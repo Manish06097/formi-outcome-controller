@@ -218,3 +218,16 @@ def latest_safe_apply(apply_by: int, tick: int) -> int:
 def tick_grid(start: int, end: int, tick: int) -> Iterable[int]:
     """Tick-aligned minutes in [start, end)."""
     return range(ceil_to_tick(start, tick), end, tick)
+
+
+# =============================================================================== end-game freeze
+
+def freeze_start(end_minute: int | None, min_days: float, frac: float) -> int | None:
+    """First minute of the end-game freeze, `end - max(min_days, frac x scenario)` (DESIGN.md
+    4.2), rounded up so `now >= freeze_start` matches the exact real-valued rule for whole-minute
+    `now`. None when the end is unknown (no freeze). The one formula the DID prober and the
+    cohort-scope projection share."""
+    if end_minute is None:
+        return None
+    span = max(end_minute, 0)
+    return math.ceil(end_minute - max(min_days * MINUTES_PER_DAY, frac * span))

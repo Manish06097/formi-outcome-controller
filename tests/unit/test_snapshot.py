@@ -4,9 +4,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from controller.snapshot import (LearningSnapshot, active_population, build_snapshot,
-                                 engage_from_columns, ew_weights, segment_of, segment_position,
-                                 segment_start_minute)
+from controller.snapshot import (active_population, build_snapshot, engage_from_columns,
+                                 ew_weights, segment_of, segment_position, segment_start_minute)
 from controller.types import WorkflowSnapshot
 from tests.support.t3_world import base_config, cohorts_by_age, make_cells, make_policy, make_spec
 
@@ -38,9 +37,10 @@ def test_build_snapshot_is_a_workflow_snapshot_with_the_extension_fields():
     spec = make_spec()
     cells = make_cells()
     ws = build_snapshot(spec=spec, policy=make_policy(), live=base_config(spec), live_version=3,
-                        now=700, cells=cells)
-    assert isinstance(ws, WorkflowSnapshot) and isinstance(ws, LearningSnapshot)
-    assert ws.seg_now == 0 and len(ws.engage) == 0 and ws.cells[0] == cells[0]
+                        now=700, cells=cells, end_minute=8 * 1440)
+    assert type(ws) is WorkflowSnapshot
+    assert segment_of(ws.now, ws.window) == 0 and len(ws.engage) == 0 and ws.cells[0] == cells[0]
+    assert ws.end_minute == 8 * 1440 and ws.looks == () and ws.active is None
 
 
 def test_active_population_falls_back_to_recent_connected_calls():

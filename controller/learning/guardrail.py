@@ -118,7 +118,7 @@ class MixGuardrailMonitor:
             if self.draws is None:
                 return self._fail_closed("engagement_rate", x, "no_engagement_draws")
             pop = active_population(ws)
-            ctx = GateContext(self.draws, pop, cells=getattr(ws, "cells", {}) or {},
+            ctx = GateContext(self.draws, pop, cells=ws.cells,
                               settings=self.t)
             pos = {c: i for i, c in enumerate(ctx.cell_ids)}
             idx = np.array([pos.get(c, -1) for c in cells])
@@ -176,7 +176,7 @@ class MixGuardrailMonitor:
         within = float((c1 * (e1 - e0)).sum())
         win_start = win[0] * 1440
         attributed = None
-        for ch in sorted(getattr(ws, "changes", ()) or (), key=lambda c: -c.minute):
+        for ch in sorted(ws.changes, key=lambda c: -c.minute):
             if ch.minute < win_start or not ch.actor.startswith("controller"):
                 continue
             dims = set(ch.dims)

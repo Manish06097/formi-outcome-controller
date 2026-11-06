@@ -9,30 +9,29 @@ Two builders produce the same object:
   `r_flags`, `cell`, active `lead_dim` rows, `experiment` / `experiment_arm`, `winner_look`,
   `decay_monitor`, `holdout` and `config_version`. It reads; it never writes.
 
-`LearningSnapshot` is a LOCAL EXTENSION of the M0 `WorkflowSnapshot` (a frozen subclass, so it is
-a `WorkflowSnapshot` everywhere one is expected). The fields it adds are the ones the learning
-modules need and 11.2 left out: the cell catalogue (features per cell, for cohort membership and
-the ridge-logit interaction terms), the active-lead population (the harm gate averages over it,
-0.1), persisted winner looks (5.5), decay monitor rows (5.7), holdouts (5.6) and our recent
-config changes (guardrail attribution, 5.10). The T3 report asks the lead to fold them into
-`types.WorkflowSnapshot`.
+Every field lives on `types.WorkflowSnapshot` (the T3 and T4 requests were merged in step I1,
+ADR 0028): the cell catalogue, the active-lead population, winner looks, decay monitors,
+holdouts, our recent config changes and the scenario end minute.
 
 Segments (5.3): a segment is half of a day's dialling window, `seg = 2 * sim_day + half`, with
 `half = 1` from `window_start + (window_end - window_start) / 2` on. History days are negative,
-so history segments are negative too. Ingest (track T1) must use the same rule; `segment_of`
-is the reference.
+so history segments are negative too. `segment_of` is the reference; ingest
+(`ingest/transform.sql`, statement `calls`) computes the same rule on each dial's TICK START,
+`floor(minute / tick) * tick`, because the simulator randomises the call timestamp inside the
+tick. Callers of `segment_of` on raw call minutes must floor to the tick first (the loop's stops
+are tick boundaries already). `tests/e2e/platform/test_ingest_paths.py` checks the two agree.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
-from controller.types import (DEFAULT_COHORT, ActivePopulation, Cell, Config, DecayMonitorState,
-                              DidArrays, EffectivePolicy, EngageArrays, Experiment, ExperimentArm,
-                              FlagSeries, FrozenDict, Minute, PickupArrays, Proposal,
-                              WorkflowSnapshot, WorkflowSpec)
+from controller.types import (DEFAULT_COHORT, ActivePopulation, Cell, ChangeRecord, Config,
+                              DecayMonitorState, DidArrays, EffectivePolicy, EngageArrays,
+                              Experiment, ExperimentArm, FlagSeries, FrozenDict, HoldoutState,
+                              LookRecord, Minute, PickupArrays, Proposal, WorkflowSnapshot,
+                              WorkflowSpec)
 
 MIN_PER_DAY = 1440
 
@@ -86,74 +85,6 @@ def ew_weights(seg: np.ndarray, seg_now: int, half_life: float) -> np.ndarray:
     return np.power(2.0, -age / half_life)
 
 
-# ============================================================================== extension types
-
-@dataclass(frozen=True)
-class LookRecord:
-    """A `winner_look` row: one look at one hypothesis (arm, scope) (5.5)."""
-
-    exp_id: str
-    arm: str
-    scope: str
-    look_no: int
-    n_at_look: int
-    sim_minute: Minute
-    w1: float | None = None
-    w2: float | None = None
-    w3: float | None = None
-    passed: bool = False
-
-
-@dataclass(frozen=True)
-class HoldoutState:
-    """A `holdout` row joined with its winner: the promoted arm and its concurrent control (5.6)."""
-
-    wf: str
-    scope: str
-    dim: str
-    winner_arm: str
-    control: str
-    share: float
-    since_version: int | None = None
-    state: str = "active"
-    since_minute: Minute | None = None
-
-
-@dataclass(frozen=True)
-class ChangeRecord:
-    """One applied config version made by the controller (guardrail attribution, 5.10)."""
-
-    minute: Minute
-    version: int
-    dims: tuple[str, ...]
-    actor: str = "controller"
-
-
-@dataclass(frozen=True, eq=False)
-class LearningSnapshot(WorkflowSnapshot):
-    """`WorkflowSnapshot` plus what the pure learning code needs (local extension, see module
-    docstring). All added fields default to empty, so a plain snapshot's data still works."""
-
-    cells: FrozenDict = field(default_factory=FrozenDict)
-    """cell_id -> Cell (features)."""
-    active: ActivePopulation | None = None
-    looks: tuple[LookRecord, ...] = ()
-    decay: tuple[DecayMonitorState, ...] = ()
-    holdouts: tuple[HoldoutState, ...] = ()
-    changes: tuple[ChangeRecord, ...] = ()
-    run_id: str = ""
-    """Run schema name; part of every derived seed (8.6)."""
-    snapshot_id: int = 0
-
-    @property
-    def window(self) -> tuple[int, int]:
-        return self.spec.dialling_window
-
-    @property
-    def seg_now(self) -> int:
-        return segment_of(self.now, self.spec.dialling_window)
-
-
 # ============================================================================== helpers
 
 def option_index(spec: WorkflowSpec, dim: str) -> dict[str, int]:
@@ -179,20 +110,20 @@ def active_population(ws: WorkflowSnapshot, recent_segments: int = 4) -> ActiveP
     `recent_segments` segments, which is proportional to the active population the dialler
     reaches. `mix` is each cell's share of expected connected calls.
     """
-    if isinstance(ws, LearningSnapshot) and ws.active is not None and len(ws.active.cells):
+    if ws.active is not None and len(ws.active.cells):
         return ws.active
     e = ws.engage
     window = ws.spec.dialling_window
     seg_now = segment_of(ws.now, window)
     if len(e) == 0:
-        cells = np.array(sorted(getattr(ws, "cells", {}) or {0}), dtype=np.int64)
+        cells = np.array(sorted(ws.cells or {0}), dtype=np.int64)
         leads = np.ones(len(cells))
     else:
         recent = e.seg >= seg_now - recent_segments
         sel = recent if recent.any() else np.ones(len(e), dtype=bool)
         cells, inv = np.unique(e.cell[sel], return_inverse=True)
         leads = np.bincount(inv, weights=e.connected[sel].astype(float)).astype(float)
-    cmap = cohort_of_cells(ws.live, getattr(ws, "cells", {}) or {}, cells.tolist())
+    cmap = cohort_of_cells(ws.live, ws.cells, cells.tolist())
     tot = float(leads.sum()) or 1.0
     return ActivePopulation(cells=np.asarray(cells, dtype=np.int64), leads=leads,
                             mix=leads / tot,
@@ -248,10 +179,11 @@ def build_snapshot(*, spec: WorkflowSpec, policy: EffectivePolicy, live: Config,
                    cells: Mapping[int, Cell] | None = None, active: ActivePopulation | None = None,
                    looks: Sequence[LookRecord] = (), decay: Sequence[DecayMonitorState] = (),
                    holdouts: Sequence[HoldoutState] = (), changes: Sequence[ChangeRecord] = (),
-                   run_id: str = "", snapshot_id: int = 0) -> LearningSnapshot:
+                   end_minute: Minute | None = None, run_id: str = "",
+                   snapshot_id: int = 0) -> WorkflowSnapshot:
     """A snapshot from in-memory arrays. `cohorts` is the T4 CohortSet when available; the
     learning code resolves membership from `live` and `cells` and does not require it."""
-    return LearningSnapshot(
+    return WorkflowSnapshot(
         spec=spec, policy=policy, live=live, live_version=live_version, cohorts=cohorts,
         engage=engage if engage is not None else empty_engage(),
         pickup=pickup if pickup is not None else _empty_pickup(),
@@ -261,7 +193,7 @@ def build_snapshot(*, spec: WorkflowSpec, policy: EffectivePolicy, live: Config,
         in_flight=in_flight, used_24h=tuple(used_24h), now=now,
         cells=FrozenDict({int(k): v for k, v in (cells or {}).items()}), active=active,
         looks=tuple(looks), decay=tuple(decay), holdouts=tuple(holdouts),
-        changes=tuple(changes), run_id=run_id, snapshot_id=snapshot_id)
+        changes=tuple(changes), end_minute=end_minute, run_id=run_id, snapshot_id=snapshot_id)
 
 
 def _arrays(rows: list[tuple[Any, ...]], n_cols: int) -> list[np.ndarray]:
@@ -274,8 +206,8 @@ def _arrays(rows: list[tuple[Any, ...]], n_cols: int) -> list[np.ndarray]:
 def load_snapshot(conn: Any, wf: int, *, spec: WorkflowSpec, policy: EffectivePolicy,
                   live: Config, live_version: int, now: Minute, cohorts: Any = None,
                   did_state: Mapping[str, Any] | None = None, in_flight: Proposal | None = None,
-                  used_24h: Sequence[Minute] = (), run_id: str = "",
-                  snapshot_id: int = 0) -> LearningSnapshot:
+                  used_24h: Sequence[Minute] = (), end_minute: Minute | None = None,
+                  run_id: str = "", snapshot_id: int = 0) -> WorkflowSnapshot:
     """Read one workflow's rollups and learned state from the run schema (search_path set).
 
     `wf` is the dense workflow code of `workflow.wf`. Spec, policy and the live config come from
@@ -346,7 +278,7 @@ def load_snapshot(conn: Any, wf: int, *, spec: WorkflowSpec, policy: EffectivePo
                           cohorts=cohorts, experiments=experiments, did_state=did_state,
                           in_flight=in_flight, used_24h=used_24h, cells=cells, active=active,
                           looks=looks, decay=decay, holdouts=holdouts, changes=changes,
-                          run_id=run_id, snapshot_id=snapshot_id)
+                          end_minute=end_minute, run_id=run_id, snapshot_id=snapshot_id)
 
 
 def _opt_name(spec: WorkflowSpec, dim: str, code: Any) -> str:

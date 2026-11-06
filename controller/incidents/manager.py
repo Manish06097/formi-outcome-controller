@@ -362,7 +362,7 @@ class IncidentManagerImpl:
                        fix_proposed_minute=ws.now)
         self._put(replace(inc, state="fixing", credits_spent=inc.credits_spent + spent))
         return PatchRequest(wf=wf, owner=OWNER, path=("prompt",), value=prompt, cls=P0_INCIDENT,
-                            p0_rank=P0A_PROMPT_SAFETY, evidence=freeze(ev), decision_id=0)
+                            p0_rank=P0A_PROMPT_SAFETY, evidence=freeze(ev))
 
     def on_fix_proposal(self, incident_id: str, proposal_id: str) -> None:
         """Governance submitted the fix (links `incident.fix_proposal_id`)."""

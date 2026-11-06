@@ -150,9 +150,8 @@ def closed_hours(now: int) -> int:
 
 @dataclass
 class FlagCusum:
-    """Live hallucination-flag CUSUM per workflow. `FlagMonitorState.last_event_id` holds the last
-    processed sim hour: `r_flags` is hourly, so that is the unit of progress (contract note in
-    the T4 report)."""
+    """Live hallucination-flag CUSUM per workflow. `FlagMonitorState.last_sim_hour` is the last
+    processed sim hour: `r_flags` is hourly, so that is the unit of progress."""
 
     t: Thresholds = field(default_factory=Thresholds)
 
@@ -173,7 +172,7 @@ class FlagCusum:
         under the new prompt before the stop that saw the change are counted."""
         fs = ws.flags
         code = prompt_code(ws, ws.live.prompt_version)
-        start = prev.last_event_id if prev is not None else closed_hours(ws.now) - 1
+        start = prev.last_sim_hour if prev is not None else closed_hours(ws.now) - 1
         before = fs.sim_hour <= start
         own = before & (fs.prompt == code)
         p_hist, per_day, _ = self.history_rates(ws)
@@ -192,7 +191,7 @@ class FlagCusum:
         return FlagMonitorState(wf=ws.spec.workflow_id, prompt=ws.live.prompt_version, p0=p0,
                                 p1=p0 * self.t.flag_cusum_ratio, h=h, stat=0.0,
                                 flags_since_reset=0, calls=0,
-                                last_event_id=start, alarm=False, reset_minute=ws.now)
+                                last_sim_hour=start, alarm=False, reset_minute=ws.now)
 
     def update(self, ws: WorkflowSnapshot, state: FlagMonitorState | None
                ) -> tuple[FlagMonitorState, list[Finding]]:
@@ -203,7 +202,7 @@ class FlagCusum:
         fs = ws.flags
         code = prompt_code(ws, state.prompt)
         hi = closed_hours(ws.now)
-        sel = (fs.sim_hour > state.last_event_id) & (fs.sim_hour < hi) & (fs.prompt == code)
+        sel = (fs.sim_hour > state.last_sim_hour) & (fs.sim_hour < hi) & (fs.prompt == code)
         cus = BernoulliCusum(state.p0, state.p1, state.h, self.t.flag_cusum_min_flags,
                              state.stat, state.flags_since_reset, state.calls, state.alarm)
         was_alarm = cus.alarm
@@ -211,8 +210,8 @@ class FlagCusum:
         for n, k in zip(fs.connected[sel][order].tolist(), fs.flags[sel][order].tolist()):
             cus = cus.update_counts(n=int(n), k=int(k))
         new = replace(state, stat=cus.stat, flags_since_reset=cus.events_since_reset,
-                      calls=cus.trials, alarm=cus.alarm, last_event_id=max(hi - 1,
-                                                                            state.last_event_id))
+                      calls=cus.trials, alarm=cus.alarm,
+                      last_sim_hour=max(hi - 1, state.last_sim_hour))
         if cus.alarm and not was_alarm:
             out.append(self._f(ws, "alarm", cus.stat, cus.h, new, {}))
         lb = poisson_lower(new.flags_since_reset, self.t.flag_live_open_conf) / new.calls \

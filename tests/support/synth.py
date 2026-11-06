@@ -117,7 +117,7 @@ def snapshot(spec: WorkflowSpec, *, live: Config | None = None, now: int = 0,
              cohorts: GridCohortSet | None = None, pickup: PickupArrays | None = None,
              did: DidArrays | None = None, flags: FlagSeries | None = None,
              did_state: Mapping | None = None, policy: EffectivePolicy | None = None,
-             live_version: int = 1) -> WorkflowSnapshot:
+             live_version: int = 1, end_minute: int | None = None) -> WorkflowSnapshot:
     cat = cohorts.catalog if cohorts else full_catalog()
     cs = cohorts or GridCohortSet(spec.workflow_id, (), cat)
     return WorkflowSnapshot(
@@ -126,7 +126,8 @@ def snapshot(spec: WorkflowSpec, *, live: Config | None = None, now: int = 0,
         pickup=pickup if pickup is not None else pickup_arrays([]),
         did=did if did is not None else did_arrays([]),
         flags=flags if flags is not None else flag_series([]), experiments=(),
-        did_state=FrozenDict(did_state or {}), in_flight=None, used_24h=(), now=now)
+        did_state=FrozenDict(did_state or {}), in_flight=None, used_24h=(), now=now,
+        end_minute=end_minute)
 
 
 # ------------------------------------------------------------------------------- simulators

@@ -213,3 +213,16 @@ def test_business_entries_helper():
     cat = synth.full_catalog()
     e = business_entries([CohortDef.make("x", {"lang": ["en"]})], cat)
     assert e[0].owner == "supervisor" and len(e[0].matched_cells) == 36
+
+
+def test_projection_reads_the_ramp_from_settings_and_the_end_from_the_snapshot():
+    """ADR 0028: the ramp is `Thresholds.winner_scope_ramp`; a snapshot's end_minute wins over
+    the one given at construction."""
+    import dataclasses
+    cat = synth.full_catalog()
+    flat = dataclasses.replace(Thresholds(), winner_scope_ramp=(0.5,))
+    gs = GridCohortSet("wf", (), cat, end_minute=None, thresholds=flat)
+    assert math.isinf(gs.projected_arm_calls(100.0, 0))
+    end = 100 * 1440                       # freeze at 85 days: 85 days x 100 x 0.5
+    assert gs.projected_arm_calls(100.0, 0, end) == pytest.approx(85 * 50)
+    assert gs.freeze_start(end) == end - int(0.15 * end)

@@ -143,8 +143,7 @@ class HourCurvesModel:
                     "dials": {str(h): curves.dials[k][h] for h in hours},
                     "kappa": self.t.hour_weight_kappa,
                     "clip": [self.t.hour_weight_min, self.t.hour_weight_max],
-                    "needs_cohort_defined": k not in ws.live.cohort_ids()}),
-                decision_id=0))
+                    "needs_cohort_defined": k not in ws.live.cohort_ids()})))
         return out
 
 

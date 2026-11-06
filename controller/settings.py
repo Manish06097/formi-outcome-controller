@@ -114,6 +114,10 @@ class Thresholds:
     look_first_days: int = T(2, "5.5", "... over at least 2 calendar days.")
     look_growth: float = T(2.0, "5.5", "Later looks once the in-scope count has doubled since the "
                            "previous look (200, 400, 800, 1,600).")
+    look_max: int = T(0, "5.5", "Cap on winner looks per hypothesis (arm, scope); 0 = no cap. 4 "
+                      "bounds W1 alone by the 0.54% union bound when volume pushes first looks "
+                      "past 200 calls (T3 measured 0.73% uncapped; the full W1-W6 rule stays at "
+                      "0 to 0.07%).")
 
     # ------------------------------------------------------------------ cohorts (5.2)
     targeting_cohort_min_share: float = T(0.05, "5.2", "A targeting cohort holds >= 5% of daily "
@@ -123,6 +127,12 @@ class Thresholds:
                                       "only with >= 15% of daily connected calls ...")
     winner_scope_projected_n: int = T(800, "5.2, 5.5", "... and a projected n = 800 look before "
                                       "the freeze (real ramp table, 5.5).")
+    winner_scope_ramp: tuple[float, ...] = T(
+        (0.038, 0.12, 0.25, 0.30, 0.40, 0.50), "5.2, 5.5", "Arm share per day along the real "
+        "ramp of 5.5 (3.8% on D0, 10-15% on D1, 20-30% on D2 and D3, then up to the 50% "
+        "ceiling), used to project when an arm reaches the n = 800 look in a cohort; later days "
+        "keep the last value. Derived from the harm gate's ramp, not an independent knob: if the "
+        "gate or arm_ceiling changes, re-derive it.")
     grid_f1_p: float = T(0.001, "5.2", "F1 = the feature whose hour curves differ most: deviance "
                          "test of connected ~ hour * f vs hour + f at p < 0.001.")
     grid_f2_lang_min_langs: int = T(2, "5.2", "F2 = lang if the workflow has 2 to 5 languages ...")
@@ -137,14 +147,19 @@ class Thresholds:
     holdout_se_target: float = T(0.075, "5.6", "Smallest holdout whose one-day SE of "
                                  "log(winner / holdout) is <= 0.075: one-day decay visibility.")
     decay_cusum_k: float = T(0.5, "5.7", "Page CUSUM reference value k (in SE units).")
-    decay_cusum_h: float = T(4.0, "5.7", "Decay alarm at h = 4: in-control ARL about 168 segments "
-                             "(84 dialling days), out-of-control ARL 8.4 segments at 1 SE.")
+    decay_cusum_h: float = T(4.0, "5.7", "Decay alarm at h = 4: one-sided in-control ARL about "
+                             "336 segments (168 dialling days; 168 is the two-sided value), "
+                             "out-of-control ARL 8.4 segments at 1 SE.")
     decay_arm_share: float = T(0.10, "5.7", "Monitor every non-control arm with >= 10% share in "
                                "some scope (lowered from 15% per F1).")
     rollback_tolerance: float = T(0.10, "5.7", "Rollback when E[de_rollback(t_a)] > 0 and "
                                   "P(de_rollback(t_a) < -1%) <= 10%.")
     rollback_trend_segments: int = T(4, "5.7", "Local linear trend over the last 4 segments to "
                                      "predict the effect at the expected apply time.")
+    apply_time_trend_p: float = T(0.90, "0.1, 5.7", "Ramps and promotions must also pass on draws "
+                                  "projected to the expected apply time when the arm's "
+                                  "4-segment trend is falling at this one-sided level (the "
+                                  "grader judges a change at its apply time).")
 
     # ------------------------------------------------------------------ call time (5.8)
     hour_curve_prior: float = T(200.0, "5.8", "Hour curves are shrunk toward the pooled curve "

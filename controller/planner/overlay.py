@@ -235,10 +235,16 @@ class Overlay:
         """Accept a patch. A newer patch on the same path replaces an open one; a patch from a
         different module on a path another module still owns is refused unless its class is
         strictly higher (more urgent). Cooldown is applied at compose time, so a P2/P3 patch on
-        a supervisor path waits instead of being lost."""
+        a supervisor path waits instead of being lost.
+
+        The request must carry the id of the decision that produced it (PatchRequest docstring,
+        ADR 0028): a patch never exists without its decision row."""
         validate_path(tuple(req.path))
         if (req.cls == P0_INCIDENT) != (req.p0_rank is not None):
             raise ValueError("p0_rank is set exactly for class 0 patches")
+        if req.decision_id is None:
+            raise ValueError(f"{req.owner} patch on {req.path} has no decision_id: write the "
+                             "decision and stamp the request before Overlay.add")
         path = tuple(req.path)
         state = OPEN
         for old in self._live_on(req.wf, path):

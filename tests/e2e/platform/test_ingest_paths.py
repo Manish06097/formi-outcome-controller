@@ -135,7 +135,9 @@ class FixtureClient:
         return [VersionMeta(1, "business_default", (), None, None, None)]
 
 
-def ingest_fixture(dsn: str, parser: str, fp: str) -> tuple[str, IngestPipeline, Database]:
+def open_fixture_schema(dsn: str, fp: str, spec: dict, chunks: dict[int, bytes],
+                        parser: str = "sql") -> tuple[str, IngestPipeline, Database,
+                                                      ConfigMirror, FixtureClient]:
     db = Database(dsn)
     db.ensure_ctl()
     schema = db.create_run_schema(fp, "http://fixture", sim_days=2)
@@ -143,12 +145,17 @@ def ingest_fixture(dsn: str, parser: str, fp: str) -> tuple[str, IngestPipeline,
     epoch = SimEpoch(EPOCH)
     client = FixtureClient()
     with db.tx() as tx:
-        cat = repos.register_workflows(tx, [WorkflowSpec.from_api(SPEC)], -1440)
+        cat = repos.register_workflows(tx, [WorkflowSpec.from_api(spec)], -1440)
         tx.execute("INSERT INTO clock VALUES (1, 0, 2880, 15, 0)")
         mirror = ConfigMirror(client, cat, epoch)  # type: ignore[arg-type]
         mirror.bootstrap(tx)
-    src = FixtureSource(CHUNKS)
+    src = FixtureSource(chunks)
     p = IngestPipeline(db, src, int(EPOCH.timestamp()), TICK, parser=parser)
+    return schema, p, db, mirror, client
+
+
+def ingest_fixture(dsn: str, parser: str, fp: str) -> tuple[str, IngestPipeline, Database]:
+    schema, p, db, mirror, client = open_fixture_schema(dsn, fp, SPEC, CHUNKS, parser)
     rep0 = p.ingest([META[0]])
     rep1 = p.ingest([META[1]])
     assert rep0.chunks == (0,) and rep1.chunks == (1,)
@@ -242,5 +249,48 @@ def test_exactly_once_and_count_mismatch(fixture_db):
         with db.tx() as tx:
             assert tx.execute("SELECT sum(dials) FROM r_pickup").fetchone() == before
             assert tx.execute("SELECT count(*) FROM ingested_chunk").fetchone() == (2,)
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("parser", ["sql", "python"])
+@pytest.mark.parametrize("window", [(9, 21), (9, 20), (7, 20)])
+def test_ingest_segments_follow_the_learning_rule(fixture_db, window, parser):
+    """Ingest's `seg` is `snapshot.segment_of` of the dial's tick start (DESIGN.md 5.3, ADR
+    0028): the learning code and the rollups agree on every segment, including the tick that
+    starts exactly at the half-window and calls randomised late inside the tick before it."""
+    from controller.snapshot import segment_of
+    from controller.world.clock import floor_to
+    lo, hi = window
+    half = lo * 60 + (hi - lo) * 30
+    spec = {**SPEC, "dialling_window": list(window)}
+    hist = [{"type": "campaign_created", "ts": ts(H + 480), "tenant_id": "ten",
+             "workflow_id": "wf_a", "campaign_id": "wf_a:c1", "leads": 1,
+             "config_version_at_creation": 1, "event_id": 1},
+            lead(2, 1, H + 480),
+            call(3, 1, H + half - TICK, TICK - 1, 1, False),
+            call(4, 1, H + half, 3, 2, True)]
+    ev = [call(5, 1, half - TICK, TICK - 1, 3, False), call(6, 1, half, 0, 4, False),
+          call(7, 1, half, TICK - 1, 5, True, engaged=True), call(8, 1, lo * 60, 0, 6, False)]
+    chunks = {0: ndjson(hist), 1: ndjson(ev)}
+    meta = [ChunkMeta(0, "history", len(hist), 1, 4, 0, ts(0)),
+            ChunkMeta(1, "events", len(ev), 5, 8, 1440, ts(1440))]
+    fp = (f"{lo:02d}{hi:02d}{'a' if parser == 'sql' else 'b'}" * 13)[:64]
+    schema, p, db, _, _ = open_fixture_schema(fixture_db, fp, spec, chunks, parser)
+    try:
+        p.source.list_chunks = lambda kind="events", after=-1: [   # type: ignore[assignment]
+            m for m in meta if m.kind == kind and m.chunk > after]
+        p.ingest(meta[:1])
+        p.ingest(meta[1:])
+        with db.tx() as tx:
+            facts = tx.execute("SELECT minute, seg FROM call_fact ORDER BY event_id").fetchall()
+            pickup = tx.execute("SELECT sim_day, hour, sum(dials) FROM r_pickup "
+                                "GROUP BY 1, 2 ORDER BY 1, 2").fetchall()
+            engage = tx.execute("SELECT seg FROM r_engage ORDER BY seg").fetchall()
+        assert [seg for _, seg in facts] == [segment_of(floor_to(m, TICK), window)
+                                              for m, _ in facts]
+        assert [seg for _, seg in facts] == [0, 1, 1, 0]
+        assert sum(d for _, _, d in pickup) == 6
+        assert engage == [(segment_of(H + half, window),), (1,)] == [(-1,), (1,)]
     finally:
         db.close()

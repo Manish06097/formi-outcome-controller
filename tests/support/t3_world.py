@@ -16,11 +16,11 @@ from typing import Callable, Mapping, Sequence
 
 import numpy as np
 
-from controller.snapshot import (HoldoutState, LookRecord, build_snapshot, cohort_of_cells,
-                                 engage_from_columns, segment_start_minute)
+from controller.snapshot import (build_snapshot, cohort_of_cells, engage_from_columns,
+                                 segment_start_minute)
 from controller.types import (DEFAULT_COHORT, ActivePopulation, Cell, CohortDef, Config,
                               DecayMonitorState, EffectivePolicy, Experiment, FrozenDict,
-                              WorkflowSpec)
+                              HoldoutState, LookRecord, WorkflowSpec)
 
 WINDOW = (9, 21)
 LANGS = ("en", "hi", "ta")

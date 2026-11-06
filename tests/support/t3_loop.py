@@ -19,9 +19,8 @@ from controller.learning.decay import PageDecayMonitor
 from controller.learning.engagement import BetaBinomialModel, RidgeLogitModel
 from controller.learning.winners import evaluate_looks
 from controller.settings import Thresholds
-from controller.snapshot import HoldoutState, LookRecord
 from controller.stats.draws import derive_seed
-from controller.types import Config, Experiment, ExperimentArm
+from controller.types import Config, Experiment, ExperimentArm, HoldoutState, LookRecord
 from tests.support.t3_world import SyntheticWorld
 
 

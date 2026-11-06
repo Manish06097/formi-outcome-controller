@@ -111,7 +111,7 @@ class PageDecayMonitor:
                     share = _share(live, coh, lead, members, exp.dim, a)
                     if share >= t.decay_arm_share:
                         out.append((scope, exp.dim, a, arms.control))
-        for h in getattr(ws, "holdouts", ()) or ():
+        for h in ws.holdouts:
             if h.state == "active" and h.winner_arm:
                 out.append((h.scope, h.dim, h.winner_arm, h.control))
         return sorted(set(out))
@@ -197,7 +197,7 @@ class PageDecayMonitor:
 
     # ---------------------------------------------------------------- rollback
     def rollback_plan(self, ws: WorkflowSnapshot, ew: Draws | EffectCache, t_apply: int,
-                      decision_id: int = 0) -> list[PatchRequest]:
+                      decision_id: int | None = None) -> list[PatchRequest]:
         t = self.t
         cache = ew if isinstance(ew, EffectCache) else EffectCache(ew)
         pop = active_population(ws)
@@ -285,11 +285,6 @@ class PageDecayMonitor:
 
 # ============================================================================== apply time
 
-TREND_SIGNIFICANCE = 0.90
-"""A falling trend is extrapolated to the apply time only when it is credible at this one-sided
-level. LOCAL until settings.py gains `apply_time_trend_p` (contract change in the T3 report)."""
-
-
 def default_apply_time(ws: WorkflowSnapshot) -> int:
     """Expected apply time of an approval submitted now: now + the mean approver latency (the
     planner passes the timing calculator's answer when it has one, 6.3)."""
@@ -329,7 +324,7 @@ def apply_time_shifts(ws: WorkflowSnapshot, n_draws: int, seed: int, t_apply: in
 
     The grader judges a change at its apply time (0.1), so ramps and promotions are gated on
     the arm's effect THEN. With a credibly falling population trend over the last 4 segments
-    (slope b, SE s, b + z_0.90 s < 0) the shift is min(0, b + s Z) x (segments to apply);
+    (slope b, SE s, b + z_p s < 0 with p = `apply_time_trend_p`) the shift is min(0, b + s Z) x (segments to apply);
     otherwise 0. Rising trends are never extrapolated: the prediction can only make the gate
     stricter. Same seed, same shifts."""
     t = _thresholds(settings)
@@ -341,7 +336,7 @@ def apply_time_shifts(ws: WorkflowSnapshot, n_draws: int, seed: int, t_apply: in
         return out
     pop = active_population(ws)
     cells = [int(c) for c in pop.cells]
-    z = norm_ppf(TREND_SIGNIFICANCE)
+    z = norm_ppf(t.apply_time_trend_p)
     for exp in ws.experiments:
         if exp.dim not in ENGAGEMENT_DIMS or exp.state in CLOSED_EXPERIMENT_STATES:
             continue
@@ -359,8 +354,8 @@ def apply_time_shifts(ws: WorkflowSnapshot, n_draws: int, seed: int, t_apply: in
 
 def _cohorts_of(ws: WorkflowSnapshot, pop) -> list[str]:
     from controller.snapshot import cohort_of_cells
-    return cohort_of_cells(ws.live, getattr(ws, "cells", {}) or {}, [int(c) for c in pop.cells]) \
-        if getattr(ws, "cells", None) else [pop.cohort_of_cell.get(int(c), "default")
+    return cohort_of_cells(ws.live, ws.cells, [int(c) for c in pop.cells]) \
+        if ws.cells else [pop.cohort_of_cell.get(int(c), "default")
                                             for c in pop.cells]
 
 

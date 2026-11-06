@@ -7,8 +7,7 @@ from controller.learning.allocator import open_experiments
 from controller.learning.engagement import BetaBinomialModel
 from controller.learning.winners import (evaluate_looks, holdout_se, holdout_size, look_due,
                                          promotion_config)
-from controller.snapshot import LookRecord
-from controller.types import DecayMonitorState
+from controller.types import DecayMonitorState, LookRecord
 from tests.support.t3_world import base_config, make_spec, uniform_world
 
 SPEC = make_spec()
@@ -29,6 +28,16 @@ def test_look_schedule_first_at_200_over_two_days_then_doubling():
     prev = [LookRecord("e", "W2", "population", 1, 230, 0)]
     assert not look_due(459, 5, prev)
     assert look_due(460, 5, prev)
+
+
+def test_look_max_caps_the_looks_of_one_hypothesis():
+    import dataclasses
+    from controller.settings import Thresholds
+    prev = [LookRecord("e", "W2", "population", i + 1, 200 * 2 ** i, 0) for i in range(4)]
+    assert look_due(10 ** 6, 9, prev)                                   # default: no cap
+    capped = dataclasses.replace(Thresholds(), look_max=4)
+    assert not look_due(10 ** 6, 9, prev, capped)
+    assert look_due(10 ** 6, 9, prev[:3], capped)
 
 
 def _world(mult, days=4, share=0.25, seed=1, per_day=3000):

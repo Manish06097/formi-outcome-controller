@@ -5,8 +5,8 @@ import pytest
 
 from controller.learning.engagement import BetaBinomialModel
 from controller.learning.guardrail import MixGuardrailMonitor
-from controller.snapshot import ChangeRecord, build_snapshot, engage_from_columns
-from controller.types import Cell
+from controller.snapshot import build_snapshot, engage_from_columns
+from controller.types import Cell, ChangeRecord
 from tests.support.t3_world import base_config, make_policy, make_spec, uniform_world
 
 ENG = make_spec()                                   # engagement primary, pickup guardrail

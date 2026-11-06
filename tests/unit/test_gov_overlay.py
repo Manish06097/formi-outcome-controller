@@ -241,3 +241,14 @@ def test_d5_supervisor_voice_edit_rebase_never_reverts():
     ov.add(req(("alloc", "default", "voice"), {"V2": 1, "V1": 0}, owner="incidents",
                cls=P1_ROLLBACK))
     assert ov.compose("wf_test", live_v8, {1}).patches
+
+
+def test_add_refuses_a_request_without_its_decision():
+    """ADR 0028: pure modules emit decision_id=None; the caller stamps it before Overlay.add."""
+    import dataclasses
+    ov = make_overlay(Clock(hm(1, 10)))
+    bare = dataclasses.replace(req(("alloc", "default", "voice"), {"V1": 0.9, "V2": 0.1}),
+                               decision_id=None)
+    with pytest.raises(ValueError, match="decision_id"):
+        ov.add(bare)
+    assert ov.add(dataclasses.replace(bare, decision_id=7)).decision_id == 7

@@ -1526,7 +1526,9 @@ class FlagMonitorState:
     stat: float
     flags_since_reset: int
     calls: int
-    last_event_id: int
+    last_sim_hour: int
+    """last sim hour folded in (`r_flags` is hourly, so the hour is the unit of progress);
+    column `flag_monitor.last_sim_hour`, migration 0010"""
     alarm: bool
     reset_minute: Minute
 
@@ -1600,6 +1602,12 @@ class PatchRequest:
     composed config by `governance/policy.classify_risk` (DESIGN.md 6.5, ADR 0025).
 
     Paths: ("alloc", cohort_key, dim), ("prompt",), ("hour_weights", cohort_key), ("cohorts",).
+
+    `decision_id` rule (ADR 0028): pure modules cannot write decisions, so they emit None. The
+    caller that runs the module writes the Decision row (the one that produced the request) and
+    stamps it with `dataclasses.replace(req, decision_id=...)` in the same transaction, before
+    `Overlay.add`. `Overlay.add` refuses a request whose decision_id is None, so no patch exists
+    without the decision behind it (audit before acting, CLAUDE.md).
     """
 
     wf: str
@@ -1611,7 +1619,8 @@ class PatchRequest:
     p0_rank: int | None
     """0 = P0a prompt safety, 1 = P0b DID drain; None if cls > 0"""
     evidence: FrozenDict
-    decision_id: int
+    decision_id: int | None = None
+    """None from pure modules; set by the caller before `Overlay.add` (see above)."""
 
 
 @dataclass(frozen=True)
@@ -1805,8 +1814,56 @@ class Intent:
 
 
 @dataclass(frozen=True)
+class LookRecord:
+    """A `winner_look` row: one look at one hypothesis (arm, scope) (DESIGN.md 5.5)."""
+
+    exp_id: str
+    arm: str
+    scope: str
+    look_no: int
+    n_at_look: int
+    sim_minute: Minute
+    w1: float | None = None
+    w2: float | None = None
+    w3: float | None = None
+    passed: bool = False
+
+
+@dataclass(frozen=True)
+class HoldoutState:
+    """A `holdout` row joined with its winner: the promoted arm and its concurrent control
+    (DESIGN.md 5.6)."""
+
+    wf: str
+    scope: str
+    dim: str
+    winner_arm: str
+    control: str
+    share: float
+    since_version: int | None = None
+    state: str = "active"
+    since_minute: Minute | None = None
+
+
+@dataclass(frozen=True)
+class ChangeRecord:
+    """One applied config version made by the controller (guardrail attribution, DESIGN.md 5.10)."""
+
+    minute: Minute
+    version: int
+    dims: tuple[str, ...]
+    actor: str = "controller"
+
+
+@dataclass(frozen=True, eq=False)
 class WorkflowSnapshot:
-    """Everything a learning or incident module may read about one workflow at one stop."""
+    """Everything a learning or incident module may read about one workflow at one stop.
+
+    Built by `controller/snapshot.py` (`build_snapshot` from arrays, `load_snapshot` from the run
+    schema). Compared and hashed by identity (`eq=False`): it holds numpy arrays, and one
+    snapshot is one stop's read. The fields after `now` were added in step I1 (T3 and T4
+    requests, ADR 0028) and default to empty, so a snapshot built from rollups alone still works.
+    """
 
     spec: WorkflowSpec
     policy: EffectivePolicy
@@ -1824,6 +1881,24 @@ class WorkflowSnapshot:
     used_24h: tuple[Minute, ...]
     """created minutes of our requests in the rolling 24h (fatigue)"""
     now: Minute
+    cells: FrozenDict = field(default_factory=FrozenDict)
+    """cell_id -> Cell (features), for cohort membership and the ridge-logit terms"""
+    active: ActivePopulation | None = None
+    """active leads (lead_dim state 0) by cell; the harm gate averages over them (0.1)"""
+    looks: tuple[LookRecord, ...] = ()
+    decay: tuple[DecayMonitorState, ...] = ()
+    holdouts: tuple[HoldoutState, ...] = ()
+    changes: tuple[ChangeRecord, ...] = ()
+    """our applied config versions, newest last (guardrail attribution, 5.10)"""
+    end_minute: Minute | None = None
+    """`/sim/state` end_minute: the freeze (5.2, 5.9) and the projected look before it (5.5)"""
+    run_id: str = ""
+    """run schema name; part of every derived seed (8.6)"""
+    snapshot_id: int = 0
+
+    @property
+    def window(self) -> tuple[int, int]:
+        return self.spec.dialling_window
 
 
 @dataclass(frozen=True)

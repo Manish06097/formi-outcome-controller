@@ -26,18 +26,12 @@ import numpy as np
 from controller.cohorts.cells import CellCatalog
 from controller.settings import Thresholds
 from controller.types import DEFAULT_COHORT, Cohort, CohortDef, FrozenDict, sha256_hex
+from controller.world.clock import freeze_start
 
 if TYPE_CHECKING:  # pragma: no cover
     from controller.types import WorkflowSnapshot
 
 Owner = Literal["ours", "supervisor"]
-
-WINNER_SCOPE_RAMP: tuple[float, ...] = (0.038, 0.12, 0.25, 0.30, 0.40, 0.50)
-"""Arm share per day along the real ramp of DESIGN.md 5.5 ("about 3.8% on D0, 10% to 15% on D1,
-20% to 30% on D2 and D3, then up to the 50% ceiling"), used to project when an arm reaches the
-n = 800 look in a cohort. Later days stay at the last value (the arm ceiling). Not a [T]: it is
-the harm gate's ramp as the design computed it; see the T4 report (contract change requested to
-move it into settings)."""
 
 
 def _slug(where: Mapping[str, Sequence[str]] | Sequence[tuple[str, Sequence[str]]]) -> str:
@@ -225,23 +219,24 @@ class GridCohortSet:
         n_days = max(len(use), 1)
         return {k: v / n_days for k, v in out.items()}
 
-    def freeze_start(self) -> int | None:
-        """Start of the end-game freeze, `end - max(1 day, 15% of the scenario)` (DESIGN.md 4.2)."""
-        if self.end_minute is None:
-            return None
-        span = max(self.end_minute, 0)
-        return self.end_minute - int(max(self.t.freeze_min_days * 1440, self.t.freeze_frac * span))
+    def freeze_start(self, end_minute: int | None = None) -> int | None:
+        """Start of the end-game freeze, `end - max(1 day, 15% of the scenario)` (DESIGN.md 4.2).
+        `end_minute` (the snapshot's) wins over the one given at construction."""
+        end = end_minute if end_minute is not None else self.end_minute
+        return freeze_start(end, self.t.freeze_min_days, self.t.freeze_frac)
 
-    def projected_arm_calls(self, connected_per_day: float, now: int) -> float:
+    def projected_arm_calls(self, connected_per_day: float, now: int,
+                            end_minute: int | None = None) -> float:
         """Connected calls an arm in a cohort with `connected_per_day` reaches before the freeze,
-        along the real ramp (`WINNER_SCOPE_RAMP`), starting now."""
-        fs = self.freeze_start()
+        along the real ramp (`settings.winner_scope_ramp`), starting now."""
+        ramp = self.t.winner_scope_ramp
+        fs = self.freeze_start(end_minute)
         if fs is None:
             return math.inf
         days = max(0.0, (fs - now) / 1440.0)
         total, d = 0.0, 0
         while days > 0:
-            share = WINNER_SCOPE_RAMP[min(d, len(WINNER_SCOPE_RAMP) - 1)]
+            share = ramp[min(d, len(ramp) - 1)]
             total += connected_per_day * share * min(1.0, days)
             days -= 1.0
             d += 1
@@ -259,7 +254,7 @@ class GridCohortSet:
             return False
         if per_day.get(cohort, 0.0) / total < self.t.winner_scope_min_share:
             return False
-        return (self.projected_arm_calls(per_day[cohort], ws.now)
+        return (self.projected_arm_calls(per_day[cohort], ws.now, ws.end_minute)
                 >= self.t.winner_scope_projected_n)
 
 
@@ -268,5 +263,4 @@ def business_entries(cohorts: Iterable[CohortDef], catalog: CellCatalog) -> list
     return [CohortEntry(c.id, c, "business", "supervisor", catalog.matching(c)) for c in cohorts]
 
 
-__all__ = ["GridCohortSet", "CohortEntry", "cohort_key", "canonical_where", "business_entries",
-           "WINNER_SCOPE_RAMP"]
+__all__ = ["GridCohortSet", "CohortEntry", "cohort_key", "canonical_where", "business_entries"]

@@ -35,10 +35,9 @@ from controller.learning.engagement import (ENGAGEMENT_DIMS, CLOSED_EXPERIMENT_S
 from controller.learning.harm import GateContext
 from controller.settings import Settings, Thresholds
 from controller.stats.ratios import norm_sf
-from controller.snapshot import (LearningSnapshot, LookRecord, active_population, cohort_of_cells,
-                                 option_index, segment_day)
+from controller.snapshot import active_population, cohort_of_cells, option_index, segment_day
 from controller.types import (DEFAULT_COHORT, Config, DidPosterior, Draws, HarmReport,
-                              WorkflowSnapshot, Winner)
+                              LookRecord, WorkflowSnapshot, Winner)
 
 POPULATION = "population"
 
@@ -73,10 +72,10 @@ def holdout_size(n_k: float, e: float, settings: Settings | Thresholds | None = 
 
 def scope_cell_ids(ws: WorkflowSnapshot, cfg: Config, scope: str) -> set[int]:
     cells = sorted(set(int(c) for c in np.unique(ws.engage.cell)) |
-                   set(int(c) for c in (getattr(ws, "cells", {}) or {})))
+                   set(int(c) for c in ws.cells))
     if scope == POPULATION:
         return set(cells)
-    coh = cohort_of_cells(cfg, getattr(ws, "cells", {}) or {}, cells)
+    coh = cohort_of_cells(cfg, ws.cells, cells)
     return {c for c, k in zip(cells, coh) if k == scope}
 
 
@@ -160,9 +159,14 @@ def gaussian_tail_above(draws: np.ndarray, x: float) -> float:
 
 def look_due(n: int, days: int, prior: Sequence[LookRecord],
              settings: Settings | Thresholds | None = None) -> bool:
+    """Is a look at this hypothesis due: the first at >= look_first_n calls over
+    look_first_days days, later ones once the count has grown look_growth-fold, and none after
+    `look_max` looks when that cap is set (5.5)."""
     t = _thresholds(settings)
     if not prior:
         return n >= t.look_first_n and days >= t.look_first_days
+    if t.look_max > 0 and len(prior) >= t.look_max:
+        return False
     last = max(prior, key=lambda r: r.look_no)
     return n >= t.look_growth * last.n_at_look
 
@@ -203,7 +207,7 @@ def evaluate_looks(ws: WorkflowSnapshot, stat: Draws | EffectCache, ew: Draws | 
     t = _thresholds(settings)
     live = ws.live
     pop = active_population(ws)
-    cells_cat = getattr(ws, "cells", {}) or {}
+    cells_cat = ws.cells
     ctx_t = None
     if not isinstance(ew, EffectCache):
         shifted = apply_time_cache(ws, ew, t_apply, t)
@@ -216,7 +220,7 @@ def evaluate_looks(ws: WorkflowSnapshot, stat: Draws | EffectCache, ew: Draws | 
     futile: list[tuple[str, str, str]] = []
     detail: list[dict[str, object]] = []
     promos: dict[tuple[str, str], Config] = {}
-    prior_looks = tuple(getattr(ws, "looks", ()) or ())
+    prior_looks = tuple(ws.looks)
     elig = eligible or (lambda k: winner_scope_eligible(ws, k, t))
     scopes = [POPULATION] + [k for k in [*live.cohort_ids(), DEFAULT_COHORT]
                              if k != DEFAULT_COHORT or live.cohorts]
@@ -323,7 +327,7 @@ def _arm_closed(exp, arm: str, scope: str) -> bool:
 
 
 def _decay_ok(ws: WorkflowSnapshot, dim: str, arm: str, scope: str, t: Thresholds) -> bool:
-    for s in getattr(ws, "decay", ()) or ():
+    for s in ws.decay:
         if s.dim == dim and s.arm == arm and s.scope in (scope, POPULATION):
             if s.alarm or s.cusum >= t.w4_cusum_frac * t.decay_cusum_h:
                 return False

@@ -36,6 +36,7 @@ import numpy as np
 
 from controller.settings import Thresholds
 from controller.stats.sequential import BernoulliRatioSprt
+from controller.world.clock import freeze_start
 from controller.types import (DEFAULT_COHORT, P0_INCIDENT, P0B_DID_DRAIN, P3_ROUTINE, DidArrays,
                               DidPosterior, DidState, Finding, FrozenDict, PatchRequest,
                               WorkflowSnapshot, freeze, thaw)
@@ -228,8 +229,9 @@ def drain_chain(cur: Mapping[str, float], target: Mapping[str, float], drained: 
 
 @dataclass
 class DidHealthModel:
-    """The concrete `DidHealth` (types.DidHealth protocol). `end_minute` (from the API) enables
-    the end-game freeze of new probes; `p_hist` is the workflow's one pickup rate (history, or
+    """The concrete `DidHealth` (types.DidHealth protocol). The snapshot's `end_minute` (from
+    the API) enables the end-game freeze of new probes; the constructor's `end_minute` is the
+    fallback for a snapshot without one; `p_hist` is the workflow's one pickup rate (history, or
     the first 2 dialling days) used where no comparator stratum exists."""
 
     t: Thresholds = field(default_factory=Thresholds)
@@ -258,12 +260,10 @@ class DidHealthModel:
         d = da.dials.sum()
         return float(da.connected.sum() / d) if d > 0 else 0.25
 
-    def in_freeze(self, now: int) -> bool:
-        if self.end_minute is None:
-            return False
-        span = max(self.end_minute, 0)
-        start = self.end_minute - max(self.t.freeze_min_days * 1440, self.t.freeze_frac * span)
-        return now >= start
+    def in_freeze(self, now: int, end_minute: int | None = None) -> bool:
+        end = end_minute if end_minute is not None else self.end_minute
+        start = freeze_start(end, self.t.freeze_min_days, self.t.freeze_frac)
+        return start is not None and now >= start
 
     # ------------------------------------------------------------------ bootstrap
     def bootstrap(self, ws: WorkflowSnapshot) -> dict[str, DidState]:
@@ -500,7 +500,7 @@ class DidHealthModel:
         """Probes, spread and drains for every cohort scope that has its own caller_id
         distribution ("default" plus overrides). One patch per scope."""
         states = dict(self.classify(ws))
-        allow_probes = not self.in_freeze(ws.now)
+        allow_probes = not self.in_freeze(ws.now, ws.end_minute)
         out: list[PatchRequest] = []
         scopes = [DEFAULT_COHORT] + sorted(k for k in ws.live.allocations
                                            if k != DEFAULT_COHORT
@@ -543,7 +543,7 @@ class DidHealthModel:
         return PatchRequest(wf=ws.spec.workflow_id, owner=OWNER,
                             path=("alloc", scope, "caller_id"),
                             value=FrozenDict({k: round(v, 9) for k, v in value.items()}),
-                            cls=cls, p0_rank=rank, evidence=freeze(ev), decision_id=0)
+                            cls=cls, p0_rank=rank, evidence=freeze(ev))
 
 
 # =============================================================================== DID posterior

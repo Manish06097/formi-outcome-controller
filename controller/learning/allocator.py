@@ -37,7 +37,7 @@ from controller.learning.engagement import (CLOSED_EXPERIMENT_STATES, ENGAGEMENT
                                             EffectCache, dim_arms, p_best)
 from controller.learning.harm import GateContext, GateResult, largest_passing
 from controller.settings import Settings, Thresholds
-from controller.snapshot import LearningSnapshot, active_population
+from controller.snapshot import active_population
 from controller.types import (DEFAULT_COHORT, P1_ROLLBACK, P3_ROUTINE, Config, DidPosterior,
                               Draws, Experiment, FrozenDict, GuardrailForecast, HarmReport,
                               PatchRequest, WorkflowSnapshot)
@@ -125,14 +125,14 @@ def _arm_state(ws: WorkflowSnapshot, exp_id: str | None, arm: str, scope: str) -
 
 
 def _decay_alarm(ws: WorkflowSnapshot, dim: str, arm: str, scope: str) -> bool:
-    for s in getattr(ws, "decay", ()) or ():
+    for s in ws.decay:
         if s.dim == dim and s.arm == arm and s.alarm and s.scope in (scope, "population"):
             return True
     return False
 
 
 def _holdout_share(ws: WorkflowSnapshot, dim: str, scope: str) -> float:
-    for h in getattr(ws, "holdouts", ()) or ():
+    for h in ws.holdouts:
         if h.dim == dim and h.scope in (scope, "population") and h.state == "active":
             return float(h.share)
     return 0.0
@@ -289,7 +289,7 @@ def open_experiments(ws: WorkflowSnapshot, settings: Settings | Thresholds | Non
 def plan_allocation_detail(ws: WorkflowSnapshot, draws_ew: Draws | EffectCache, *,
                            settings: Settings | Thresholds | None = None,
                            guard_fn: GuardFn | None = None, did_post: DidPosterior | None = None,
-                           max_tv: float | None = None, decision_id: int = 0,
+                           max_tv: float | None = None, decision_id: int | None = None,
                            ctx: GateContext | None = None,
                            t_apply: int | None = None) -> AllocationPlan:
     """The full planning computation, with every intermediate result for the decision row.
@@ -312,7 +312,7 @@ def plan_allocation_detail(ws: WorkflowSnapshot, draws_ew: Draws | EffectCache, 
         shifted = apply_time_cache(ws, draws_ew, t_apply, t)
         if shifted.shifts:
             trend_ctx = GateContext(shifted, active_population(ws),
-                                    cells=getattr(ws, "cells", {}), settings=t)
+                                    cells=ws.cells, settings=t)
     plan = _plan(ws, draws_ew, settings=settings, guard_fn=guard_fn, did_post=did_post,
                  max_tv=max_tv, decision_id=decision_id, ctx=ctx, trend_ctx=trend_ctx)
     return replace(plan, new_experiments=opened) if opened else plan
@@ -331,13 +331,13 @@ def merge_results(now: GateResult, at_apply: GateResult | None) -> GateResult:
 
 def _plan(ws: WorkflowSnapshot, draws_ew: Draws | EffectCache, *,
           settings: Settings | Thresholds | None, guard_fn: GuardFn | None,
-          did_post: DidPosterior | None, max_tv: float | None, decision_id: int,
+          did_post: DidPosterior | None, max_tv: float | None, decision_id: int | None,
           ctx: GateContext | None, trend_ctx: GateContext | None = None) -> AllocationPlan:
     t = _thresholds(settings)
     live = ws.live
     dims = _engagement_dims(ws, t)
     pop = active_population(ws)
-    ctx = ctx or GateContext(draws_ew, pop, cells=getattr(ws, "cells", {}), settings=t)
+    ctx = ctx or GateContext(draws_ew, pop, cells=ws.cells, settings=t)
     cohorts = _cohorts(live)
     empty = AllocationPlan(proposed=live, patches=(), kind="none", lambdas={}, common_factor=0.0,
                            targets={}, removed=(), harm=None, expected_gain=0.0)
@@ -432,7 +432,7 @@ def _removal_only(ws: WorkflowSnapshot, ctx: GateContext, live: Config,
                   dims: Sequence[DimArms], removed: set[tuple[str, str, str]],
                   gate: Callable[[Config, Sequence[str] | None], GateResult],
                   ok: Callable[[GateResult, Sequence[str] | None], bool], t: Thresholds,
-                  decision_id: int) -> AllocationPlan | None:
+                  decision_id: int | None) -> AllocationPlan | None:
     """Move only the removed arms' share to the control, as far as the gate allows."""
     full: dict[str, dict[str, dict[str, float]]] = {}
     for k in _cohorts(live):
@@ -505,7 +505,7 @@ def _expected_gain(r: GateResult) -> float:
 
 
 def _patches(ws: WorkflowSnapshot, live: Config, new: Config, cls: int,
-             evidence: Mapping[str, Any], decision_id: int) -> tuple[PatchRequest, ...]:
+             evidence: Mapping[str, Any], decision_id: int | None) -> tuple[PatchRequest, ...]:
     out = []
     for k in _cohorts(live):
         for dim in ENGAGEMENT_DIMS:
@@ -531,13 +531,13 @@ def _freeze(x: Any) -> Any:
 # ============================================================================== harm stop
 
 def harm_stops(ws: WorkflowSnapshot, draws_ew: Draws | EffectCache, *,
-               settings: Settings | Thresholds | None = None, decision_id: int = 0,
+               settings: Settings | Thresholds | None = None, decision_id: int | None = None,
                ctx: GateContext | None = None) -> list[PatchRequest]:
     """P1 risk-reducing moves of clearly bad arms to the control (runs every step, 5.4)."""
     t = _thresholds(settings)
     live = ws.live
     pop = active_population(ws)
-    ctx = ctx or GateContext(draws_ew, pop, cells=getattr(ws, "cells", {}), settings=t)
+    ctx = ctx or GateContext(draws_ew, pop, cells=ws.cells, settings=t)
     props: dict[str, dict[str, dict[str, float]]] = {}
     stopped: list[dict[str, Any]] = []
     for arms in _engagement_dims(ws, t):

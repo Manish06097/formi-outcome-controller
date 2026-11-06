@@ -48,8 +48,8 @@ from typing import Any, Literal, Mapping, Sequence
 import numpy as np
 
 from controller.settings import Settings, Thresholds
-from controller.snapshot import (LearningSnapshot, active_population, cohort_of_cells,
-                                 ew_weights, option_index, segment_of)
+from controller.snapshot import (active_population, cohort_of_cells, ew_weights, option_index,
+                                 segment_of)
 from controller.stats.draws import seeded_draws
 from controller.stats.glm import SparseDesign, fit_ridge_logit
 from controller.stats.ratios import mantel_haenszel, shared_control_cov
@@ -99,7 +99,7 @@ def dim_arms(ws: WorkflowSnapshot, dim: str) -> DimArms:
 
 def model_cells(ws: WorkflowSnapshot) -> list[int]:
     """Every cell the model gives an effect to: catalogue, rollups and active leads."""
-    cells: set[int] = set(int(c) for c in getattr(ws, "cells", {}) or {})
+    cells: set[int] = set(int(c) for c in ws.cells)
     cells.update(int(c) for c in np.unique(ws.engage.cell))
     pop = active_population(ws)
     cells.update(int(c) for c in pop.cells)
@@ -273,7 +273,7 @@ class BetaBinomialModel:
     def fit(self, ws: WorkflowSnapshot, kind: FitKind) -> Posterior:
         t = self.t
         cells = model_cells(ws)
-        cmap_list = cohort_of_cells(ws.live, getattr(ws, "cells", {}) or {}, cells)
+        cmap_list = cohort_of_cells(ws.live, ws.cells, cells)
         coh_of = dict(zip(cells, cmap_list))
         cohorts = _cohort_order(ws, cmap_list)
         pop = active_population(ws)
@@ -390,7 +390,7 @@ class RidgeLogitModel:
         e = ws.engage
         cells = model_cells(ws)
         cell_pos = {c: i for i, c in enumerate(cells)}
-        catalogue = getattr(ws, "cells", {}) or {}
+        catalogue = ws.cells
         levels: dict[str, list[str]] = {}
         for fname, attr in FEATURES:
             levels[fname] = sorted({getattr(catalogue[c], attr) for c in cells if c in catalogue})
@@ -627,4 +627,4 @@ def p_best(effects: Mapping[str, np.ndarray], control: str) -> dict[str, float]:
 
 
 __all__ = ["BetaBinomialModel", "RidgeLogitModel", "DimArms", "dim_arms", "EffectCache",
-           "make_engagement_model", "p_best", "model_cells", "ENGAGEMENT_DIMS", "LearningSnapshot"]
+           "make_engagement_model", "p_best", "model_cells", "ENGAGEMENT_DIMS"]

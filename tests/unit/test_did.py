@@ -241,6 +241,21 @@ def test_freeze_blocks_new_probes_but_not_spreads():
     assert set(v) == {"D1", "D2"}
 
 
+def test_freeze_reads_the_snapshot_end_minute():
+    """The snapshot's end_minute (from /sim/state) drives the freeze; the model needs none."""
+    spec = synth.make_spec(dids=("D1", "D2", "D3", "D4"))
+    st = {n: DidState("wf_a", n, s) for n, s in
+          {"D1": "healthy", "D2": "healthy", "D3": "unknown", "D4": "unknown"}.items()}
+    ws = synth.snapshot(spec, live=synth.config({"D1": 1.0}), did_state=st, now=9 * 1440,
+                        end_minute=10 * 1440)
+    v = dict(DidHealthModel().plan_caller_ids(ws)[0].value)
+    assert set(v) == {"D1", "D2"}
+    start = 10 * 1440 - int(0.15 * 10 * 1440)                   # max(1 day, 15%) = 2160 min
+    assert DidHealthModel().in_freeze(start, 10 * 1440)
+    assert not DidHealthModel().in_freeze(start - 1, 10 * 1440)
+    assert not DidHealthModel().in_freeze(9 * 1440)
+
+
 def test_fast_drain_is_a_p0b_chain_step_where_auto_applies():
     reqs = plan({"D1": "healthy", "D2": "degraded", "D3": "healthy", "D4": "unknown"},
                 {"D1": 0.307, "D2": 0.386, "D3": 0.307}, fast=("D2",), max_shift=0.2)

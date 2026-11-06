@@ -34,6 +34,20 @@ def rng(seed: int) -> np.random.Generator:
     return np.random.Generator(np.random.PCG64(int(seed) % SEED_MOD))
 
 
+STREAM_DIGEST = "d38f57c7bd0b0d7fd134521b1a07d7d7074d4763fd44a0c085e1d76df2c63472"
+"""`stream_digest()` under the numpy of requirements-runtime.lock. numpy promises the bit generator
+but not its distribution methods across versions (NEP 19), so the lock pins the version, and
+tests/unit/test_numpy_stream.py fails when a bump changes the draws."""
+
+
+def stream_digest() -> str:
+    """sha256 of a fixed sequence through every Generator method the controller uses."""
+    g = rng(20261107)
+    parts = (g.standard_normal(16), g.standard_normal((3, 4)), g.random(8),
+             g.uniform(0.3, 0.9, 8), g.normal(0.1, 0.2, 8))
+    return hashlib.sha256(b"".join(p.tobytes() for p in parts)).hexdigest()
+
+
 def cholesky_psd(cov: np.ndarray) -> np.ndarray:
     """A lower factor L with L L' = cov for a symmetric positive semi-definite matrix.
 

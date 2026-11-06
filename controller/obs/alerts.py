@@ -77,6 +77,12 @@ CODES: dict[str, AlertCode] = {c.code: c for c in (
               "simulator"),
     AlertCode("INTENT_UNKNOWN", "page", "event",
               "reconciliation could not tell whether a side effect happened"),
+    AlertCode("SAFE_MODE", "page", "event",
+              "a hook crashed repeatedly at one step; the loop keeps advancing without it"),
+    AlertCode("LIMP_MODE", "page", "event",
+              "the controller could not run; the scenario is only being advanced to its end"),
+    AlertCode("DIRECTIVE_UNMATCHED", "page", "event",
+              "a client directive matches no workflow, so its memo promise is not applied"),
     # ------------------------------------------------------------------ morning digest (right column)
     AlertCode("APPROVAL_REJECTED", "digest", "event",
               "an approver rejected a request (re-queued with fresh data automatically)"),

@@ -166,6 +166,45 @@ found no provenance row for an option the customer actually heard.
 **Do:** our config mirror is wrong. Compare `config_version.config` with
 `GET /workflows/{id}/config` and fix the mirror before anything else is proposed on the workflow.
 
+<a id="SAFE_MODE"></a>
+### SAFE_MODE
+
+**Means:** one hook of the loop crashed repeatedly at one step (or the process died in it, or it
+hung). The run keeps advancing without that hook, because an unfinished scenario is the worst
+outcome. If the hook is `decide` or `detect`, nothing new is being learned; if `lifecycle`,
+approvals are not being applied.
+
+**Look first:** `SELECT point, state, since_minute, reason, skips FROM hook_guard;` and
+`SELECT * FROM audit_log WHERE action IN ('safe_mode_entered', 'hook_skipped') ORDER BY audit_id;`.
+
+**Do:** fix the bug named in `reason`. A guarded hook keeps being tried at every step, so one that
+only failed on one step's data has recovered if its `hook_skipped` rows stopped. A disabled hook
+stays off for this run. Safe mode is per run schema: a new run starts clean.
+
+<a id="LIMP_MODE"></a>
+### LIMP_MODE
+
+**Means:** the core loop crash-looped, the configuration is fatal, or Docker could not run the
+controller. `controller/loop/limp.py` advanced the simulator to its end with no decisions, so the
+scenario finished but nothing was optimised after that point. run.sh's last line says DEGRADED.
+
+**Look first:** the run.sh log before the `last resort` line: the last exit code and traceback.
+
+**Do:** fix the cause, then run the scenario again on a fresh simulator.
+
+<a id="DIRECTIVE_UNMATCHED"></a>
+### DIRECTIVE_UNMATCHED
+
+**Means:** a rule in `controller/directives.yaml` names a tenant or use case that no workflow from
+`GET /workflows` has. The workflows that rule was written for fall back to the defaults, so a memo
+promise may not be applied.
+
+**Look first:** the alert text (it lists the rule, its memo and the live tenants) and
+`SELECT * FROM audit_log WHERE action = 'directive_unmatched';`.
+
+**Do:** if the tenant was renamed, update the rule. The defaults only ever tighten the API policy,
+so nothing unsafe happened, but tell the client which promise is not in force.
+
 <a id="CRASH_LOOP"></a>
 ### CRASH_LOOP
 

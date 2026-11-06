@@ -439,8 +439,10 @@ class EnvSettings:
     get_retry_base_s: float = 0.5
     get_retry_max_s: float = 30.0
     """Exponential backoff 0.5 s to 30 s with jitter for idempotent GETs (8.4)."""
-    get_retry_budget_s: float = 0.0
-    """Give up a GET after this long; 0 = keep retrying (the orchestrator pages at 5 min)."""
+    get_retry_budget_s: float = 1800.0
+    """CTL_GET_RETRY_BUDGET_S: give up a GET after this long and exit 1 (AUDIT-1 finding 15; the
+    orchestrator pages SIM_UNREACHABLE at alert_get_retry_page_s). 0 = retry forever. A restart then
+    waits CTL_SIM_WAIT for /health and exits 3, so a dead simulator ends run.sh in bounded time."""
     ingest: str = "sql"
     """CTL_INGEST: sql | python (the fallback parser, 3.1)."""
     llm_suggest: bool = True
@@ -454,8 +456,22 @@ class EnvSettings:
     governance runs but nothing emits patches (the M2 no-op loop, used by the platform tests)."""
     fault: str | None = None
     """CTL_FAULT=<kind>:<n>:<phase> crash injection (10.2)."""
-    max_restarts: int = 20
-    """CTL_MAX_RESTARTS (run.sh restart loop)."""
+    max_restarts: int = 30
+    """CTL_MAX_RESTARTS (run.sh restart loop): restarts with no progress in the store (ADR 0019).
+    30 leaves room for every hook point to reach safe mode at one step."""
+    safe_mode_crashes: int = 3
+    """CTL_SAFE_MODE_CRASHES: exceptions in one hook at one step before it is guarded
+    (loop/safemode.py). Not a decision threshold, so not part of settings_hash."""
+    safe_mode_hard_crashes: int = 8
+    """CTL_SAFE_MODE_HARD_CRASHES: process deaths inside one hook at one step (no exception) before
+    it is disabled. Higher than safe_mode_crashes because a death may be someone's kill -9 and not
+    the hook's fault: random kills must not switch a healthy hook off."""
+    stage_watchdog_s: float = 1200.0
+    """CTL_STAGE_WATCHDOG_S: a hook running longer than this is hung: the process exits so it can
+    be judged by a restart. 0 disables. The wall budget of a whole sim day is 600 s (DESIGN.md 15)."""
+    hook_fault: str | None = None
+    """CTL_HOOK_FAULT=<point>:<from_minute>:<raise|kill|hang>[,...]: test-only failures of a hook
+    point from a sim minute on, to exercise safe mode end to end (reliability/faults.py)."""
     stop_after_steps: int | None = None
     """CTL_STOP_AFTER_STEPS=n: exit 1 after n steps of this process (tests of resume)."""
     synthetic_markers: tuple[SyntheticMarker, ...] = ()
@@ -518,6 +534,12 @@ class EnvSettings:
             learner=learner or d.learner,
             fault=_env_str(env, "CTL_FAULT"),
             max_restarts=int(_env_num(env, "CTL_MAX_RESTARTS", d.max_restarts, int)),
+            safe_mode_crashes=max(1, int(_env_num(env, "CTL_SAFE_MODE_CRASHES",
+                                                  d.safe_mode_crashes, int))),
+            safe_mode_hard_crashes=max(1, int(_env_num(env, "CTL_SAFE_MODE_HARD_CRASHES",
+                                                       d.safe_mode_hard_crashes, int))),
+            stage_watchdog_s=float(_env_num(env, "CTL_STAGE_WATCHDOG_S", d.stage_watchdog_s)),
+            hook_fault=_env_str(env, "CTL_HOOK_FAULT"),
             stop_after_steps=_positive_or_none(env, "CTL_STOP_AFTER_STEPS"),
             synthetic_markers=parse_synthetic_markers(env.get("CTL_SYNTHETIC_MARKERS")),
             prefetch_chunks=max(0, int(_env_num(env, "CTL_PREFETCH_CHUNKS", d.prefetch_chunks,

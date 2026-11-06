@@ -3,7 +3,7 @@ name = "formi-controller"
 version = "0.1.0"
 description = "Outcome-first controller for the Formi voice-agent simulator (talks to it only over HTTP)."
 requires-python = ">=3.11"
-# Runtime dependencies; pinned ranges live in requirements.txt and requirements-controller.txt.
+# Runtime dependencies as ranges; the image installs the exact versions of requirements-runtime.lock.
 dependencies = [
     "numpy>=1.26",
     "pyyaml>=6.0",

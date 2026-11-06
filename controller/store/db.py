@@ -250,6 +250,15 @@ class Database:
                    ORDER BY created_wall DESC, schema_name DESC""", (fingerprint,)).fetchall()
         return [RunRecord(*r) for r in rows]
 
+    def done_runs(self, fingerprint: str) -> list[RunRecord]:
+        """Registry rows for this fingerprint that finished, newest first."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT schema_name, fingerprint, sim_url, status, last_sim_minute, created_wall
+                   FROM ctl.run_registry WHERE fingerprint = %s AND status = 'done'
+                   ORDER BY created_wall DESC, schema_name DESC""", (fingerprint,)).fetchall()
+        return [RunRecord(*r) for r in rows]
+
     def create_run_schema(self, fingerprint: str, sim_url: str,
                           sim_days: int | None = None) -> str:
         """Create `run_<fp12>_<n+1>`, apply every run migration and register it, atomically.

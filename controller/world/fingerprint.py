@@ -6,8 +6,10 @@ The simulator keeps its world in memory and has no run id, so a restarted simula
 of the same scenario, looks exactly like the old one by name. Two layers separate them:
 
 1. `fingerprint` = sha256 of what the API says the world is: scenario name, end minute, tick, every
-   workflow's (id, tenant, governance, options), and history chunk 0's metadata. Runs with another
-   fingerprint are never candidates.
+   workflow's (id, tenant, options), and history chunk 0's metadata. Runs with another fingerprint
+   are never candidates. The governance policy is left out on purpose: it may change while a world
+   runs (DESIGN.md 9.7, re-read every step), and a new fingerprint on restart would abandon the
+   schema, losing pending approvals and learned state (constraint 8).
 2. A candidate schema with the same fingerprint (status not done, newest first) is resumed only
    if our store is consistent with the live simulator: our clock is not ahead of it, our chunks
    and event ids are a prefix of its own (the newest one matching chunk for chunk), every
@@ -44,9 +46,9 @@ class WorldIdentity:
 def fingerprint(state: SimState, specs: Sequence[WorkflowSpec],
                 history0: ChunkMeta | None) -> str:
     """sha256 of the world's API-visible identity (DESIGN.md 8.5). Leaves out everything that
-    changes while the world runs (clock, credits, chunk count, config versions)."""
-    wfs = sorted(([s.workflow_id, s.tenant_id, dict(s.raw["governance"]), dict(s.raw["options"])]
-                  for s in specs), key=lambda w: w[0])
+    can change while the world runs (clock, credits, chunk count, config versions, policy)."""
+    wfs = sorted(([s.workflow_id, s.tenant_id, dict(s.raw["options"])] for s in specs),
+                 key=lambda w: w[0])
     h0 = None if history0 is None else [history0.events, history0.last_event_id]
     return sha256_hex({"scenario": state.scenario, "end_minute": state.end_minute,
                        "tick_minutes": state.tick_minutes, "workflows": wfs, "history0": h0})
@@ -130,13 +132,24 @@ class RunResolution:
     schema: str
     resumed: bool
     rejected: tuple[Consistency, ...] = field(default_factory=tuple)
+    already_done: bool = False
+    """The simulator has finished and this schema already recorded that run to its end."""
 
 
 def resolve_run(db: Database, client: SimClient, ident: WorldIdentity,
                 sim_url: str) -> RunResolution:
     """Resume the newest consistent candidate, else create and register a fresh schema.
-    Rejected candidates are marked abandoned (their world is gone) and kept for audit."""
+    Rejected candidates are marked abandoned (their world is gone) and kept for audit.
+
+    A finished simulator whose whole run is already in a done schema has nothing left to do: the
+    answer is that schema, at once, instead of a fresh schema and a full re-ingest (a second
+    run.sh after the first one finished, or an orphan that finished first; AUDIT-1 finding 11)."""
     db.ensure_ctl()
+    if ident.state.finished:
+        for run in db.done_runs(ident.fingerprint):
+            if check_consistency(db, run.schema_name, client, ident).ok:
+                log.info("the scenario has finished and run %s has it all", run.schema_name)
+                return RunResolution(run.schema_name, True, already_done=True)
     rejected = []
     for cand in db.run_candidates(ident.fingerprint):
         res = check_consistency(db, cand.schema_name, client, ident)

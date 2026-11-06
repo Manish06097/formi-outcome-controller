@@ -1,7 +1,7 @@
 """Simulated-time helpers: tick arithmetic, approver working time, expiry probability and the
 apply-window step bound.
 
-Owner: track T1 (milestone M2); T2 builds `governance/timing.py` (slots, choose_submit) on top.
+Owners: track T1 (milestone M2) and track T2 (milestone M3, the governance helpers at the end).
 Implements DESIGN.md 4.2 (`s_watch_max`, decision visibility) and 6.3 (`next_working`,
 `p_expire`, submit candidates).
 
@@ -11,8 +11,9 @@ since D0 00:00 (negative in history), so day and minute-of-day use floor divisio
 """
 from __future__ import annotations
 
+import math
 from fractions import Fraction
-from typing import Iterator, Sequence
+from typing import Iterable, Iterator, Sequence
 
 MINUTES_PER_DAY = 1440
 
@@ -131,3 +132,89 @@ def may_decide_between(start: int, end: int, hours: Sequence[int]) -> bool:
     """True if any minute in [start, end) is approver working time, so a pending approval could
     be decided in that interval."""
     return any(True for _ in approver_minutes(start, end, hours))
+
+
+# =============================================================================== governance helpers (T2)
+# Contract-equivalent helpers written by track T2 for governance/timing.py and release.py.
+
+def ceil_to_tick(m: int, tick: int) -> int:
+    return -(-m // tick) * tick
+
+
+def floor_to_tick(m: int, tick: int) -> int:
+    return (m // tick) * tick
+
+
+def day_start(m: int) -> int:
+    return (m // MINUTES_PER_DAY) * MINUTES_PER_DAY
+
+
+def in_approver_hours(t: int, approver_hours: tuple[int, int]) -> bool:
+    lo, hi = approver_hours
+    return lo * 60 <= minute_of_day(t) < hi * 60
+
+
+def next_open(t: int, approver_hours: tuple[int, int]) -> int:
+    """The first approver-open minute at or after t (t itself if t is exactly the opening)."""
+    lo, _ = approver_hours
+    start = day_start(t) + lo * 60
+    return start if start >= t else start + MINUTES_PER_DAY
+
+
+def ttl_minutes(ttl_hours: float) -> int:
+    """The simulator's `int(ttl * 60)` (expires_in_hours is left at the policy TTL, F11)."""
+    return int(ttl_hours * 60)
+
+
+def latencies(latency_minutes: tuple[int, int]) -> range:
+    """Every latency the approver can draw: uniform on the integers [lo, hi]."""
+    lo, hi = latency_minutes
+    return range(lo, hi + 1)
+
+
+def decide_minutes(t: int, latency_minutes: tuple[int, int],
+                   approver_hours: tuple[int, int]) -> list[int]:
+    """The decide minute for every possible latency, in latency order."""
+    return [next_working(t + L, approver_hours) for L in latencies(latency_minutes)]
+
+
+def p_expire_raw(t: int, latency_minutes: tuple[int, int], approver_hours: tuple[int, int],
+                 ttl_min: int) -> float:
+    """Exact P(expire) of a request submitted at minute t (DESIGN.md 6.3, F3)."""
+    ds = decide_minutes(t, latency_minutes, approver_hours)
+    bad = sum(1 for d in ds if d > t + ttl_min)
+    return bad / len(ds)
+
+
+def worst_decide_minute(t: int, latency_minutes: tuple[int, int],
+                        approver_hours: tuple[int, int]) -> int:
+    """Latest possible decide minute (next_working is monotone, so it is at L = hi)."""
+    return next_working(t + latency_minutes[1], approver_hours)
+
+
+def visible_minute(decide: int, tick: int) -> int:
+    """First stop at which a decision at minute `decide` can be seen."""
+    return ceil_to_tick(decide, tick) + tick
+
+
+def expected_visible_minute(t: int, latency_minutes: tuple[int, int],
+                            approver_hours: tuple[int, int], tick: int) -> float:
+    ds = decide_minutes(t, latency_minutes, approver_hours)
+    return sum(visible_minute(d, tick) for d in ds) / len(ds)
+
+
+def apply_window_minutes(apply_window_hours: float) -> int:
+    """Latest whole minute offset after the decision at which an apply still succeeds: the
+    simulator lapses when `now > decided + 60 x hours`, so floor of that (exact for whole and
+    half hours, conservative otherwise)."""
+    return int(math.floor(apply_window_hours * 60))
+
+
+def latest_safe_apply(apply_by: int, tick: int) -> int:
+    """We apply only while `now <= apply_by - tick` (one tick of margin, DESIGN.md 6.1)."""
+    return apply_by - tick
+
+
+def tick_grid(start: int, end: int, tick: int) -> Iterable[int]:
+    """Tick-aligned minutes in [start, end)."""
+    return range(ceil_to_tick(start, tick), end, tick)

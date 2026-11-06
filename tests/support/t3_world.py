@@ -141,9 +141,14 @@ class SyntheticWorld:
         return ("harmful" if de < -0.01 else "beneficial" if de > 0.01 else "neutral"), de
 
     # ------------------------------------------------------------------ data
-    def simulate_segment(self, cfg: Config, seg: int, version: int = 1, prompt: int = 0) -> None:
-        """Connected calls of one half-day segment under cfg (counts aggregated like r_engage)."""
-        n_total = self.connected_per_day // 2
+    def simulate_segment(self, cfg: Config, seg: int, version: int = 1, prompt: int = 0,
+                         frac: float = 1.0, pos: float | None = None) -> None:
+        """Connected calls of one half-day segment under cfg (counts aggregated like r_engage),
+        or of a fraction `frac` of it centred at segment position `pos` (finer time steps:
+        the multipliers are evaluated at `pos`, rows still carry the segment index)."""
+        n_total = int(round(self.connected_per_day / 2 * frac))
+        t_mid = seg + 0.5 if pos is None else pos
+        t_start = t_mid - frac / 2
         ids = sorted(self.cells)
         share = self.leads[ids] / self.leads[ids].sum()
         per_cell = self.rng.multinomial(n_total, share)
@@ -161,9 +166,9 @@ class SyntheticWorld:
             for idx in np.flatnonzero(counts):
                 wi, vi = divmod(int(idx), len(vopts))
                 for dim, o in (("welcome_message", wopts[wi]), ("voice", vopts[vi])):
-                    self.first_exposure.setdefault((dim, o), float(seg))
-                m = (self.multiplier("welcome_message", wopts[wi], cell, seg + 0.5)
-                     * self.multiplier("voice", vopts[vi], cell, seg + 0.5))
+                    self.first_exposure.setdefault((dim, o), float(t_start))
+                m = (self.multiplier("welcome_message", wopts[wi], cell, t_mid)
+                     * self.multiplier("voice", vopts[vi], cell, t_mid))
                 p = min(self.e0[c] * m, 0.95)
                 eng = int(self.rng.binomial(int(counts[idx]), p))
                 for key, val in (("seg", seg), ("cell", c), ("config_version", version),
@@ -178,11 +183,19 @@ class SyntheticWorld:
         return ActivePopulation(cells=ids, leads=leads, mix=leads / leads.sum(),
                                 cohort_of_cell=FrozenDict({int(c): k for c, k in zip(ids, coh)}))
 
+    def minute(self, pos: float) -> int:
+        """Simulated minute of a fractional segment position (dialling time)."""
+        lo, hi = self.spec.dialling_window
+        seg = int(pos // 1)
+        return segment_start_minute(seg, self.spec.dialling_window) + int(
+            round((pos - seg) * (hi - lo) * 30))
+
     def snapshot(self, cfg: Config, seg_now: int, *, policy: EffectivePolicy | None = None,
                  experiments: Sequence[Experiment] = (), looks: Sequence[LookRecord] = (),
                  decay: Sequence[DecayMonitorState] = (), holdouts: Sequence[HoldoutState] = (),
-                 version: int = 1, run_id: str = "run_test"):
-        now = segment_start_minute(seg_now, self.spec.dialling_window) + 30
+                 version: int = 1, run_id: str = "run_test", now: int | None = None):
+        if now is None:
+            now = segment_start_minute(seg_now, self.spec.dialling_window) + 30
         return build_snapshot(
             spec=self.spec, policy=policy or make_policy(), live=cfg, live_version=version,
             now=now, engage=engage_from_columns(self.rows), experiments=experiments,

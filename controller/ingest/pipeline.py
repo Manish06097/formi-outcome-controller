@@ -101,6 +101,8 @@ class ChunkResult:
     unknown_options: int
     bytes: int
     txn_ms: int
+    last_event_id: int = 0
+    until_minute: int = 0
     step_ms: dict[str, int] = field(default_factory=dict)
     config_events: list[ConfigEvent] = field(default_factory=list)
     approval_events: list[ApprovalEvent] = field(default_factory=list)
@@ -184,7 +186,8 @@ class IngestPipeline:
     def _transform(self, meta: ChunkMeta, nbytes: int) -> ChunkResult:
         maybe_crash("chunk_transform", "before_t1")
         t0 = time.monotonic()
-        res = ChunkResult(meta.chunk, meta.events, 0, 0, 0, 0, nbytes, 0)
+        res = ChunkResult(meta.chunk, meta.events, 0, 0, 0, 0, nbytes, 0,
+                          last_event_id=meta.last_event_id, until_minute=meta.until_minute)
         with self.db.tx() as conn:
             if conn.execute("SELECT 1 FROM ingested_chunk WHERE chunk_no = %s",
                             (meta.chunk,)).fetchone():
@@ -255,7 +258,8 @@ def _report(results: list[ChunkResult], skipped: tuple[int, ...], wall_ms: int) 
         chunks=tuple(r.chunk for r in done), events=sum(r.events for r in done),
         calls=sum(r.calls for r in done), leads=sum(r.leads for r in done),
         orphan_calls=sum(r.orphan_calls for r in done),
-        last_event_id=0, until_minute=0, wall_ms=wall_ms,
+        last_event_id=max((r.last_event_id for r in done), default=0),
+        until_minute=max((r.until_minute for r in done), default=0), wall_ms=wall_ms,
         config_events=tuple(e for r in done for e in r.config_events),
         approval_events=tuple(e for r in done for e in r.approval_events),
         skipped_chunks=skipped + tuple(r.chunk for r in results if r.skipped))

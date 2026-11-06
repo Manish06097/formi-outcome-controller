@@ -4,3 +4,6 @@ __pycache__/
 .venv/
 .claude/settings.local.json
 reports/baseline_*.md
+
+# Vendored wheels are a build input (scripts/vendor_wheels.sh, ADR 0019)
+vendor/wheels/*.whl

@@ -1,0 +1,2 @@
+-- Set-based transform and rollups for one chunk (DESIGN.md 3.1).
+-- Owner: track T1 (milestone M1). Placeholder created by M0.

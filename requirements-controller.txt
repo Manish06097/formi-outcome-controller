@@ -1,0 +1,5 @@
+# Controller dependencies on top of requirements.txt (numpy, pyyaml, fastapi, uvicorn, httpx, pytest).
+# Every line is justified by docs/decisions/0001-stack.md: psycopg 3 is the Postgres driver (COPY for
+# bulk ingest); the [pool] extra is psycopg's own connection pool (psycopg_pool, same project), used by
+# controller/store/db.py for the three connections of DESIGN.md section 2.
+psycopg[binary,pool]>=3.2,<4

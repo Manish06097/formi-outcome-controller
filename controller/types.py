@@ -1695,6 +1695,19 @@ class Proposal:
     p0_rank: int | None = None
     """0 = P0a prompt safety, 1 = P0b DID drain, None unless cls == 0 (`proposal.p0_rank`,
     migration 0009; release precedence and supersede read it, ADR 0013)."""
+    velocity: tuple[tuple[str, str, float, bool], ...] = ()
+    """(cohort, dim, TV, exposure-increasing) per changed agent (cohort, dim) of the composition,
+    fixed at draft time (`proposal.velocity`, migration 0013). Counted in the velocity ledger only
+    once the proposal is applied (DESIGN.md 6.5 rule 4, ADR 0029)."""
+    applied_minute: Minute | None = None
+    """Sim minute the proposal's config became live (`proposal.applied_minute`)."""
+
+    def velocity_entries(self) -> tuple["VelocityEntry", ...]:
+        """This proposal's ledger entries; empty unless it is an applied auto-apply."""
+        if self.route != "auto" or self.applied_minute is None:
+            return ()
+        return tuple(VelocityEntry(self.applied_minute, k, d, tv, inc, self.proposal_id)
+                     for k, d, tv, inc in self.velocity)
 
     @property
     def in_flight(self) -> bool:

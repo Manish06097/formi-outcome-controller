@@ -21,8 +21,9 @@ Layout:
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
+from typing import Any, Callable, ContextManager, Iterable, Mapping, Protocol, Sequence
 
 from controller.governance.builder import RequestPackage
 from controller.governance.policy import needs_notice, sim_verdict
@@ -33,7 +34,8 @@ from controller.simclient import errors as E
 from controller.types import (IN_FLIGHT_STATES, P0_INCIDENT, P0A_PROMPT_SAFETY, P0B_DID_DRAIN,
                               P1_ROLLBACK, ApplyResult, ApprovalPublic, AutoApplyPolicy,
                               AutoApplyRequest, Composition, Decision, EffectivePolicy,
-                              FrozenDict, Hold, Proposal, SimEpoch, freeze, make_proposal_id)
+                              FrozenDict, Hold, Proposal, SimEpoch, VelocityEntry, freeze,
+                              make_proposal_id, thaw)
 
 # ---------------------------------------------------------------- the state machine (6.1)
 TRANSITIONS: dict[tuple[str, str], str] = {
@@ -71,6 +73,14 @@ TRANSITIONS: dict[tuple[str, str], str] = {
     ("applied", "verify_start"): "verifying",
     ("verifying", "verified"): "verified",
     ("verifying", "verify_failed"): "rollback",          # a new P1 proposal reverts it
+    # Crash recovery (DESIGN.md 8.3, ADR 0029). A drafted proposal whose request never reached the
+    # simulator goes back to DRAFT and is either resent with the same id and body (every SUBMITTING
+    # precondition still holds) or aborted; an apply that did not take effect returns to APPROVED,
+    # where the pre-apply checks run again.
+    ("submitting", "not_sent"): "draft",
+    ("auto_applying", "not_sent"): "draft",
+    ("draft", "abort"): "discarded",
+    ("applying", "not_applied"): "approved",
 }
 TERMINAL_STATES = frozenset({"discarded", "rejected", "expired", "stale", "lapsed_local",
                              "superseded", "abandoned", "failed", "failed_policy", "verified",
@@ -277,6 +287,12 @@ class ProposalStore(Protocol):
     def transitions_of(self, proposal_id: str) -> list[TransitionRow]: ...
     def mirror(self, a: ApprovalPublic, epoch: SimEpoch, minute: int) -> None: ...
     def mirrored_reasons(self, approval_id: str) -> tuple[str, ...]: ...
+    def atomic(self) -> ContextManager[Any]:
+        """Group several writes into one transaction (a no-op in memory)."""
+        ...
+    def velocity_entries(self, wf: str, since_minute: int) -> list[VelocityEntry]:
+        """Ledger entries of applied auto-applies with `applied_minute > since_minute`."""
+        ...
 
 
 class InMemoryProposalStore:
@@ -363,6 +379,14 @@ class InMemoryProposalStore:
     def mirrored_reasons(self, approval_id: str) -> tuple[str, ...]:
         return tuple((self.approvals.get(approval_id) or {}).get("reasons") or ())
 
+    def atomic(self) -> ContextManager[Any]:
+        return nullcontext()
+
+    def velocity_entries(self, wf: str, since_minute: int) -> list[VelocityEntry]:
+        out = [e for p in self.rows.values() if p.wf == wf for e in p.velocity_entries()
+               if e.minute > since_minute]
+        return sorted(out, key=lambda e: (e.minute, e.proposal_id, e.cohort, e.dim))
+
 
 # ---------------------------------------------------------------- the lifecycle
 class SimReader(Protocol):
@@ -374,7 +398,25 @@ class SimReader(Protocol):
 
 
 class Executor(Protocol):
-    def execute(self, kind: str, key: str, payload: dict[str, Any], decision: Decision) -> Any: ...
+    """Runs one side effect. `before` (when given) is the proposal's "before" transition: the
+    production executor (`governance/effects.py` over T1's IntentExecutor) runs it inside the
+    write-ahead T1 transaction, after the decision and intent rows; a test executor runs it
+    first. The response is the typed API value or its JSON form."""
+
+    def execute(self, kind: str, key: str, payload: dict[str, Any], decision: Decision, *,
+                before: Callable[[], None] | None = None) -> Any: ...
+
+
+EFFECT_KINDS = ("submit_approval", "auto_apply", "apply")
+"""The intent kinds whose domain transitions this module owns (8.3)."""
+
+
+def _approval(x: Any) -> ApprovalPublic:
+    return x if isinstance(x, ApprovalPublic) else ApprovalPublic.from_api(x)
+
+
+def _apply_result(x: Any) -> ApplyResult:
+    return x if isinstance(x, ApplyResult) else ApplyResult.from_api(x)
 
 
 @dataclass
@@ -396,6 +438,9 @@ class LifecycleDeps:
     verifiers: Mapping[str, Verifier] = field(default_factory=dict)
     on_alert: Callable[[str, str, str], None] = lambda code, wf, msg: None
     on_rollback: Callable[[Proposal, VerifyResult], None] = lambda p, r: None
+    on_applied: Callable[[Proposal, int], None] = lambda p, version: None
+    """Called in the transaction that marks a proposal APPLIED (the config mirror records the
+    body we sent as `ours`, DESIGN.md 4.1 step 4)."""
 
 
 @dataclass(frozen=True)
@@ -407,7 +452,19 @@ class SubmitResult:
 
 class ProposalLifecycle:
     """Moves proposals through TRANSITIONS; the only module that calls submit, apply and
-    auto-apply (through the executor). DESIGN.md 11.2 interface plus keyword extensions."""
+    auto-apply (through the executor). DESIGN.md 11.2 interface plus keyword extensions.
+
+    Side effects and their transitions (DESIGN.md 8.2, ADR 0029):
+    - the "before" transition (DRAFT -> SUBMITTING, DRAFT/NOTICED -> AUTO_APPLYING,
+      APPROVED -> APPLYING) is passed to the executor and commits with the intent row (T1);
+    - `on_effect_done`, `on_effect_failed` and `on_effect_not_run` are the domain transitions.
+      The production executor calls them inside the intent's T2 (or the reconciler's)
+      transaction; the code after `execute` calls them again, which is a no-op when the state
+      already moved, so a test executor without hooks gets the same transitions;
+    - `recover(now)` resolves whatever a crash left between those transactions: a proposal still
+      in a call state is looked up at the simulator, and a DRAFT (never sent) is resent with the
+      same id and body when every precondition still holds, else aborted and its patches
+      requeued."""
 
     def __init__(self, deps: LifecycleDeps):
         self.d = deps
@@ -421,6 +478,12 @@ class ProposalLifecycle:
                         inputs=freeze(dict(inputs)), outcome=FrozenDict(), harm_report=None,
                         snapshot_ids=(), seed=0, settings_hash=self.d.settings_hash,
                         code_version=self.d.code_version, sim_minute=self.d.clock())
+
+    def _get(self, pid: str) -> Proposal:
+        p = self.d.store.get(pid)
+        if p is None:
+            raise KeyError(pid)
+        return p
 
     def used(self, wf: str) -> list[int]:
         """Request minutes for fatigue: every record `GET /approvals` lists for the workflow
@@ -440,32 +503,61 @@ class ProposalLifecycle:
     def submit_blockers(self, comp: Composition, now: int, *, superseding: bool = False
                         ) -> list[str]:
         """DRAFT -> SUBMITTING preconditions (6.1 first row), each as a reason."""
-        pol = self.d.policy_of(comp.wf)
+        return self._blockers(comp.wf, comp.cls, comp.base_version, now, superseding=superseding)
+
+    def _blockers(self, wf: str, cls: int, base_version: int, now: int, *,
+                  superseding: bool = False) -> list[str]:
+        pol = self.d.policy_of(wf)
         out = []
         if p_expire(now, pol) > self.d.t.submit_expiry_p_max:
             out.append(f"window: P(expire) at {now} is {p_expire(now, pol):.4f}")
-        if not fatigue_ok(now, pol, self.used(comp.wf), comp.cls, self.d.t):
+        if not fatigue_ok(now, pol, self.used(wf), cls, self.d.t):
             out.append("fatigue: no request left in the class budget")
-        if comp.cls in ROUTINE_CLASSES and not is_slot_minute(now, pol, t=self.d.t):
+        if cls in ROUTINE_CLASSES and not is_slot_minute(now, pol, t=self.d.t):
             out.append("slot: P2/P3 submit only at a routine slot minute")
-        if not superseding and self.d.store.holder(comp.wf) is not None:
-            out.append(f"one_in_flight: held by {self.d.store.holder(comp.wf).proposal_id}")
-        if comp.cls != P0_INCIDENT and any(h.active(now) for h in self.d.holds(comp.wf)):
+        holder = self.d.store.holder(wf)
+        if not superseding and holder is not None:
+            out.append(f"one_in_flight: held by {holder.proposal_id}")
+        if cls != P0_INCIDENT and any(h.active(now) for h in self.d.holds(wf)):
             out.append("hold: a supervisor hold is active")
-        current = self.d.sim.config(comp.wf).version
-        if comp.base_version != current:
-            out.append(f"base_version {comp.base_version} != current {current}")
+        current = self.d.sim.config(wf).version
+        if base_version != current:
+            out.append(f"base_version {base_version} != current {current}")
+        return out
+
+    def _auto_blockers(self, p: Proposal, now: int) -> list[str]:
+        """What must still hold before an unsent auto-apply is resent (8.3 auto_apply row)."""
+        out = []
+        snap = self.d.sim.config(p.wf)
+        if snap.version != p.base_version:
+            out.append(f"base_version {p.base_version} != current {snap.version}")
+        holder = self.d.store.holder(p.wf)
+        if holder is not None and holder.proposal_id != p.proposal_id:
+            out.append(f"one_in_flight: held by {holder.proposal_id}")
+        if p.cls != P0_INCIDENT and any(h.active(now) for h in self.d.holds(p.wf)):
+            out.append("hold: a supervisor hold is active")
+        if p.wf in self.auto_blocked:
+            out.append(self.auto_blocked[p.wf])
+        pol = self.d.policy_of(p.wf)
+        sv = sim_verdict(AutoApplyPolicy(pol.auto_enabled, pol.allowed_dims, pol.max_shift),
+                         snap.config, p.proposed_config, "x", margin=self.d.t.max_shift_margin)
+        if not sv.permitted:
+            out += [f"policy: {x}" for x in sv.problems(pol.max_shift)]
         return out
 
     def _draft(self, comp: Composition, now: int, route: str, package: RequestPackage | None,
                rationale: str) -> Proposal:
+        """The proposal row, with the exact request body it will send (so a resend after a
+        crash sends the same bytes) and its velocity entries (counted once applied)."""
         wf = comp.wf
         pid = make_proposal_id(self.d.run6, wf, now, comp.cls, self.d.store.next_seq(wf))
         prev = sorted({p.proposal_id for p in comp.patches if p.proposal_id})
         stored = comp.proposed.as_stored()
         pkg = package
         evidence = dict(pkg.evidence) if pkg else {"class": comp.cls}
-        return Proposal(
+        velocity = tuple((k, d, float(tv), comp.risk.get((k, d)) == "increasing")
+                         for (k, d), tv in sorted(comp.tv_by_cohort_dim.items()) if tv > 0)
+        p = Proposal(
             proposal_id=pid, wf=wf, cls=comp.cls, p0_rank=comp.p0_rank, route=route,
             state="draft",
             base_version=comp.base_version, proposed_config=stored,
@@ -476,11 +568,29 @@ class ProposalLifecycle:
             impact_score=pkg.impact_score if pkg else 0.0,
             rationale=pkg.rationale if pkg else rationale, evidence=freeze(evidence),
             requeued_from=prev[-1] if prev else None,
-            decision_id=min((p.decision_id for p in comp.patches), default=None))
+            decision_id=min((p.decision_id for p in comp.patches), default=None),
+            velocity=velocity)
+        body = self._request_body(p) if route == "approval" else self._auto_body(p)
+        return replace(p, request=freeze(body))
 
     def _insert(self, draft: Proposal, comp: Composition, now: int, reason: str) -> Proposal:
-        p = self.d.store.insert(draft, now, reason)
-        self.d.overlay.mark_proposed([x.patch_id for x in comp.patches], p.proposal_id)
+        with self.d.store.atomic():
+            p = self.d.store.insert(draft, now, reason)
+            self.d.overlay.mark_proposed([x.patch_id for x in comp.patches], p.proposal_id)
+        return p
+
+    def _move(self, pid: str, event: str, now: int, reason: str, *, overlay: str | None = None,
+              until: int | None = None, **fields: Any) -> Proposal:
+        """One transition and its overlay consequence in one transaction."""
+        with self.d.store.atomic():
+            p = self.d.store.apply(pid, event, now, reason, **fields)
+            if overlay == "open":
+                self.d.overlay.return_to_open(pid)
+            elif overlay == "hold":
+                self.d.overlay.hold_proposal(pid, until if until is not None
+                                             else now + self.d.t.held_patch_release_min)
+            elif overlay == "drop":
+                self.d.overlay.drop(pid)
         return p
 
     # ------------------------------------------------------------ submit (approval route)
@@ -511,66 +621,76 @@ class ProposalLifecycle:
             if blockers:
                 raise SubmitBlocked(blockers)
         draft = self._draft(by, now, route, package, rationale)
-        p = self.d.store.supersede(holder.proposal_id, draft, now,
-                                   f"class {by.cls} change takes precedence")
-        self.d.overlay.return_to_open(holder.proposal_id)
-        self.d.overlay.mark_proposed([x.patch_id for x in by.patches], p.proposal_id)
+        with self.d.store.atomic():
+            p = self.d.store.supersede(holder.proposal_id, draft, now,
+                                       f"class {by.cls} change takes precedence")
+            self.d.overlay.return_to_open(holder.proposal_id)
+            self.d.overlay.mark_proposed([x.patch_id for x in by.patches], p.proposal_id)
         if route == "approval":
             return self._send_approval(p, now)
         return self._send_auto(p, now)
 
     def _discard(self, comp: Composition, now: int) -> Proposal:
         draft = self._draft(comp, now, "approval", None, "no net change")
-        p = self._insert(draft, comp, now, "drafted")
-        p = self.d.store.apply(p.proposal_id, "no_change", now, "composition has no net change")
-        self.d.overlay.drop(p.proposal_id)
-        return p
+        with self.d.store.atomic():
+            p = self._insert(draft, comp, now, "drafted")
+            return self._move(p.proposal_id, "no_change", now, "composition has no net change",
+                              overlay="drop")
 
     def _request_body(self, p: Proposal) -> dict[str, Any]:
         return {"proposal_id": p.proposal_id, "workflow_id": p.wf,
                 "base_version": p.base_version, "proposed_config": p.proposed_config.body(),
-                "change_summary": p.change_summary, "diff": dict(p.diff) or {"note": "-"},
+                "change_summary": p.change_summary, "diff": thaw(p.diff) or {"note": "-"},
                 "affected_leads": int(p.affected_leads),
-                "dry_run": dict(p.dry_run) or {"method": "not estimated"},
+                "dry_run": thaw(p.dry_run) or {"method": "not estimated"},
                 "impact_score": float(p.impact_score),
                 "rationale": p.rationale or p.change_summary,
-                "evidence": dict(p.evidence)}
+                "evidence": thaw(p.evidence)}
+
+    def _auto_body(self, p: Proposal) -> dict[str, Any]:
+        return AutoApplyRequest(proposal_id=p.proposal_id, base_version=p.base_version,
+                                proposed_config=p.proposed_config,
+                                rationale=p.rationale or p.change_summary or "controller change",
+                                evidence=p.evidence).body()
+
+    def _payload(self, p: Proposal) -> dict[str, Any]:
+        if p.route == "approval":
+            body = thaw(p.request) or self._request_body(p)
+        else:
+            body = thaw(p.request) or self._auto_body(p)
+        return {"workflow_id": p.wf, "proposal_id": p.proposal_id, "body": body}
 
     def _send_approval(self, p: Proposal, now: int) -> Proposal:
-        p = self.d.store.apply(p.proposal_id, "route_approval", now, "gates passed")
-        body = self._request_body(p)
-        p = replace(p, request=freeze(body))
+        pid = p.proposal_id
+        payload = self._payload(p)
         decision = self._decision(p.wf, "submit_approval", "6.1/submit",
-                                  {"proposal_id": p.proposal_id, "class": p.cls})
+                                  {"proposal_id": pid, "class": p.cls})
+        before = None
+        if p.state == "draft":
+            def before() -> None:
+                self.d.store.apply(pid, "route_approval", now, "gates passed")
         try:
-            a = self.d.executor.execute("submit_approval", p.proposal_id, body, decision)
+            resp = self.d.executor.execute("submit_approval", pid, payload, decision,
+                                           before=before)
         except E.DuplicateProposalId:
-            found = [x for x in self.d.sim.approvals(p.wf) if x.proposal_id == p.proposal_id]
+            found = [x for x in self.d.sim.approvals(p.wf) if x.proposal_id == pid]
             if not found:
-                self.d.on_alert("GOV_INVARIANT", p.wf, f"{p.proposal_id}: duplicate id, no record")
+                self.d.on_alert("GOV_INVARIANT", p.wf, f"{pid}: duplicate id, no record")
                 raise
-            a = found[0]
-            return self._created(p, a, now, "duplicate_found")
-        except E.StaleBaseVersion as e:
-            p = self.d.store.apply(p.proposal_id, "stale", now, f"current {e.current_version}")
-            self.d.overlay.return_to_open(p.proposal_id)
-            return p
-        except E.Unprocessable as e:
-            p = self.d.store.apply(p.proposal_id, "invalid", now, str(e.detail))
-            self.d.overlay.hold_proposal(p.proposal_id, now + self.d.t.held_patch_release_min)
-            self.d.on_alert("GOV_INVARIANT", p.wf, f"{p.proposal_id}: 422 {e.code}")
-            return p
+            self.on_effect_done("submit_approval", payload, found[0])
+            return self._after_submit(pid, found[0], now)
+        except E.ApiError as e:
+            self.on_effect_failed("submit_approval", payload, e)
+            return self._get(pid)
         except E.SimTransportError:
-            return p          # SUBMITTING: the reconciler resolves it by proposal_id (8.3)
-        return self._created(p, a, now, "created")
+            return self._get(pid)      # reconciled by proposal_id (8.3): PENDING or DRAFT
+        a = _approval(resp)
+        self.on_effect_done("submit_approval", payload, a)
+        return self._after_submit(pid, a, now)
 
-    def _created(self, p: Proposal, a: ApprovalPublic, now: int, event: str) -> Proposal:
-        self.d.store.mirror(a, self.d.epoch, now)
-        p = self.d.store.apply(p.proposal_id, event, now, a.approval_id,
-                               approval_id=a.approval_id,
-                               submitted_minute=self.d.epoch.minute(a.created_at),
-                               request=p.request)
-        if a.status != "pending":
+    def _after_submit(self, pid: str, a: ApprovalPublic, now: int) -> Proposal:
+        p = self._get(pid)
+        if p.state == "pending" and a.status != "pending":
             p = self._on_status(p, a, now)
         return p
 
@@ -586,54 +706,180 @@ class ProposalLifecycle:
         if self.d.store.holder(comp.wf) is not None:
             raise SubmitBlocked([f"one_in_flight: held by {self.d.store.holder(comp.wf).proposal_id}"])
         draft = self._draft(comp, now, "auto", package, rationale)
-        p = self._insert(draft, comp, now, "drafted")
         pol = self.d.policy_of(comp.wf)
         if needs_notice(pol, comp) and (notice_until is None or now < notice_until):
             until = notice_until if notice_until is not None else now + pol.notice_minutes
-            return self.d.store.apply(p.proposal_id, "route_notice", now, f"notice until {until}",
-                                      notice_until_minute=until)
+            with self.d.store.atomic():
+                p = self._insert(draft, comp, now, "drafted")
+                return self.d.store.apply(p.proposal_id, "route_notice", now,
+                                          f"notice until {until}", notice_until_minute=until)
+        p = self._insert(draft, comp, now, "drafted")
         return self._send_auto(p, now)
 
     def _send_auto(self, p: Proposal, now: int) -> Proposal:
-        if p.state == "draft":
-            p = self.d.store.apply(p.proposal_id, "route_auto", now, "auto-apply permitted")
-        body = AutoApplyRequest(proposal_id=p.proposal_id, base_version=p.base_version,
-                                proposed_config=p.proposed_config,
-                                rationale=p.rationale or p.change_summary or "controller change",
-                                evidence=p.evidence).body()
-        decision = self._decision(p.wf, "auto_apply", "6.5/auto", {"proposal_id": p.proposal_id})
+        pid = p.proposal_id
+        payload = self._payload(p)
+        decision = self._decision(p.wf, "auto_apply", "6.5/auto", {"proposal_id": pid})
+        event = {"draft": ("route_auto", "auto-apply permitted"),
+                 "noticed": ("notice_elapsed", "notice period elapsed")}.get(p.state)
+        before = None
+        if event is not None:
+            def before() -> None:
+                self.d.store.apply(pid, event[0], now, event[1])
         try:
-            res: ApplyResult = self.d.executor.execute("auto_apply", p.proposal_id, body, decision)
-        except E.AutoApplyNotPermitted as e:
-            self.auto_blocked[p.wf] = f"403 on {p.proposal_id}: {e.problems}"
-            self.d.on_alert("AUTO_APPLY_REJECTED", p.wf, f"{p.proposal_id}: {e.problems}")
-            p = self.d.store.apply(p.proposal_id, "forbidden", now, "; ".join(e.problems))
-            self.d.overlay.return_to_open(p.proposal_id)
-            return p
+            res = self.d.executor.execute("auto_apply", pid, payload, decision, before=before)
         except E.DuplicateProposalId:
-            hist = [v for v in self.d.sim.config_history(p.wf) if v.proposal_id == p.proposal_id]
+            hist = [v for v in self.d.sim.config_history(p.wf) if v.proposal_id == pid]
             if not hist:
-                self.d.on_alert("GOV_INVARIANT", p.wf, f"{p.proposal_id}: duplicate id, no version")
+                self.d.on_alert("GOV_INVARIANT", p.wf, f"{pid}: duplicate id, no version")
                 raise
-            return self._applied(p, hist[0].version, now, "duplicate_found")
-        except E.StaleBaseVersion as e:
-            p = self.d.store.apply(p.proposal_id, "stale", now, f"current {e.current_version}")
-            self.d.overlay.return_to_open(p.proposal_id)
-            return p
-        except E.Unprocessable as e:
-            p = self.d.store.apply(p.proposal_id, "invalid", now, str(e.detail))
-            self.d.overlay.hold_proposal(p.proposal_id, now + self.d.t.held_patch_release_min)
-            self.d.on_alert("GOV_INVARIANT", p.wf, f"{p.proposal_id}: 422 {e.code}")
-            return p
+            self.on_effect_done("auto_apply", payload,
+                                ApplyResult(p.wf, hist[0].version, tuple(hist[0].changed_dims)))
+            return self._get(pid)
+        except E.ApiError as e:
+            self.on_effect_failed("auto_apply", payload, e)
+            return self._get(pid)
         except E.SimTransportError:
-            return p          # AUTO_APPLYING: reconciled via config history (8.3)
-        return self._applied(p, res.version, now, "applied")
+            return self._get(pid)      # reconciled via config history (8.3): APPLIED or DRAFT
+        self.on_effect_done("auto_apply", payload, res)
+        return self._get(pid)
 
     def _applied(self, p: Proposal, version: int, now: int, event: str) -> Proposal:
-        p = self.d.store.apply(p.proposal_id, event, now, f"version {version}",
-                               applied_version=version)
-        self.d.overlay.mark_applied(p.proposal_id)
-        return self.d.store.apply(p.proposal_id, "verify_start", now, "verification window opens")
+        with self.d.store.atomic():
+            p = self.d.store.apply(p.proposal_id, event, now, f"version {version}",
+                                   applied_version=version, applied_minute=now)
+            self.d.overlay.mark_applied(p.proposal_id)
+            self.d.on_applied(p, version)
+            return self.d.store.apply(p.proposal_id, "verify_start", now,
+                                      "verification window opens")
+
+    # ------------------------------------------------------------ effect transitions (8.2, 8.3)
+    def on_effect_done(self, kind: str, request: Mapping[str, Any], response: Any
+                       ) -> Proposal | None:
+        """The call took effect: SUBMITTING -> PENDING, AUTO_APPLYING or APPLYING -> APPLIED.
+        Idempotent: a proposal that already moved is returned unchanged."""
+        p = self.d.store.get(str(request["proposal_id"]))
+        if p is None:
+            return None
+        now = self.d.clock()
+        if kind == "submit_approval" and p.state == "submitting":
+            a = _approval(response)
+            with self.d.store.atomic():
+                self.d.store.mirror(a, self.d.epoch, now)
+                return self.d.store.apply(p.proposal_id, "created", now, a.approval_id,
+                                          approval_id=a.approval_id,
+                                          submitted_minute=self.d.epoch.minute(a.created_at))
+        if (kind, p.state) in (("auto_apply", "auto_applying"), ("apply", "applying")):
+            return self._applied(p, _apply_result(response).version, now, "applied")
+        return p
+
+    def on_effect_failed(self, kind: str, request: Mapping[str, Any], err: E.ApiError
+                         ) -> Proposal | None:
+        """A definite error response (no effect happened). Duplicate ids and an apply that finds
+        the approval already applied need a lookup and are resolved by the caller (or by
+        `recover`); every other error has its transition here. Idempotent."""
+        p = self.d.store.get(str(request["proposal_id"]))
+        if p is None:
+            return None
+        now, pid, wf = self.d.clock(), p.proposal_id, p.wf
+        call_state = {"submit_approval": "submitting", "auto_apply": "auto_applying",
+                      "apply": "applying"}[kind]
+        if p.state != call_state:
+            return p
+        if isinstance(err, E.StaleBaseVersion):
+            if kind == "apply":
+                self.d.on_alert("GOV_INVARIANT", wf, f"{pid}: apply conflict")
+            return self._move(pid, "stale", now, f"current {err.current_version}",
+                              overlay="open")
+        if isinstance(err, E.AutoApplyNotPermitted) and kind == "auto_apply":
+            self.auto_blocked[wf] = f"403 on {pid}: {err.problems}"
+            self.d.on_alert("AUTO_APPLY_REJECTED", wf, f"{pid}: {err.problems}")
+            return self._move(pid, "forbidden", now, "; ".join(err.problems), overlay="open")
+        if isinstance(err, E.Unprocessable) and kind != "apply":
+            self.d.on_alert("GOV_INVARIANT", wf, f"{pid}: 422 {err.code}")
+            return self._move(pid, "invalid", now, str(err.detail), overlay="hold")
+        if isinstance(err, E.ApprovalLapsed) and kind == "apply":
+            self.d.on_alert("APPLY_AT_RISK", wf, f"{pid} lapsed (410)")
+            return self._move(pid, "lapsed", now, "410 at the simulator", overlay="open")
+        return p
+
+    def on_effect_not_run(self, kind: str, request: Mapping[str, Any],
+                          info: Mapping[str, Any]) -> Proposal | None:
+        """Reconciliation found that the call never took effect. A submit or auto-apply goes
+        back to DRAFT (resent or aborted by `resume_unsent`); an apply goes back to APPROVED,
+        where the pre-apply checks decide again, unless the approval has lapsed meanwhile."""
+        p = self.d.store.get(str(request["proposal_id"]))
+        if p is None:
+            return None
+        now = self.d.clock()
+        if (kind, p.state) in (("submit_approval", "submitting"),
+                               ("auto_apply", "auto_applying")):
+            return self._move(p.proposal_id, "not_sent", now, "the request never took effect")
+        if kind == "apply" and p.state == "applying":
+            status = info.get("approval_status")
+            if status == "approved":
+                return self._move(p.proposal_id, "not_applied", now, "the apply did not run")
+            if status == "lapsed":
+                self.d.on_alert("APPLY_AT_RISK", p.wf, f"{p.proposal_id} lapsed")
+                return self._move(p.proposal_id, "lapsed", now, "lapsed at the simulator",
+                                  overlay="open")
+        return p
+
+    # ------------------------------------------------------------ crash recovery (8.3, sweep)
+    def recover(self, now: int) -> list[Proposal]:
+        """Restart step 5 and the start of every LIFECYCLE stage: resolve proposals a crash
+        left in a call state with no open intent, then resend or abort unsent drafts."""
+        return self.sweep(now) + self.resume_unsent(now)
+
+    def sweep(self, now: int) -> list[Proposal]:
+        out = []
+        for p in self.d.store.in_states(("submitting", "auto_applying", "applying")):
+            payload = self._payload(p)
+            if p.state == "submitting":
+                found = [a for a in self.d.sim.approvals(p.wf) if a.proposal_id == p.proposal_id]
+                if found:
+                    self.on_effect_done("submit_approval", payload, found[0])
+                    q = self._after_submit(p.proposal_id, found[0], now)
+                else:
+                    q = self.on_effect_not_run("submit_approval", payload, {})
+            elif p.state == "auto_applying":
+                hist = [v for v in self.d.sim.config_history(p.wf)
+                        if v.proposal_id == p.proposal_id]
+                q = (self.on_effect_done("auto_apply", payload, ApplyResult(
+                         p.wf, hist[0].version, tuple(hist[0].changed_dims))) if hist
+                     else self.on_effect_not_run("auto_apply", payload, {}))
+            else:
+                payload = {"workflow_id": p.wf, "approval_id": p.approval_id,
+                           "proposal_id": p.proposal_id}
+                a = self.d.sim.approval(p.approval_id)
+                hist = [v for v in self.d.sim.config_history(p.wf)
+                        if v.approval_id == p.approval_id]
+                q = (self.on_effect_done("apply", payload, ApplyResult(
+                         p.wf, hist[0].version, tuple(hist[0].changed_dims)))
+                     if a.status == "applied" and hist
+                     else self.on_effect_not_run("apply", payload, {"approval_status": a.status}))
+            if q is not None:
+                out.append(q)
+        return out
+
+    def resume_unsent(self, now: int) -> list[Proposal]:
+        """Every DRAFT is a request that never reached the simulator. Resend it with the same id
+        and body if every precondition still holds (8.3: "all still hold: resend the same id and
+        payload"); otherwise abort it and requeue its patches for a fresh composition."""
+        out = []
+        for p in self.d.store.in_states(("draft",)):
+            if p.route == "approval":
+                reasons = self._blockers(p.wf, p.cls, p.base_version, now)
+            else:
+                reasons = self._auto_blockers(p, now)
+            if reasons:
+                out.append(self._move(p.proposal_id, "abort", now,
+                                      "not resent: " + "; ".join(reasons), overlay="open"))
+            elif p.route == "approval":
+                out.append(self._send_approval(p, now))
+            else:
+                out.append(self._send_auto(p, now))
+        return out
 
     # ------------------------------------------------------------ tick (4.1 step 5)
     def tick(self, now: int) -> list[Proposal]:
@@ -645,7 +891,8 @@ class ProposalLifecycle:
                 q = self._tick_noticed(p, now)
             else:
                 a = self.d.sim.approval(p.approval_id)
-                self.d.store.mirror(a, self.d.epoch, now)
+                with self.d.store.atomic():
+                    self.d.store.mirror(a, self.d.epoch, now)
                 q = self._on_status(p, a, now)
             if q.state != p.state:
                 changed.append(q)
@@ -669,24 +916,16 @@ class ProposalLifecycle:
     def _ended(self, p: Proposal, a: ApprovalPublic, now: int) -> Proposal:
         decided = None if a.decided_at is None else self.d.epoch.minute(a.decided_at)
         if a.status == "expired":
-            p = self.d.store.apply(p.proposal_id, "expired", now, "expired (re-queued fresh)",
-                                   decided_minute=decided)
             self.d.on_alert("APPROVAL_EXPIRED", p.wf, f"{p.proposal_id} expired")
-            self.d.overlay.return_to_open(p.proposal_id)
-            return p
+            return self._move(p.proposal_id, "expired", now, "expired (re-queued fresh)",
+                              overlay="open", decided_minute=decided)
         plan = rejection_plan(p.cls, a.reasons, self._prior_judgements(p))
-        p = self.d.store.apply(p.proposal_id, "rejected", now,
-                               f"{plan.kind}: {'; '.join(a.reasons)} -> {plan.action}",
-                               decided_minute=decided)
         if plan.page:
             self.d.on_alert(plan.page, p.wf, f"{p.proposal_id} rejected: {list(a.reasons)}")
-        if plan.action == "hold":
-            self.d.overlay.hold_proposal(p.proposal_id, now + self.d.t.held_patch_release_min)
-        elif plan.action == "drop_needs_discussion":
-            self.d.overlay.drop(p.proposal_id)
-        else:
-            self.d.overlay.return_to_open(p.proposal_id)
-        return p
+        overlay = {"hold": "hold", "drop_needs_discussion": "drop"}.get(plan.action, "open")
+        return self._move(p.proposal_id, "rejected", now,
+                          f"{plan.kind}: {'; '.join(a.reasons)} -> {plan.action}",
+                          overlay=overlay, decided_minute=decided)
 
     def _prior_judgements(self, p: Proposal) -> int:
         n, cur = 0, p.requeued_from
@@ -706,39 +945,35 @@ class ProposalLifecycle:
         gate = (lambda q: self.d.regate(q, "late_decision")) if self.d.regate else None
         event = pre_apply_event(p, now, current, pol.tick, self.d.t, gate)
         if event != "apply_start":
-            p = self.d.store.apply(p.proposal_id, event, now,
-                                   f"current version {current}, apply_by {p.apply_by_minute}")
             if event == "lapse_risk":
                 self.d.on_alert("APPLY_AT_RISK", p.wf, f"{p.proposal_id} not applied in time")
-            self.d.overlay.return_to_open(p.proposal_id)
-            return p
-        p = self.d.store.apply(p.proposal_id, "apply_start", now, "pre-apply checks passed")
+            return self._move(p.proposal_id, event, now,
+                              f"current version {current}, apply_by {p.apply_by_minute}",
+                              overlay="open")
+        pid, aid = p.proposal_id, p.approval_id
+        payload = {"workflow_id": p.wf, "approval_id": aid, "proposal_id": pid}
         decision = self._decision(p.wf, "apply", "6.1/apply",
-                                  {"proposal_id": p.proposal_id, "approval_id": p.approval_id})
+                                  {"proposal_id": pid, "approval_id": aid})
+
+        def before() -> None:
+            self.d.store.apply(pid, "apply_start", now, "pre-apply checks passed")
         try:
-            res = self.d.executor.execute("apply", p.approval_id,
-                                          {"workflow_id": p.wf, "approval_id": p.approval_id},
-                                          decision)
+            res = self.d.executor.execute("apply", aid, payload, decision, before=before)
         except E.NotApproved as e:
-            if e.approval_status == "applied":
-                hist = [v for v in self.d.sim.config_history(p.wf)
-                        if v.approval_id == p.approval_id]
-                return self._applied(p, hist[0].version if hist else current + 1, now,
-                                     "already_applied")
-            raise
-        except E.StaleBaseVersion as e:
-            p = self.d.store.apply(p.proposal_id, "stale", now, f"current {e.current_version}")
-            self.d.on_alert("GOV_INVARIANT", p.wf, f"{p.proposal_id}: apply conflict")
-            self.d.overlay.return_to_open(p.proposal_id)
-            return p
-        except E.ApprovalLapsed:
-            p = self.d.store.apply(p.proposal_id, "lapsed", now, "410 at the simulator")
-            self.d.on_alert("APPLY_AT_RISK", p.wf, f"{p.proposal_id} lapsed (410)")
-            self.d.overlay.return_to_open(p.proposal_id)
-            return p
+            if e.approval_status != "applied":
+                raise
+            hist = [v for v in self.d.sim.config_history(p.wf) if v.approval_id == aid]
+            version = hist[0].version if hist else current + 1
+            self.on_effect_done("apply", payload, ApplyResult(
+                p.wf, version, tuple(hist[0].changed_dims) if hist else ()))
+            return self._get(pid)
+        except E.ApiError as e:
+            self.on_effect_failed("apply", payload, e)
+            return self._get(pid)
         except E.SimTransportError:
-            return p          # APPLYING: retry-safe by approval_id (8.1)
-        return self._applied(p, res.version, now, "applied")
+            return self._get(pid)      # retry-safe by approval_id (8.1): APPLIED or APPROVED
+        self.on_effect_done("apply", payload, res)
+        return self._get(pid)
 
     def _tick_noticed(self, p: Proposal, now: int) -> Proposal:
         if p.notice_until_minute is None or now < p.notice_until_minute:
@@ -746,28 +981,22 @@ class ProposalLifecycle:
         held = p.cls != P0_INCIDENT and any(h.active(now) for h in self.d.holds(p.wf))
         current = self.d.sim.config(p.wf).version
         if current != p.base_version:
-            p = self.d.store.apply(p.proposal_id, "stale", now, f"current version {current}")
-            self.d.overlay.return_to_open(p.proposal_id)
-            return p
+            return self._move(p.proposal_id, "stale", now, f"current version {current}",
+                              overlay="open")
         if held or (self.d.regate is not None and not self.d.regate(p, "notice")):
-            p = self.d.store.apply(p.proposal_id, "hold", now,
-                                   "hold set" if held else "harm gate fails at notice expiry")
-            self.d.overlay.return_to_open(p.proposal_id)
-            return p
+            return self._move(p.proposal_id, "hold", now,
+                              "hold set" if held else "harm gate fails at notice expiry",
+                              overlay="open")
         if p.wf in self.auto_blocked:
-            p = self.d.store.apply(p.proposal_id, "hold", now, self.auto_blocked[p.wf])
-            self.d.overlay.return_to_open(p.proposal_id)
-            return p
+            return self._move(p.proposal_id, "hold", now, self.auto_blocked[p.wf],
+                              overlay="open")
         pol = self.d.policy_of(p.wf)      # the policy may have been re-read during the notice
         live = self.d.sim.config(p.wf).config
         sv = sim_verdict(AutoApplyPolicy(pol.auto_enabled, pol.allowed_dims, pol.max_shift),
                          live, p.proposed_config, "x", margin=self.d.t.max_shift_margin)
         if not sv.permitted:
-            p = self.d.store.apply(p.proposal_id, "hold", now,
-                                   "policy no longer permits: " + "; ".join(sv.problems(pol.max_shift)))
-            self.d.overlay.return_to_open(p.proposal_id)
-            return p
-        p = self.d.store.apply(p.proposal_id, "notice_elapsed", now, "notice period elapsed")
+            return self._move(p.proposal_id, "hold", now, "policy no longer permits: "
+                              + "; ".join(sv.problems(pol.max_shift)), overlay="open")
         return self._send_auto(p, now)
 
     # ------------------------------------------------------------ verify (6.1)
@@ -799,10 +1028,9 @@ class ProposalLifecycle:
         out = []
         for p in self.d.store.in_states(("pending", "approved", "noticed"), wf=wf):
             if p.base_version < version:
-                q = self.d.store.apply(p.proposal_id, "stale", now,
-                                       f"config changed to v{version} (supervisor)")
-                self.d.overlay.return_to_open(p.proposal_id)
-                out.append(q)
+                out.append(self._move(p.proposal_id, "stale", now,
+                                      f"config changed to v{version} (supervisor)",
+                                      overlay="open"))
         return out
 
     def policy_reread(self, wf: str) -> None:

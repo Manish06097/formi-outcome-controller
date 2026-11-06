@@ -95,6 +95,10 @@ class LoopHooks:
     Stage hooks return StageCounts (or None) for the loop_step row. `on_config_changes` runs in
     the REFRESH transaction (the supervisor-edit handler, DESIGN.md 6.7)."""
 
+    def attach(self, rt: "Runtime") -> None:
+        """Build the hooks' working set from the store and attach intent hooks. Called on every
+        start, after the run schema is open and before the reconciler resolves any intent."""
+
     def policy(self, rt: "Runtime", workflow_id: str) -> EffectivePolicy | None:
         return None
 
@@ -218,6 +222,7 @@ class Orchestrator:
                                epoch, mirror, ingest, executor, registry, ident.state,
                                run6=ident.fingerprint[:6])
         self._attach_advance(registry)
+        self.hooks.attach(rt)
         self.heartbeat = Heartbeat(self.db, self.lock, env.heartbeat_s,
                                    lambda: self._step_no).start()
         reset_stage(self.db)                                           # restart step 2
@@ -229,6 +234,7 @@ class Orchestrator:
         self._refresh()
         self.hooks.full_sweep(rt)                                      # restart step 5
         rerun = self._bootstrap()                                      # restart step 6
+        self._finish_interrupted_step()
         clock = self._clock()
         log.info("run %s %s at %s (%d chunks caught up, %d intents reconciled)", res.schema,
                  "resumed" if res.resumed else "started", clock.sim_minute, len(caught.chunks),
@@ -346,9 +352,7 @@ class Orchestrator:
             rt.state = state = self.client.state()
             self._check_lag(state)
             self._refresh()
-        for stage in ("lifecycle", "detect", "decide", "govern", "verify"):
-            with timer(stage):
-                counts.add(getattr(self.hooks, stage)(rt, state.sim_minute))
+        self._stages(self._step_no, state.sim_minute, timer, counts)
         report = StepReport(step_no=self._step_no, from_minute=now, to_minute=state.sim_minute,
                             phase_ms=FrozenDict(timer.ms),
                             chunks=len(ing.chunks) + len(gap.chunks),
@@ -363,6 +367,55 @@ class Orchestrator:
         log.info("step %d: %d -> %d (%s) %d chunks %d events in %d ms", report.step_no, now,
                  report.to_minute, plan.bound, report.chunks, report.events, timer.total_ms())
         return report
+
+    STAGES = ("lifecycle", "detect", "decide", "govern", "verify")
+
+    def _stages(self, step_no: int, minute: int, timer: PhaseTimer, counts: StageCounts) -> None:
+        """4.1 steps 5 to 9 at `minute` (the clock after the advance). Each completed stage is
+        marked (`loop_stage`), and a stage already marked for this step is not run again."""
+        with self.db.tx() as tx:
+            done = {r[0] for r in tx.execute("SELECT stage FROM loop_stage WHERE step_no = %s",
+                                             (step_no,))}
+        for stage in self.STAGES:
+            if stage in done:
+                continue
+            with timer(stage):
+                counts.add(getattr(self.hooks, stage)(self._rt(), minute))
+            with self.db.tx() as tx:
+                tx.execute("INSERT INTO loop_stage (step_no, stage) VALUES (%s, %s) "
+                           "ON CONFLICT DO NOTHING", (step_no, stage))
+
+    def _finish_interrupted_step(self) -> None:
+        """Restart: if the last advance committed but its step never reached OPS (no
+        `loop_step` row), finish that step's LIFECYCLE..VERIFY at the current minute before
+        planning the next advance, from the first stage not marked done. Otherwise a crash
+        inside GOVERN would skip the rest of that minute's work (a P2/P3 submit is only ever
+        made at its exact slot minute) and the crashed run would diverge from a clean one. The
+        interrupted stage itself runs again; every stage is idempotent at a given minute (what
+        already happened is in the store and is not done twice)."""
+        rt = self._rt()
+        with self.db.tx() as tx:
+            clock = repos.get_clock(tx)
+            last = tx.execute("SELECT max(step_no) FROM loop_step").fetchone()[0]
+            frm = tx.execute("""SELECT (request->>'from_minute')::int FROM intent
+                                WHERE kind = 'advance' AND status = 'done'
+                                  AND (request->>'step_no')::int = %s
+                                ORDER BY intent_id DESC LIMIT 1""",
+                             (clock.last_step_no,)).fetchone()
+        if clock.last_step_no <= (last or 0):
+            return
+        log.warning("step %d was interrupted after its advance; finishing it at %d",
+                    clock.last_step_no, clock.sim_minute)
+        timer = PhaseTimer()
+        counts = StageCounts()
+        self._stages(clock.last_step_no, clock.sim_minute, timer, counts)
+        st = rt.state
+        self._write_step(StepReport(
+            step_no=clock.last_step_no, from_minute=frm[0] if frm else clock.sim_minute,
+            to_minute=clock.sim_minute, phase_ms=FrozenDict(timer.ms), chunks=0, events=0,
+            orphan_calls=0, decisions=counts.decisions,
+            proposals_submitted=counts.proposals_submitted, applies=counts.applies,
+            credits_remaining=st.credits_remaining, finished=st.finished))
 
     # ------------------------------------------------------------------ PLAN
     def planner_context(self, now: int) -> PlannerContext:

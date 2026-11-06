@@ -80,7 +80,7 @@ class KindHandler:
     failed: Hook | None = None
     """(tx, intent, ApiError): a definite error response (no effect happened)"""
     aborted: Hook | None = None
-    """(tx, intent): reconciliation found the call never took effect"""
+    """(tx, intent, lookup_response): reconciliation found the call never took effect"""
     lost: Hook | None = None
     """(tx, intent, response): the effect happened but its result is lost"""
     required: tuple[str, ...] = ()
@@ -122,10 +122,16 @@ class IntentExecutor:
         self.actor = audit_actor
         self.reconciler = Reconciler(db, client, registry)
 
-    def execute(self, kind: str, key: str, payload: Mapping[str, Any], decision: Decision) -> Any:
+    def execute(self, kind: str, key: str, payload: Mapping[str, Any], decision: Decision, *,
+                before: Callable[[Tx], None] | None = None) -> Any:
         """Run one side effect under the write-ahead protocol. Returns the response JSON, or
         raises the simulator's ApiError after recording it. On a transport failure the intent
-        is reconciled at once; if the call did not take effect, `IntentAborted` is raised."""
+        is reconciled at once; if the call did not take effect, `IntentAborted` is raised.
+
+        `before(tx)` is this call's own "before" transition (after the kind's registered one),
+        committed in T1 with the decision and intent rows: governance moves the proposal into
+        its call state there (DRAFT -> SUBMITTING), so the intent log and the proposal never
+        disagree (DESIGN.md 8.2)."""
         h = self._handler(kind)
         missing = [f for f in h.required if payload.get(f) is None]
         if missing:
@@ -146,6 +152,8 @@ class IntentExecutor:
                             decision.sim_minute or 0)
             if h.before:
                 h.before(tx, intent)
+            if before is not None:
+                before(tx)
             record(tx, wf=decision.wf, actor=self.actor, action="intent_started",
                    subject=("intent", key), summary=f"{kind} {key}",
                    details={"intent_id": iid}, caused_by=did)
@@ -244,7 +252,7 @@ class Reconciler:
             elif look.outcome == "not_run":
                 abort_intent(tx, intent)
                 if h and h.aborted:
-                    h.aborted(tx, intent)
+                    h.aborted(tx, intent, look.response)
             elif look.outcome == "lost":
                 repos.finish_intent(tx, intent.intent_id, "done", {**look.response, "lost": True})
                 if h and h.lost:

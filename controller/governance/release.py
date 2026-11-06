@@ -19,13 +19,13 @@ from typing import Callable, Mapping, Sequence
 from controller.governance.builder import BuildContext, RequestPackage, build_request
 from controller.governance.lifecycle import ProposalLifecycle, SubmitBlocked
 from controller.governance.policy import check_auto_apply, needs_notice
-from controller.governance.timing import ROUTINE_CLASSES, choose_submit
+from controller.governance.timing import ROUTINE_CLASSES, choose_submit, p_expire, routine_slots
 from controller.planner.overlay import CompositionInvalid, Overlay
 from controller.settings import Thresholds
 from controller.governance.policy import is_risk_reducing, tv_by_cohort_dim
 from controller.types import (AGENT_DIMS, DEFAULT_COHORT, P0_INCIDENT, P0A_PROMPT_SAFETY,
                               P0B_DID_DRAIN, P1_ROLLBACK, Composition, Config, EffectivePolicy,
-                              FrozenDict, Hold, Proposal, VelocityEntry, VelocityLedger)
+                              FrozenDict, Hold, Proposal, VelocityLedger)
 from controller.world.clock import (ceil_to_tick, in_approver_hours, next_open,
                                     worst_decide_minute)
 
@@ -157,6 +157,23 @@ def notice_until(now: int, pol: EffectivePolicy) -> int:
     return post + pol.notice_minutes
 
 
+def no_submit_reason(now: int, pol: EffectivePolicy, cls: int, t: Thresholds) -> str:
+    """Why `choose_submit` found no minute: `no_safe_window` only when no expiry-safe minute
+    exists at all (today's and tomorrow's routine slots for P2/P3, the next 24h of ticks for
+    P0/P1), which pages NO_SAFE_WINDOW; otherwise the fatigue budget (at cap 1, the 48h routine
+    rule of 6.4) is what makes the work wait, which is the policy working and pages nothing."""
+    if cls in ROUTINE_CLASSES:
+        day = now // 1440
+        if routine_slots(day, pol, t=t) or routine_slots(day + 1, pol, t=t):
+            return "fatigue_wait"
+        return "no_safe_window"
+    start = ceil_to_tick(now, pol.tick)
+    if any(p_expire(m, pol) <= t.submit_expiry_p_max
+           for m in range(start, start + 1440, pol.tick)):
+        return "fatigue_wait"
+    return "no_safe_window"
+
+
 def is_operational(path: tuple[str, ...]) -> bool:
     return path[0] == "hour_weights" or (path[0] == "alloc" and path[2] == "caller_id")
 
@@ -195,26 +212,31 @@ class ReleaseTrain:
 
     def __init__(self, deps: ReleaseDeps):
         self.d = deps
-        self.velocity: dict[str, list[VelocityEntry]] = {}
 
-    def ledger(self, wf: str) -> VelocityLedger:
-        return VelocityLedger(wf, tuple(self.velocity.get(wf, ())))
+    def ledger(self, wf: str, now: int | None = None) -> VelocityLedger:
+        """The rolling velocity ledger (6.5 rule 4), derived from the applied auto-apply
+        proposals in the store, so a restart rebuilds exactly what a clean run holds (ADR
+        0029). Entries older than the window (and the chaining look-back of one tick) are
+        irrelevant to every rule and are not loaded."""
+        now = self.d.lifecycle.d.clock() if now is None else now
+        since = now - max(self.d.t.velocity_window_min, self.d.policy_of(wf).tick) - 1
+        return VelocityLedger(wf, tuple(self.d.lifecycle.d.store.velocity_entries(wf, since)))
 
-    def _record_velocity(self, comp: Composition, p: Proposal, now: int) -> None:
-        if p.state not in ("applied", "verifying"):
-            return
-        for (k, dim), tv in comp.tv_by_cohort_dim.items():
-            self.velocity.setdefault(comp.wf, []).append(VelocityEntry(
-                now, k, dim, tv, comp.risk.get((k, dim)) == "increasing", p.proposal_id))
-
-    def run(self, now: int) -> list[ReleaseDecision]:
+    def run(self, now: int,
+            on_decision: Callable[[ReleaseDecision], None] | None = None
+            ) -> list[ReleaseDecision]:
+        """One decision per workflow. `on_decision` is called as soon as each workflow is done
+        (the loop records it then, so a crash in a later workflow loses no earlier record)."""
         out = []
         for wf in self.d.workflows():
             try:
-                out.append(self.run_workflow(wf, now))
+                d = self.run_workflow(wf, now)
             except CompositionInvalid as e:
                 self.d.overlay.hold(e.patch_ids, now + self.d.t.held_patch_release_min)
-                out.append(ReleaseDecision(wf, "hold", f"composition invalid: {e.problems}"))
+                d = ReleaseDecision(wf, "hold", f"composition invalid: {e.problems}")
+            out.append(d)
+            if on_decision is not None:
+                on_decision(d)
         return out
 
     def _package(self, comp: Composition) -> RequestPackage:
@@ -302,14 +324,13 @@ class ReleaseTrain:
         pkg = self._package(comp)
         p = self.d.lifecycle.auto_apply(step, now, rationale=f"chain step ({lam:.3f} of the "
                                         f"way): {pkg.rationale}", package=pkg)
-        self._record_velocity(step, p, now)
         return ReleaseDecision(comp.wf, "chain_step",
                                f"{chain_steps_left(comp, pol, self.d.t)} steps to target",
                                p.proposal_id)
 
     def _auto_report(self, comp: Composition, now: int, pol: EffectivePolicy,
                      notice: int | None):
-        return check_auto_apply(pol, comp, self.ledger(comp.wf), self.d.holds(comp.wf), now,
+        return check_auto_apply(pol, comp, self.ledger(comp.wf, now), self.d.holds(comp.wf), now,
                                 notice_until=notice, t=self.d.t)
 
     def _route(self, comp: Composition, now: int, pol: EffectivePolicy) -> ReleaseDecision:
@@ -323,7 +344,6 @@ class ReleaseTrain:
                 pkg = self._package(comp)
                 p = lc.auto_apply(comp, now, rationale=pkg.rationale, notice_until=notice,
                                   package=pkg)
-                self._record_velocity(comp, p, now)
                 return ReleaseDecision(wf, "auto_apply" if r.permitted else "notice",
                                        "policy, directive and velocity permit", p.proposal_id,
                                        p.notice_until_minute)
@@ -355,7 +375,6 @@ class ReleaseTrain:
             return None        # apply the operational part right before the approval only
         pkg = self._package(op)
         p = self.d.lifecycle.auto_apply(op, now, rationale=pkg.rationale, package=pkg)
-        self._record_velocity(op, p, now)
         version, live = self.d.live(comp.wf)
         rest = ov.compose(comp.wf, live, composition_classes(comp.cls), base_version=version)
         if not rest.changed_dims:
@@ -374,8 +393,12 @@ class ReleaseTrain:
         when = choose_submit(now, pol, lc.used(comp.wf), comp.cls,
                              self._slot1_terminal(comp.wf, now), t=self.d.t)
         if when is None:
-            return ReleaseDecision(comp.wf, "no_safe_window",
-                                   "no expiry- and fatigue-safe submit minute (NO_SAFE_WINDOW)")
+            why = no_submit_reason(now, pol, comp.cls, self.d.t)
+            if why == "fatigue_wait":
+                return ReleaseDecision(comp.wf, why, "the request budget of the next 24h is used "
+                                       "(at cap 1: one routine request per 48h); waiting")
+            return ReleaseDecision(comp.wf, why,
+                                   "no expiry-safe submit minute (NO_SAFE_WINDOW)")
         if when != now:
             return ReleaseDecision(comp.wf, "planned", f"submit planned at {when}",
                                    planned_minute=when)
@@ -405,8 +428,6 @@ class ReleaseTrain:
                              bundle_keeps_drain=bundle, rationale=pkg.rationale)
         except SubmitBlocked as e:
             return ReleaseDecision(comp.wf, "blocked", "; ".join(e.reasons))
-        if route == "auto":
-            self._record_velocity(comp, p, now)
         return ReleaseDecision(comp.wf, prec.action, prec.reason, p.proposal_id)
 
 

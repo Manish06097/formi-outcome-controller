@@ -29,7 +29,7 @@ def test_run_sh_public01_exit_0_zero_changes(sim_factory, tmp_path):
     env = {k: v for k, v in os.environ.items() if not k.startswith("CTL_")}
     env.update({"COMPOSE_PROJECT_NAME": os.environ.get("CTL_T1_COMPOSE_PROJECT", "formi_t1"),
                 "CTL_PG_PORT": os.environ.get("CTL_T1_PG_PORT", "55441"),
-                "CTL_MAX_RESTARTS": "2", "CTL_START_API": "0"})
+                "CTL_MAX_RESTARTS": "2", "CTL_START_API": "0", "CTL_LEARNER": "none"})
     env.pop("TMPDIR", None)        # the docker CLI's plugin socket needs a short path
     log = tmp_path / "run_sh.log"
     with open(log, "wb") as f:

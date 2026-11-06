@@ -71,7 +71,10 @@ def controller_env(sim_url: str, dsn: str, extra: dict[str, str] | None = None) 
     env = {k: v for k, v in os.environ.items() if not k.startswith("CTL_")}
     env.update({"CTL_SIM_URL": sim_url, "PG_DSN": dsn, "CTL_SIM_WAIT": "60",
                 "CTL_HEARTBEAT_S": "2", "CTL_LOCK_POLL_S": "1", "PYTHONUNBUFFERED": "1",
-                "CTL_CODE_VERSION": "test"})
+                "CTL_CODE_VERSION": "test",
+                # the platform tests check the M1/M2 loop: governance runs, nothing emits
+                # patches (pass CTL_LEARNER=probe in `extra` for the M3 tests)
+                "CTL_LEARNER": "none"})
     env.update(extra or {})
     return env
 

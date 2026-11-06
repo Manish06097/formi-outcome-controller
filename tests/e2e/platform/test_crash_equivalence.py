@@ -10,14 +10,23 @@ store as the clean run:
 - identical facts, rollups, catalog and config tables.
 The kill mid-COPY (`chunk_copy:1:mid`) crashes inside the history chunk's COPY; the bootstrap
 crash checks that an interrupted bootstrap reruns.
+
+Governance cells (DESIGN.md 15.1 M3, step I2): the same matrix for `submit_approval`, `apply`
+and `auto_apply` with the probe-only learner on, so the run submits, applies and auto-applies.
+A crashed run must leave the simulator with the same approvals and config versions (same ids,
+minutes, statuses, bodies' dims) and the store with the same proposals, patches, DID states and
+approval mirror as the clean run. Decision and intent rows are not compared: reconciliation
+adds its own rows and resolutions, which is the audit trail of the crash.
 """
 from __future__ import annotations
+
+import re
 
 import pytest
 
 from controller.simclient import SimClient
-from tests.e2e.platform.helpers import (DOMAIN_TABLES, SHORT, create_database, diff_dumps,
-                                        done_advances, drop_database, dump_schema,
+from tests.e2e.platform.helpers import (DOMAIN_TABLES, SHORT, WALL_COLUMNS, create_database,
+                                        diff_dumps, done_advances, drop_database, dump_table,
                                         latest_schema, query, run_controller)
 from tests.support.sim_process import SimProcess
 from tests.e2e.platform.helpers import SIM_PORT
@@ -30,19 +39,57 @@ CELLS = ([("advance", n, ph) for ph in ("before_t1", "after_t1", "after_http", "
             for n in (1, 3)]
          + [("chunk_copy", 1, "mid"), ("audit_write", 2, "in_t2"), ("bootstrap", 1, "mid")])
 COMPARED = DOMAIN_TABLES + ("ingested_chunk",)
+GOV_CELLS = ([(k, 1, ph) for k in ("submit_approval", "apply", "auto_apply")
+              for ph in ("before_t1", "after_t1", "after_http", "in_t2")]
+             + [(k, 3, ph) for k in ("submit_approval", "apply", "auto_apply")
+                for ph in ("after_t1", "after_http")])
+GOV_COMPARED = COMPARED + ("proposal", "patch", "path_owner", "cooldown", "approval_mirror",
+                           "did_state", "loop_stage")
+GOV_EXCLUDE = {"proposal": {"decision_id"}, "patch": {"decision_id"}}
+"""Decision ids are identity values: a crashed run writes extra decision rows (reconciliation),
+so the ids a proposal or patch points at differ while everything they say is the same."""
 
 
-def _one_run(base_dsn: str, workdir, fault: str | None):
+DECISION_REFS = (re.compile(r"decision #\d+"), re.compile(r"'decision_ids': \[[\d, ]*\]"))
+
+
+def _without_decision_refs(rows: list[str]) -> list[str]:
+    """Rationale and evidence quote decision ids; only the ids may differ."""
+    out = []
+    for r in rows:
+        for pat in DECISION_REFS:
+            r = pat.sub("<decision>", r)
+        out.append(r)
+    return sorted(out)
+
+
+def _sim_view(url: str) -> dict:
+    c = SimClient(url)
+    return {"approvals": sorted((a.proposal_id, a.workflow_id, a.status, a.base_version,
+                                 a.changed_dims, a.created_at, a.decided_at, a.apply_by)
+                                for a in c.approvals()),
+            "versions": {w.workflow_id: [(v.version, v.actor, v.changed_dims, v.proposal_id,
+                                          v.approval_id, v.applied_at)
+                                         for v in c.config_history(w.workflow_id)]
+                         for w in c.workflows()}}
+
+
+def _one_run(base_dsn: str, workdir, fault: str | None, learner: str = "none",
+             tables: tuple[str, ...] = COMPARED):
     dsn = create_database(base_dsn)
     sim = SimProcess("scenarios/public_01_dev.yaml", workdir, port=SIM_PORT, overrides=SHORT,
                      ready_timeout_s=300).start()
     try:
         extra = {"CTL_FAULT": fault} if fault else {}
+        extra["CTL_LEARNER"] = learner
         run = run_controller(sim.url, dsn, workdir / "controller.log", extra, max_restarts=5)
         st = SimClient(sim.url).state()
         schema = latest_schema(dsn)
+        dump = {t: _without_decision_refs(dump_table(
+                    dsn, schema, t, WALL_COLUMNS.get(t, set()) | GOV_EXCLUDE.get(t, set())))
+                for t in tables}
         out = {"codes": run.exit_codes, "log": run.log, "state": st, "schema": schema,
-               "dump": dump_schema(dsn, schema, COMPARED),
+               "dump": dump, "sim": _sim_view(sim.url),
                "advances": done_advances(dsn, schema),
                "events": query(dsn, schema, "SELECT sum(events) FROM ingested_chunk")[0][0],
                "faults": query(dsn, schema, """SELECT subject_id FROM audit_log
@@ -51,6 +98,8 @@ def _one_run(base_dsn: str, workdir, fault: str | None):
                                                   WHERE action = 'bootstrap_completed'"""),
                "intents": query(dsn, schema, """SELECT status, count(*) FROM intent
                                                 GROUP BY 1 ORDER BY 1"""),
+               "gov_intents": query(dsn, schema, """SELECT kind, count(*) FROM intent
+                                                    WHERE status = 'done' GROUP BY 1"""),
                "history": {w.workflow_id: len(SimClient(sim.url).config_history(w.workflow_id))
                            for w in SimClient(sim.url).workflows()}}
         return out
@@ -83,3 +132,27 @@ def test_crash_equivalence(clean, pg_dsn, tmp_path, kind, n, phase):
     assert ("started", 1) not in out["intents"]
     if kind == "bootstrap":
         assert [d[0]["rerun"] for d in out["bootstrap"]] == [True]
+
+
+@pytest.fixture(scope="module")
+def clean_gov(pg_dsn, tmp_path_factory):
+    out = _one_run(pg_dsn, tmp_path_factory.mktemp("clean_gov"), None, "probe", GOV_COMPARED)
+    assert out["codes"] == [0]
+    done = dict(out["gov_intents"])
+    for kind in ("submit_approval", "apply", "auto_apply"):
+        assert done.get(kind, 0) >= 3, f"the clean run must exercise {kind} 3 times: {done}"
+    return out
+
+
+@pytest.mark.parametrize("kind,n,phase", GOV_CELLS, ids=[f"{k}:{n}:{p}" for k, n, p in GOV_CELLS])
+def test_crash_equivalence_governance(clean_gov, pg_dsn, tmp_path, kind, n, phase):
+    spec = f"{kind}:{n}:{phase}"
+    out = _one_run(pg_dsn, tmp_path, spec, "probe", GOV_COMPARED)
+    assert out["codes"][0] == 137 and out["codes"][-1] == 0, out["log"][-3000:]
+    assert len(out["codes"]) == 2, "the fault fires once per run"
+    assert out["faults"] == [(spec,)]
+    assert out["state"].finished and out["events"] == out["state"].last_event_id
+    assert out["advances"] == clean_gov["advances"], "the same stops, in the same order"
+    assert out["sim"] == clean_gov["sim"], "the same approvals and config versions"
+    assert diff_dumps(clean_gov["dump"], out["dump"]) == []
+    assert ("started", 1) not in out["intents"]

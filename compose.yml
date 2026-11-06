@@ -64,6 +64,7 @@ services:
       - CTL_PREFETCH_CHUNKS
       - CTL_LLM_SUGGEST
       - CTL_ENGAGEMENT_MODEL
+      - CTL_LEARNER
     mem_limit: 1g
     restart: "no"
 

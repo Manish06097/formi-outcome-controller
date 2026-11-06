@@ -22,7 +22,7 @@ from tests.support.sim_process import REPO, SimProcess
 
 pytestmark = pytest.mark.e2e
 
-PORT = 8712
+PORT = int(__import__("os").environ.get("CTL_GOV_SIM_PORT", "8712"))
 SCENARIO = "scenarios/public_01_dev.yaml"
 
 

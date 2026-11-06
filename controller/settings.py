@@ -448,6 +448,10 @@ class EnvSettings:
     set 0 to skip it (it then changes no decision, 7.1)."""
     engagement_model: str = "beta_binomial"
     """CTL_ENGAGEMENT_MODEL: beta_binomial (ships first, 17.2) | ridge_logit."""
+    learner: str = "probe"
+    """CTL_LEARNER: which patch-emitting learners the loop runs. `probe` (DESIGN.md 15.1 M3):
+    caller-ID probes and spreads (5.9) plus per-cohort hour weights from history (5.8); `none`:
+    governance runs but nothing emits patches (the M2 no-op loop, used by the platform tests)."""
     fault: str | None = None
     """CTL_FAULT=<kind>:<n>:<phase> crash injection (10.2)."""
     max_restarts: int = 20
@@ -465,7 +469,7 @@ class EnvSettings:
     """CTL_CODE_VERSION (git sha baked into the image); stored on every decision row."""
     log_level: str = "INFO"
 
-    DECISION_FIELDS = ("llm_suggest", "engagement_model")
+    DECISION_FIELDS = ("llm_suggest", "engagement_model", "learner")
     """Environment fields that change decisions, so they enter settings_hash."""
 
     @property
@@ -484,6 +488,9 @@ class EnvSettings:
         ingest = _env_str(env, "CTL_INGEST", default=d.ingest)
         if ingest not in ("sql", "python"):
             raise ValueError(f"CTL_INGEST must be sql or python, not {ingest}")
+        learner = _env_str(env, "CTL_LEARNER", default=d.learner)
+        if learner not in ("probe", "none"):
+            raise ValueError(f"CTL_LEARNER must be probe or none, not {learner}")
         return cls(
             sim_url=_env_str(env, "CTL_SIM_URL", "SIM_URL", default=d.sim_url) or d.sim_url,
             pg_dsn=_env_str(env, "PG_DSN", "CTL_PG_DSN"),
@@ -508,6 +515,7 @@ class EnvSettings:
             ingest=ingest or d.ingest,
             llm_suggest=_env_bool(env, "CTL_LLM_SUGGEST", d.llm_suggest),
             engagement_model=model or d.engagement_model,
+            learner=learner or d.learner,
             fault=_env_str(env, "CTL_FAULT"),
             max_restarts=int(_env_num(env, "CTL_MAX_RESTARTS", d.max_restarts, int)),
             stop_after_steps=_positive_or_none(env, "CTL_STOP_AFTER_STEPS"),

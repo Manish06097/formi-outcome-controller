@@ -29,15 +29,17 @@ class DirectExecutor:
         self.c = client
         self.calls: list[tuple[str, str]] = []
 
-    def execute(self, kind: str, key: str, payload: dict[str, Any], decision: Decision) -> Any:
+    def execute(self, kind: str, key: str, payload: dict[str, Any], decision: Decision, *,
+                before=None) -> Any:
         self.calls.append((kind, key))
+        if before is not None:
+            before()
         if kind == "submit_approval":
-            return self.c.request_approval(payload)
+            return self.c.request_approval(payload["body"])
         if kind == "apply":
             return self.c.apply(payload["workflow_id"], payload["approval_id"])
         if kind == "auto_apply":
-            wf = decision.wf
-            return self.c.auto_apply(wf, payload)
+            return self.c.auto_apply(payload["workflow_id"], payload["body"])
         raise ValueError(kind)
 
 

@@ -23,7 +23,8 @@ EXPECTED_RUN_TABLES = {
     "credit_envelope",
     "patch", "path_owner", "cooldown", "proposal", "proposal_transition", "approval_mirror",
     "intent", "hold",
-    "decision", "audit_log", "allocation_provenance", "loop_step", "alert", "clock", "heartbeat",
+    "decision", "audit_log", "allocation_provenance", "loop_step", "loop_stage", "alert", "clock",
+    "heartbeat",
     "schema_migrations",
 }
 

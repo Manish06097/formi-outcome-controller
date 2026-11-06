@@ -17,6 +17,7 @@ EXIT_FATAL = 3
 
 def main(argv: list[str] | None = None) -> int:
     try:  # a missing dependency is a deployment error: restarting cannot fix it
+        from controller.loop.governance import GovernanceHooks
         from controller.loop.orchestrator import Orchestrator
         from controller.settings import load_settings
     except ImportError as e:
@@ -33,7 +34,7 @@ def main(argv: list[str] | None = None) -> int:
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
                         stream=sys.stderr)
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    return Orchestrator(settings).run()
+    return Orchestrator(settings, GovernanceHooks(settings.env.learner)).run()
 
 
 if __name__ == "__main__":

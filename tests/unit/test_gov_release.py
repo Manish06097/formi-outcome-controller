@@ -1,6 +1,8 @@
 """Release train rules (DESIGN.md 6.2, 6.5): precedence table, chains, notice, batching."""
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from controller.governance.policy import classify_risk, tv_by_cohort_dim
@@ -127,3 +129,19 @@ def test_chain_step_moves_max_shift_on_the_straight_line():
     assert tv_by_cohort_dim(live, step.as_stored())[("default", "caller_id")] <= 0.05 - 1e-6 + 1e-12
     small = live.with_allocation("default", "caller_id", {"D1": 0.68, "D2": 0.32})
     assert chain_lambda(_comp(live, small), pol, T) == 1.0
+
+
+def test_no_submit_reason_tells_fatigue_from_a_missing_window():
+    """At cap 1 a rejected routine request leaves no slot for 48h: that is the budget working,
+    not NO_SAFE_WINDOW (found in the gov_c_cap1 variant, step I2)."""
+    from controller.governance.release import no_submit_reason
+    from controller.governance.timing import choose_submit
+    pol = policy(max_requests_per_24h=1, enabled=False, allowed_dims=[], max_shift=0)
+    used = [hm(3, 11)]
+    assert choose_submit(hm(3, 15), pol, used, 3, True, t=T) is None
+    assert no_submit_reason(hm(3, 15), pol, 3, T) == "fatigue_wait"
+    # approvers 14-16 with TTL 4h and pre-open submits forbidden: no expiry-safe slot exists
+    closed = policy(approver_hours=[14, 16], proposal_ttl_hours=4)
+    closed = dataclasses.replace(closed, pre_open_submits="never")
+    assert choose_submit(hm(3, 9), closed, [], 3, True, t=T) is None
+    assert no_submit_reason(hm(3, 9), closed, 3, T) == "no_safe_window"

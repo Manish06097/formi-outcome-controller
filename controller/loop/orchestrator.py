@@ -13,8 +13,10 @@ Per step:
   3  INGEST    the advance's chunks plus any gap; decisions wait until ingest lag is 0
   4  REFRESH   GET /sim/state; config bodies of new versions (ConfigMirror); the
                supervisor-edit handler hook, in one transaction with an audit row per version
-  5-9          LIFECYCLE, DETECT, DECIDE, GOVERN, VERIFY: hooks (`LoopHooks`), no-ops until the
-               governance, learning and incident tracks plug in
+  5-9          LIFECYCLE, DETECT, DECIDE, GOVERN, VERIFY: hooks (`LoopHooks`); production runs
+               `loop/governance.py: GovernanceHooks` (ADR 0029). Each completed stage is marked
+               in `loop_stage`; a restart finishes an interrupted step from the first unmarked
+               stage
  10  OPS       loop_step row, run registry
  11  finished: final ingest and reconcile, run_registry.status = done, exit 0
 

@@ -10,7 +10,9 @@ Status of the pieces this guide mentions (so nothing here surprises you):
 | Store, migrations, settings, simulator client | `controller/store`, `controller/settings.py`, `controller/simclient` | built (M0) |
 | Audit CLI, decision replay, supervisor and ops API, alert rules | `controller/audit`, `controller/api`, `controller/obs/alerts.py` | built (M7, T5) |
 | Private scenario variants and the matrix runner | `scenarios/private/`, `scripts/variants/` | built (M0b) |
-| `run.sh` with Docker Compose, the loop, ingest, learning, governance | `run.sh`, `compose*.yml`, `controller/loop`, ... | landing with M1 to M6; until then `run.sh` runs the naive example |
+| `run.sh` with Docker Compose, the loop, ingest, crash safety | `run.sh`, `compose*.yml`, `controller/loop`, `controller/ingest`, `controller/reliability` | built (M1, M2) |
+| Governance in the loop: proposals and overlay in Postgres, lifecycle, release train, supervisor-edit rebase | `controller/governance`, `controller/planner`, `controller/loop/governance.py` | built (M3, step I2, ADR 0029) |
+| Learners | `controller/learning`, `controller/incidents` | the probe-only learner runs (`CTL_LEARNER=probe`: caller-ID probes and spreads, per-cohort call times from history); engagement learning and incident response land with M4 to M6 |
 
 ## 1. Prerequisites
 
@@ -44,6 +46,7 @@ CTL_NO_DOCKER=1 PG_DSN="host=127.0.0.1 port=5432 user=postgres password=... dbna
 Every setting is an environment variable read by `controller/settings.py` (`EnvSettings`):
 `CTL_SIM_URL`, `PG_DSN` or `CTL_PG_HOST/PORT/USER/PASSWORD/DB`, `CTL_API_PORT` (8780),
 `CTL_INGEST` (`sql` or `python`), `CTL_ENGAGEMENT_MODEL`, `CTL_LLM_SUGGEST`, `CTL_FAULT`,
+`CTL_LEARNER` (`probe`, the default, or `none`: governance runs but nothing proposes changes),
 `CTL_CODE_VERSION`. Thresholds are overridden with `CTL_T_<NAME>` (only for private-variant
 experiments; an override changes `settings_hash`, which every decision row stores).
 
@@ -158,6 +161,19 @@ scripts/variants/run_matrix.sh --controller ./run.sh gov_c_cap1_p01 two_incident
 
 `run_matrix.sh --controller CMD` serves the simulator for each variant on port 8715, runs
 `CMD <SIM_URL>`, grades the run against the baseline and writes `runs/private/summary.tsv`.
+
+To run the controller process itself (what run.sh runs inside its container) against one
+scenario with a throwaway database and grade it, without Docker:
+
+```bash
+.venv/bin/python -m sim baseline --scenario scenarios/public_01_dev.yaml --run-dir runs/base_public_01_dev
+.venv/bin/python scripts/m3_run.py scenarios/public_01_dev.yaml --out runs/m3/public_01 \
+    --baseline runs/base_public_01_dev --port 8720 \
+    --dsn "host=127.0.0.1 port=55470 user=postgres password=ctl dbname=postgres" [--keep-db]
+```
+
+It writes `grade.md`, `controller.log` and `summary.json` (exit codes, wall time, the grader's
+governance block) under `--out`. `--env CTL_FAULT=apply:1:after_http` injects a crash.
 Baseline wall times are in `docs/measurements/private-variants-baseline.md`.
 
 ## 8. Extending

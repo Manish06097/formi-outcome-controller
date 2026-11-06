@@ -290,24 +290,49 @@ def plan_allocation_detail(ws: WorkflowSnapshot, draws_ew: Draws | EffectCache, 
                            settings: Settings | Thresholds | None = None,
                            guard_fn: GuardFn | None = None, did_post: DidPosterior | None = None,
                            max_tv: float | None = None, decision_id: int = 0,
-                           ctx: GateContext | None = None) -> AllocationPlan:
+                           ctx: GateContext | None = None,
+                           t_apply: int | None = None) -> AllocationPlan:
     """The full planning computation, with every intermediate result for the decision row.
 
     Dimensions without an open experiment get one first (`open_experiments`), returned in
     `new_experiments`: the caller must persist them, or the next plan opens them again with
-    whatever the incumbent is then."""
+    whatever the incumbent is then.
+
+    Robust to decay between now and the expected apply time `t_apply` (default: now + the mean
+    approver latency): when an arm's recent trend is credibly falling, the move must pass the
+    gate both on the EW draws and on the draws predicted to t_apply (decay.apply_time_shifts).
+    A pessimistic prediction alone is not conservative: it would make cutting a still-good arm
+    look harmless. Requiring both makes the move safe whether or not the decline continues."""
     opened = open_experiments(ws, settings)
     if opened:
         ws = replace(ws, experiments=tuple(ws.experiments) + opened)
+    t = _thresholds(settings)
+    trend_ctx = None
+    if ctx is None and not isinstance(draws_ew, EffectCache):
+        shifted = apply_time_cache(ws, draws_ew, t_apply, t)
+        if shifted.shifts:
+            trend_ctx = GateContext(shifted, active_population(ws),
+                                    cells=getattr(ws, "cells", {}), settings=t)
     plan = _plan(ws, draws_ew, settings=settings, guard_fn=guard_fn, did_post=did_post,
-                 max_tv=max_tv, decision_id=decision_id, ctx=ctx)
+                 max_tv=max_tv, decision_id=decision_id, ctx=ctx, trend_ctx=trend_ctx)
     return replace(plan, new_experiments=opened) if opened else plan
+
+
+def merge_results(now: GateResult, at_apply: GateResult | None) -> GateResult:
+    """The 'now' result, failing also where the apply-time scenario fails ("apply_time:...")."""
+    if at_apply is None:
+        return now
+    extra = tuple(f"apply_time:{f}" for f in at_apply.report.failed)
+    if not extra:
+        return now
+    rep = replace(now.report, passes=False, failed=now.report.failed + extra)
+    return replace(now, report=rep)
 
 
 def _plan(ws: WorkflowSnapshot, draws_ew: Draws | EffectCache, *,
           settings: Settings | Thresholds | None, guard_fn: GuardFn | None,
           did_post: DidPosterior | None, max_tv: float | None, decision_id: int,
-          ctx: GateContext | None) -> AllocationPlan:
+          ctx: GateContext | None, trend_ctx: GateContext | None = None) -> AllocationPlan:
     t = _thresholds(settings)
     live = ws.live
     dims = _engagement_dims(ws, t)
@@ -344,10 +369,12 @@ def _plan(ws: WorkflowSnapshot, draws_ew: Draws | EffectCache, *,
     def gate(cfg: Config, scopes: Sequence[str] | None) -> GateResult:
         guard = guard_fn(live, cfg) if guard_fn is not None else None
         r = ctx.evaluate(live, cfg, ws.policy, t.alpha_h, t.alpha_d, did_post, guard)
-        return r
+        r2 = trend_ctx.evaluate(live, cfg, ws.policy, t.alpha_h, t.alpha_d, did_post, guard) \
+            if trend_ctx is not None else None
+        return merge_results(r, r2)
 
     def ok(r: GateResult, scopes: Sequence[str] | None) -> bool:
-        fails = r.report.failed
+        fails = [f.removeprefix("apply_time:") for f in r.report.failed]
         if scopes is None:
             return not fails
         bad = {"population", "guardrail", "did", "did_unmodeled"}
@@ -436,6 +463,15 @@ def _removal_only(ws: WorkflowSnapshot, ctx: GateContext, live: Config,
                           kind="risk_reducing", lambdas={}, common_factor=f, targets={},
                           removed=tuple(sorted(removed)), harm=result.report,
                           expected_gain=_expected_gain(result), evidence=evidence)
+
+
+def apply_time_cache(ws: WorkflowSnapshot, draws: Draws, t_apply: int | None,
+                     settings: Settings | Thresholds | None = None) -> EffectCache:
+    """An EffectCache whose arm effects are predicted to the apply time (see decay.py)."""
+    from controller.learning.decay import apply_time_shifts, default_apply_time  # no cycle
+    ta = default_apply_time(ws) if t_apply is None else t_apply
+    shifts = apply_time_shifts(ws, int(draws.params.shape[0]), int(draws.seed), ta, settings)
+    return EffectCache(draws, shifts)
 
 
 def plan_allocations(ws: WorkflowSnapshot, draws_ew: Draws, **kw: Any) -> list[PatchRequest]:

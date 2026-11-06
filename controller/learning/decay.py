@@ -130,6 +130,10 @@ class PageDecayMonitor:
             key = (scope, dim, arm)
             st = self._s.get(key)
             if st is None:
+                # the reference must be an estimate, not the prior: start once the arm has the
+                # evidence floor of 5.5 in scope (200 connected calls)
+                if _arm_n(ws, dim, arm, cells) < t.look_first_n:
+                    continue
                 ref = self._theta_ref(ws, cache, dim, arm, control, cells, pop, coh, scope,
                                       segment)
                 st = DecayMonitorState(wf=ws.spec.workflow_id, scope=scope, dim=dim, arm=arm,
@@ -160,6 +164,24 @@ class PageDecayMonitor:
                                          "theta_ref": new.theta_ref,
                                          "z": tuple((int(j), float(z)) for j, z in zs)})))
         return findings
+
+    def restart(self, ws: WorkflowSnapshot, scope: str, dim: str, arm: str,
+                stat: Draws | EffectCache | None = None) -> DecayMonitorState:
+        """Re-take the reference at promotion (5.7: "theta_ref ... or at promotion"): a winner
+        is then monitored against its holdout from its effect at promotion, with a fresh CUSUM.
+        Call it when the promotion is APPLIED; the caller persists the returned row."""
+        cache = stat if isinstance(stat, EffectCache) else (EffectCache(stat) if stat else None)
+        pop = active_population(ws)
+        coh = _cohorts_of(ws, pop)
+        cells = _scope_cells(pop, coh, ws.live, scope)
+        control = next((c for s_, d, a, c in self.monitored(ws)
+                        if (s_, d, a) == (scope, dim, arm)), dim_arms(ws, dim).control)
+        seg = segment_of(ws.now, ws.spec.dialling_window)
+        ref = self._theta_ref(ws, cache, dim, arm, control, cells, pop, coh, scope, seg - 1)
+        st = DecayMonitorState(wf=ws.spec.workflow_id, scope=scope, dim=dim, arm=arm, cusum=0.0,
+                               seg_last=seg - 1, theta_ref=ref, alarm=False)
+        self._s[(scope, dim, arm)] = st
+        return st
 
     def _theta_ref(self, ws, cache, dim, arm, control, cells, pop, coh, scope, segment) -> float:
         if cache is not None:
@@ -258,27 +280,79 @@ class PageDecayMonitor:
         return x, info
 
     def _trend(self, ws, dim, arm, control, cells) -> tuple[float, float, int]:
-        """Weighted least-squares slope of segment log ratios over the last completed segments."""
-        t = self.t
-        seg_now = segment_of(ws.now, ws.spec.dialling_window)
-        pts = []
-        j = seg_now - 1
-        while j >= seg_now - 4 * t.rollback_trend_segments and len(pts) < t.rollback_trend_segments:
-            r = segment_ratio(ws, dim, arm, control, cells, j)
-            if r is not None and r[1] > 0:
-                pts.append((j, r[0], r[1]))
-            j -= 1
-        if len(pts) < 2:
-            return 0.0, 0.0, len(pts)
-        x = np.array([p[0] for p in pts], dtype=float)
-        y = np.array([p[1] for p in pts])
-        wts = 1.0 / np.array([p[2] for p in pts]) ** 2
-        xm = np.average(x, weights=wts)
-        sxx = float((wts * (x - xm) ** 2).sum())
-        if sxx <= 0:
-            return 0.0, 0.0, len(pts)
-        b = float((wts * (x - xm) * (y - np.average(y, weights=wts))).sum() / sxx)
-        return b, float(np.sqrt(1.0 / sxx)), len(pts)
+        return arm_trend(ws, dim, arm, control, cells, self.t.rollback_trend_segments)
+
+
+# ============================================================================== apply time
+
+TREND_SIGNIFICANCE = 0.90
+"""A falling trend is extrapolated to the apply time only when it is credible at this one-sided
+level. LOCAL until settings.py gains `apply_time_trend_p` (contract change in the T3 report)."""
+
+
+def default_apply_time(ws: WorkflowSnapshot) -> int:
+    """Expected apply time of an approval submitted now: now + the mean approver latency (the
+    planner passes the timing calculator's answer when it has one, 6.3)."""
+    lo, hi = ws.policy.latency_minutes
+    return int(ws.now + (lo + hi) / 2)
+
+
+def arm_trend(ws: WorkflowSnapshot, dim: str, arm: str, control: str, cells: Sequence[int],
+              n_segments: int) -> tuple[float, float, int]:
+    """WLS slope (log ratio per segment), its SE and the number of points, over the last
+    `n_segments` completed segments with data (searching back at most 4 x n_segments)."""
+    seg_now = segment_of(ws.now, ws.spec.dialling_window)
+    pts = []
+    j = seg_now - 1
+    while j >= seg_now - 4 * n_segments and len(pts) < n_segments:
+        r = segment_ratio(ws, dim, arm, control, cells, j)
+        if r is not None and r[1] > 0:
+            pts.append((j, r[0], r[1]))
+        j -= 1
+    if len(pts) < 2:
+        return 0.0, 0.0, len(pts)
+    x = np.array([p[0] for p in pts], dtype=float)
+    y = np.array([p[1] for p in pts])
+    wts = 1.0 / np.array([p[2] for p in pts]) ** 2
+    xm = np.average(x, weights=wts)
+    sxx = float((wts * (x - xm) ** 2).sum())
+    if sxx <= 0:
+        return 0.0, 0.0, len(pts)
+    b = float((wts * (x - xm) * (y - np.average(y, weights=wts))).sum() / sxx)
+    return b, float(np.sqrt(1.0 / sxx)), len(pts)
+
+
+def apply_time_shifts(ws: WorkflowSnapshot, n_draws: int, seed: int, t_apply: int,
+                      settings: Settings | Thresholds | None = None
+                      ) -> dict[tuple[str, str], np.ndarray]:
+    """Per (dim, arm): draws of the predicted change of the arm's effect from now to t_apply.
+
+    The grader judges a change at its apply time (0.1), so ramps and promotions are gated on
+    the arm's effect THEN. With a credibly falling population trend over the last 4 segments
+    (slope b, SE s, b + z_0.90 s < 0) the shift is min(0, b + s Z) x (segments to apply);
+    otherwise 0. Rising trends are never extrapolated: the prediction can only make the gate
+    stricter. Same seed, same shifts."""
+    t = _thresholds(settings)
+    from controller.stats.ratios import norm_ppf
+    window = ws.spec.dialling_window
+    delta = max(0.0, segment_position(t_apply, window) - segment_position(ws.now, window))
+    out: dict[tuple[str, str], np.ndarray] = {}
+    if delta <= 0:
+        return out
+    pop = active_population(ws)
+    cells = [int(c) for c in pop.cells]
+    z = norm_ppf(TREND_SIGNIFICANCE)
+    for exp in ws.experiments:
+        if exp.dim not in ENGAGEMENT_DIMS or exp.state in CLOSED_EXPERIMENT_STATES:
+            continue
+        arms = dim_arms(ws, exp.dim)
+        for a in arms.arms:
+            b, se, n = arm_trend(ws, exp.dim, a, arms.control, cells, t.rollback_trend_segments)
+            if n < 3 or b + z * se >= 0:
+                continue
+            g = rng(derive_seed(seed, "apply_time_trend", exp.dim, a))
+            out[(exp.dim, a)] = np.minimum(0.0, b + se * g.standard_normal(n_draws)) * delta
+    return out
 
 
 # ============================================================================== membership
@@ -288,6 +362,16 @@ def _cohorts_of(ws: WorkflowSnapshot, pop) -> list[str]:
     return cohort_of_cells(ws.live, getattr(ws, "cells", {}) or {}, [int(c) for c in pop.cells]) \
         if getattr(ws, "cells", None) else [pop.cohort_of_cell.get(int(c), "default")
                                             for c in pop.cells]
+
+
+def _arm_n(ws: WorkflowSnapshot, dim: str, arm: str, cells: Sequence[int]) -> int:
+    e = ws.engage
+    if len(e) == 0:
+        return 0
+    col = e.w if dim == "welcome_message" else e.v
+    m = (col == option_index(ws.spec, dim).get(arm, -1)) & np.isin(
+        e.cell, np.asarray(list(cells), dtype=np.int64))
+    return int(e.connected[m].sum())
 
 
 def _scope_cells(pop, coh: Sequence[str], cfg: Config, scope: str) -> list[int]:

@@ -530,9 +530,13 @@ class EffectCache:
     are modelled; sigmoid of the control's linear predictor on the logit scale).
     """
 
-    def __init__(self, draws: Draws):
+    def __init__(self, draws: Draws,
+                 shifts: Mapping[tuple[str, str], np.ndarray] | None = None):
         self.draws = draws
         self.index = draws.index
+        self.shifts = dict(shifts or {})
+        """(dim, arm) -> (n_draws,) log-ratio shift added in every cell: the predicted change of
+        the arm's effect between now and the apply time (decay.apply_time_shifts)."""
         self._fx: dict[tuple[str, str], np.ndarray] = {}
         self._exp: dict[tuple[str, str], np.ndarray] = {}
         self._base_lin: np.ndarray | None = None
@@ -574,9 +578,11 @@ class EffectCache:
                 delta = self._lin(emap)
                 base = self.base_linear()
                 if base is None:
-                    self._fx[key] = delta
+                    fx = delta
                 else:
-                    self._fx[key] = -np.logaddexp(0.0, -(base + delta)) + np.logaddexp(0.0, -base)
+                    fx = -np.logaddexp(0.0, -(base + delta)) + np.logaddexp(0.0, -base)
+                shift = self.shifts.get(key)
+                self._fx[key] = fx if shift is None else fx + np.asarray(shift)[:, None]
         return self._fx[key]
 
     def ratio(self, dim: str, arm: str) -> np.ndarray:

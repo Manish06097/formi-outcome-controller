@@ -28,11 +28,13 @@ from typing import Callable, Mapping, Sequence
 
 import numpy as np
 
-from controller.learning.allocator import GuardFn, build_config
+from controller.learning.allocator import (GuardFn, apply_time_cache, build_config,
+                                           merge_results)
 from controller.learning.engagement import (ENGAGEMENT_DIMS, CLOSED_EXPERIMENT_STATES, DimArms,
                                             EffectCache, dim_arms, p_best)
 from controller.learning.harm import GateContext
 from controller.settings import Settings, Thresholds
+from controller.stats.ratios import norm_sf
 from controller.snapshot import (LearningSnapshot, LookRecord, active_population, cohort_of_cells,
                                  option_index, segment_day)
 from controller.types import (DEFAULT_COHORT, Config, DidPosterior, Draws, HarmReport,
@@ -136,6 +138,24 @@ def winner_scope_eligible(ws: WorkflowSnapshot, cohort: str,
     return ok
 
 
+# ============================================================================== tails
+
+def gaussian_tail_above(draws: np.ndarray, x: float) -> float:
+    """P(effect > x) from the draws' mean and sd under a normal approximation.
+
+    W1 thresholds a 0.5% (0.2% for cohorts) tail. Counted from 4,000 draws that tail has a
+    Monte Carlo sd of about 0.11 points (22% relative), and a posterior whose true tail is 1%
+    shows <= 0.5% with non-trivial probability, which inflates false winners. The scope effect
+    is Gaussian for the Beta-binomial model (a sum of Gaussian parameters) and very nearly so
+    for the ridge-logit (a smooth function of a Laplace posterior), so its moments give the
+    tail with about 1% relative error instead (ADR 0005)."""
+    sd = float(np.std(draws))
+    m = float(np.mean(draws))
+    if sd <= 0:
+        return 1.0 if m > x else 0.0
+    return norm_sf((x - m) / sd)
+
+
 # ============================================================================== looks
 
 def look_due(n: int, days: int, prior: Sequence[LookRecord],
@@ -174,11 +194,21 @@ def promotion_config(live: Config, dim: str, winner: str, control: str, scope: s
 def evaluate_looks(ws: WorkflowSnapshot, stat: Draws | EffectCache, ew: Draws | EffectCache, *,
                    settings: Settings | Thresholds | None = None,
                    did_post: DidPosterior | None = None, guard_fn: GuardFn | None = None,
-                   eligible: Callable[[str], bool] | None = None) -> LookOutcome:
+                   eligible: Callable[[str], bool] | None = None,
+                   t_apply: int | None = None) -> LookOutcome:
+    """Looks due now. A promotion is judged at its expected apply time `t_apply` too (default
+    now + mean approver latency): when the arm's recent trend is credibly falling, W3 and W5
+    must also hold on the EW draws predicted to t_apply, as the grader will judge the promotion
+    then (0.1, decay.apply_time_shifts)."""
     t = _thresholds(settings)
     live = ws.live
     pop = active_population(ws)
     cells_cat = getattr(ws, "cells", {}) or {}
+    ctx_t = None
+    if not isinstance(ew, EffectCache):
+        shifted = apply_time_cache(ws, ew, t_apply, t)
+        if shifted.shifts:
+            ctx_t = GateContext(shifted, pop, cells=cells_cat, settings=t)
     ctx_s = GateContext(stat, pop, cells=cells_cat, settings=t)
     ctx_e = GateContext(ew, pop, cells=cells_cat, settings=t)
     looks: list[LookRecord] = []
@@ -202,6 +232,8 @@ def evaluate_looks(ws: WorkflowSnapshot, stat: Draws | EffectCache, ew: Draws | 
             cl, w = _cells_weights(ctx_s, live, scope)
             fx_s = {a: ctx_s.cache.scope_effect(exp.dim, a, cl, w) for a in arms.arms}
             fx_e = {a: ctx_e.cache.scope_effect(exp.dim, a, cl, w) for a in arms.arms}
+            fx_t = {a: ctx_t.cache.scope_effect(exp.dim, a, cl, w) for a in arms.arms} \
+                if ctx_t is not None else fx_e
             best = p_best({a: fx_s[a] for a in arms.experiment_arms}, arms.control)
             c_k = t.w1_population if scope == POPULATION else t.w1_cohort
             for a in arms.experiment_arms:
@@ -214,11 +246,14 @@ def evaluate_looks(ws: WorkflowSnapshot, stat: Draws | EffectCache, ew: Draws | 
                     continue
                 look_no = 1 + max((r.look_no for r in prior), default=0)
                 s_eff, e_eff = fx_s[a], fx_e[a]
-                w1 = float(np.mean(s_eff > 0))
+                w1 = gaussian_tail_above(s_eff, 0.0)
                 w2 = float(best.get(a, 0.0))
                 w3p = float(np.mean(e_eff > 0))
                 m_s, m_e = float(s_eff.mean()), float(e_eff.mean())
                 w3 = w3p >= t.w3_ew_p_pos and m_e >= t.w3_ew_ratio * m_s
+                e_ta = fx_t[a]
+                w3 = w3 and float(np.mean(e_ta > 0)) >= t.w3_ew_p_pos and \
+                    float(e_ta.mean()) >= t.w3_ew_ratio * m_s
                 w4 = _decay_ok(ws, exp.dim, a, scope, t)
                 ok123 = w1 >= c_k and w2 >= t.w2_p_best and w3 and w4
                 harm: HarmReport | None = None
@@ -229,14 +264,17 @@ def evaluate_looks(ws: WorkflowSnapshot, stat: Draws | EffectCache, ew: Draws | 
                     promo = promotion_config(live, exp.dim, a, arms.control, scope, h)
                     promos[(exp.dim, scope)] = promo
                     guard = guard_fn(live, promo) if guard_fn is not None else None
-                    harm = ctx_e.evaluate(live, promo, ws.policy, t.alpha_h, t.alpha_d,
-                                          did_post, guard).report
+                    now_r = ctx_e.evaluate(live, promo, ws.policy, t.alpha_h, t.alpha_d,
+                                           did_post, guard)
+                    at_r = ctx_t.evaluate(live, promo, ws.policy, t.alpha_h, t.alpha_d,
+                                          did_post, guard) if ctx_t is not None else None
+                    harm = merge_results(now_r, at_r).report
                     g_ok = harm.passes
                 passed = bool(ok123 and g_ok)
                 looks.append(LookRecord(exp_id=exp.exp_id, arm=a, scope=scope, look_no=look_no,
                                         n_at_look=n, sim_minute=ws.now, w1=w1, w2=w2, w3=w3p,
                                         passed=passed))
-                is_futile = float(np.mean(s_eff > t.futility_margin)) <= t.futility_p
+                is_futile = gaussian_tail_above(s_eff, t.futility_margin) <= t.futility_p
                 if is_futile and not passed:
                     futile.append((exp.exp_id, a, scope))
                 detail.append({"exp_id": exp.exp_id, "arm": a, "scope": scope,
@@ -278,7 +316,8 @@ def _cells_weights(ctx: GateContext, cfg: Config, scope: str) -> tuple[list[int]
 
 def _arm_closed(exp, arm: str, scope: str) -> bool:
     for r in exp.arm_rows:
-        if r.arm == arm and r.scope in (scope, POPULATION) and r.state in ("removed", "futile"):
+        if r.arm == arm and r.scope in (scope, POPULATION) and r.state in ("removed", "futile",
+                                                                          "winner"):
             return True
     return False
 

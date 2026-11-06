@@ -557,7 +557,7 @@ class Orchestrator:
         self.hooks.on_finished(rt)
         with self.db.tx() as tx:
             record(tx, wf=None, actor="controller", action="run_finished",
-                   subject=("run", rt.schema), summary="scenario finished",
+                   subject=("world", rt.ident.fingerprint[:12]), summary="scenario finished",
                    details={"sim_minute": state.sim_minute, "events": state.last_event_id})
         self.db.update_run(rt.schema, status="done", last_sim_minute=state.sim_minute)
         log.info("scenario finished at %d; run %s done", state.sim_minute, rt.schema)

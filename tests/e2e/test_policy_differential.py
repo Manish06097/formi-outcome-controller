@@ -121,7 +121,7 @@ class PairGen:
         return {f: r.sample(FEATURES[f], r.randint(1, 2)) for f in feats}
 
     def body(self, live: Config) -> dict:
-        r, spec = self.rng, self.spec
+        r = self.rng
         b = live.stored() if r.random() < 0.5 else live.body()
         mutations = r.choice([0, 1, 1, 1, 2, 2, 3])
         for _ in range(mutations):

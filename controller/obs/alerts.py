@@ -285,9 +285,10 @@ def raise_alert(tx: Any, code: str, wf: int | None, subject: str, text: str,
     c = CODES[code]
     msg = _message(subject, text)
     if c.severity == "page":
+        prefix = _message(subject, "")
         dup = tx.execute("SELECT alert_id FROM alert WHERE closed_wall IS NULL AND code = %s "
-                         "AND wf IS NOT DISTINCT FROM %s AND message LIKE %s",
-                         (code, wf, _message(subject, "") + "%")).fetchone()
+                         "AND wf IS NOT DISTINCT FROM %s AND left(message, %s) = %s",
+                         (code, wf, len(prefix), prefix)).fetchone()
         if dup:
             return None
     row = tx.execute(

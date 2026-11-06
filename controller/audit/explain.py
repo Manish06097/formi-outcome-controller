@@ -17,6 +17,11 @@ queries depend on them:
   consequences starts from it (9.4: stale marks, interrupts, rebase, cooldown).
 - A proposal's audit rows have `subject_type = 'proposal'` and `subject_id = proposal_id`; every
   consequence row sets `caused_by` to the row that caused it.
+- A decision not to act has `kind = 'no_action'` (the weekly digest counts those of the caller-ID
+  and schedule modules).
+- `proposal.evidence` may carry `kpi` (the impact score's KPI label), `notes` (supervisor-facing
+  lines such as "3rd request today, above your 2/day preference"), `items` and
+  `expected_decision_window`; the supervisor view shows them as given.
 - `allocation_provenance` is materialised for every cohort of every version, and for
   `prompt_version` under cohort_key 'default'. A missing provenance row for an option a call
   actually heard is a finding (`COHORT_MISMATCH`), never silently skipped.

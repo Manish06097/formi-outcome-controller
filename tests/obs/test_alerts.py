@@ -152,3 +152,9 @@ def test_event_alerts_dedupe_and_digests_are_recorded_closed(conn):
     alerts.sync(conn, [])
     assert [x["code"] for x in alerts.open_alerts(conn)].count("GOV_INVARIANT") == 2
     assert alerts.close_alert(conn, a) and not alerts.close_alert(conn, a)
+
+
+@pytest.mark.pg
+def test_event_dedupe_treats_like_wildcards_literally(conn):
+    assert alerts.raise_alert(conn, "UNKNOWN_WRITER", 1, "p_17", "x") is not None
+    assert alerts.raise_alert(conn, "UNKNOWN_WRITER", 1, "pX17", "y") is not None

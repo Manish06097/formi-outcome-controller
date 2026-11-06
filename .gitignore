@@ -2,3 +2,5 @@ runs/
 __pycache__/
 *.pyc
 .venv/
+.claude/settings.local.json
+reports/baseline_*.md

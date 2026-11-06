@@ -1,0 +1,62 @@
+# Client agreements from the stakeholder memos (DESIGN.md 6.5). Not simulator data.
+# Owner: M0. Loaded by controller/world/directives.py into the `directive` table at start (audit).
+#
+# A directive can only TIGHTEN the API policy: world/registry.py builds EffectivePolicy as the
+# stricter of the API policy and the resolved directive, value by value.
+#
+# Scope of a directive = (tenant, selector). Resolution for one workflow, key by key, the more
+# specific scope overriding the less specific one:
+#   defaults ("*")  <  tenant-wide (selector: {})  <  use_case keyword  <  workflow_id
+# A rule for tenant "*" with a selector sits below a tenant-specific rule of the same selector.
+# Who wrote the memo decides the scope (assumption A-11): Northwind's Compliance head speaks for
+# the tenant; Kestrel's operations supervisor runs only the cancellation line.
+#
+# Keys (all optional except in defaults, which must set every key):
+#   customer_facing_auto_apply  none | risk_reducing_only | ramps_and_risk_reducing
+#   notice_minutes              int >= 0, notice before an auto-apply in notice_scope
+#   notice_scope                customer_facing | non_incident
+#   notice_inside_approver_hours  bool: the notice must be posted inside approver hours
+#   max_requests_per_day        int >= 1 or null (voluntary cap below the policy cap)
+#   not_before                  "HH:MM" or null (hard: no routine request before it)
+#   avoid_prompt_terms          list of case-insensitive terms ranked last in fix selection
+#   weekly_digest               bool: weekly operational digest for the tenant
+#   pre_open_submits            only_if_no_safe_in_hours | never
+#   cohort_harm_line            x_k of the per-cohort harm gate; defaults to
+#                               settings.Thresholds.cohort_harm_line_default when not set here
+# The `*` preferred slot (approver_open + min(60, 25% of the window)) is a threshold in settings.
+
+version: 1
+
+defaults:
+  source: "design default, ADR 0012 (DESIGN.md 6.5 row '*')"
+  set:
+    customer_facing_auto_apply: risk_reducing_only   # arm removals, rollbacks, harm stops
+    notice_minutes: 60                               # before customer-facing auto-applies
+    notice_scope: customer_facing
+    notice_inside_approver_hours: false
+    max_requests_per_day: null
+    not_before: null
+    avoid_prompt_terms: []
+    weekly_digest: false
+    pre_open_submits: only_if_no_safe_in_hours
+
+directives:
+  - tenant: northwind_life
+    selector: {}                                     # every Northwind workflow (Compliance speaks for the tenant)
+    source: "memo 02 items 1, 4 and 5"
+    set:
+      customer_facing_auto_apply: none               # nothing customer-facing without a named human approval
+      cohort_harm_line: 0.01                         # "worse for a cohort of our customers, even briefly"
+      weekly_digest: true                            # weekly summary of operational changes
+
+  - tenant: kestrel_finance
+    selector: {use_case_contains: cancel}            # the cancellation line only (memo 04 author)
+    source: "memo 04"
+    set:
+      max_requests_per_day: 2                        # "two requests a day"
+      not_before: "11:00"                            # "never before 11:00" (hard, routine)
+      notice_minutes: 60                             # tell me before anything changes on a running campaign
+      notice_scope: non_incident                     # operational or customer-facing, not incident fixes
+      notice_inside_approver_hours: true
+      customer_facing_auto_apply: ramps_and_risk_reducing
+      avoid_prompt_terms: ["verbatim", "word for word"]   # the disengaging compliance-script "fix"

@@ -1,0 +1,9 @@
+# Linux: the simulator binds 127.0.0.1, which a bridge-networked container cannot reach
+# (host.docker.internal is the docker0 gateway, not loopback). The controller therefore shares
+# the host network and reaches Postgres on its published loopback port (ADR 0019).
+services:
+  controller:
+    network_mode: host
+    environment:
+      - CTL_PG_HOST=127.0.0.1
+      - CTL_PG_PORT=${CTL_PG_PORT:-55432}

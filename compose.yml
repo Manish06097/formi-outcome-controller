@@ -1,0 +1,87 @@
+# Postgres and the controller (DESIGN.md 2, 3.3, 11.3). Started by run.sh together with
+# compose.linux.yml (host network) or compose.desktop.yml (Docker Desktop); see ADR 0019.
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: ${CTL_PG_PASSWORD:-ctl}
+    # Settings of DESIGN.md 3.3. synchronous_commit stays on: audit durability is a constraint.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - effective_cache_size=3GB
+      - -c
+      - work_mem=64MB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - wal_compression=on
+      - -c
+      - jit=off
+      - -c
+      - synchronous_commit=on
+    ports:
+      - "127.0.0.1:${CTL_PG_PORT:-55432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    shm_size: 1g
+    mem_limit: 3g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 90
+
+  controller:
+    build:
+      context: .
+      args:
+        CODE_VERSION: ${CTL_CODE_VERSION:-dev}
+    image: ${COMPOSE_PROJECT_NAME:-formi_ctl}-controller:latest
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - CTL_SIM_URL=${CTL_SIM_URL:?CTL_SIM_URL is set by run.sh}
+      - CTL_PG_HOST=db
+      - CTL_PG_PORT=5432
+      - CTL_PG_PASSWORD=${CTL_PG_PASSWORD:-ctl}
+      - CTL_CODE_VERSION=${CTL_CODE_VERSION:-dev}
+      # Optional knobs (controller/settings.py, loop/orchestrator.py LoopOptions), passed
+      # through only when set on the host, so the code's defaults stay the only defaults:
+      - CTL_INGEST
+      - CTL_LOG_LEVEL
+      - CTL_SIM_WAIT
+      - CTL_FAULT
+      - CTL_STOP_AFTER_STEPS
+      - CTL_SYNTHETIC_MARKERS
+      - CTL_PREFETCH_CHUNKS
+      - CTL_LLM_SUGGEST
+      - CTL_ENGAGEMENT_MODEL
+    mem_limit: 1g
+    restart: "no"
+
+  api:
+    profiles: ["api"]
+    image: ${COMPOSE_PROJECT_NAME:-formi_ctl}-controller:latest
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint: ["python", "-m", "uvicorn", "controller.api.app:app", "--host", "0.0.0.0",
+                 "--port", "8780"]
+    environment:
+      CTL_PG_HOST: db
+      CTL_PG_PORT: "5432"
+      CTL_PG_PASSWORD: ${CTL_PG_PASSWORD:-ctl}
+    ports:
+      - "127.0.0.1:${CTL_API_PORT:-8780}:8780"
+    mem_limit: 256m
+
+volumes:
+  pgdata:

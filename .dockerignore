@@ -1,0 +1,8 @@
+# Build context: only what the image needs (the controller package and its dependency list).
+*
+!controller/
+!requirements.txt
+!requirements-controller.txt
+!vendor/wheels/
+**/__pycache__
+**/*.pyc

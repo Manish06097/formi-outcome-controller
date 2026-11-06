@@ -93,3 +93,22 @@ def test_injector_stays_disarmed_when_already_fired():
                         exit_fn=exits.append)
     inj.hit("advance", "after_t1")
     assert exits == [] and inj.armed == ()
+
+
+def test_injector_ignores_boundaries_reached_while_recording_a_fault():
+    """Regression: on_fire writes an audit row, which passes the audit_write boundary; with a
+    second fault still armed this re-entered the injector's lock and hung the process (found by
+    scripts/kill_test.sh)."""
+    exits = []
+    inj: FaultInjector
+
+    def on_fire(spec):
+        inj.hit("audit_write", "in_t2")
+
+    inj = FaultInjector((FaultSpec("chunk_copy", 1, "mid"), FaultSpec("audit_write", 1, "in_t2")),
+                        on_fire=on_fire, exit_fn=exits.append)
+    import threading
+    t = threading.Thread(target=inj.hit, args=("chunk_copy", "mid"))
+    t.start()
+    t.join(timeout=5)
+    assert not t.is_alive() and exits == [137]

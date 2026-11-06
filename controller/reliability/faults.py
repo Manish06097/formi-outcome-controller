@@ -74,22 +74,26 @@ class FaultInjector:
         self._counts: dict[tuple[str, str], int] = {}
         self._on_fire = on_fire
         self._exit = exit_fn
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._firing = False
 
     @property
     def armed(self) -> tuple[FaultSpec, ...]:
         return tuple(self._armed)
 
     def hit(self, kind: str, phase: str) -> None:
-        if not self._armed:
+        if not self._armed or self._firing:
             return
         with self._lock:
+            if self._firing:      # a boundary reached while recording a firing fault
+                return
             key = (kind, phase)
             self._counts[key] = c = self._counts.get(key, 0) + 1
             spec = next((s for s in self._armed if (s.kind, s.phase) == key and s.n == c), None)
             if spec is None:
                 return
             self._armed.remove(spec)
+            self._firing = True
             if self._on_fire is not None:
                 try:
                     self._on_fire(spec)

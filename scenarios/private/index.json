@@ -1,0 +1,506 @@
+[
+  {
+    "name": "seed_p01_s1101",
+    "file": "scenarios/private/seed_p01_s1101.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "the public_01 world with a new seed: different leads, archetypes, approver coin flips and validation outcomes, same truth",
+    "pass": "0 auto_apply_rejected, 0 lapsed, 0 expired, 0 apply conflicts, peak requests per 24h at most C_eff, 0 harmful; engagement gap captured above 0",
+    "design": "17 override 3",
+    "family": null
+  },
+  {
+    "name": "seed_p01_s1102",
+    "file": "scenarios/private/seed_p01_s1102.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "as seed_p01_s1101 with another seed",
+    "pass": "0 auto_apply_rejected, 0 lapsed, 0 expired, 0 apply conflicts, peak requests per 24h at most C_eff, 0 harmful; engagement gap captured above 0",
+    "design": "17 override 3",
+    "family": null
+  },
+  {
+    "name": "seed_p02_s2201",
+    "file": "scenarios/private/seed_p02_s2201.yaml",
+    "base": "scenarios/public_02_incidents.yaml",
+    "tests": "the public_02 world (DID flag, P2 supervisor prompt, supervisor voice edit) with a new seed",
+    "pass": "0 auto_apply_rejected, 0 lapsed, 0 expired, 0 apply conflicts, peak requests per 24h at most C_eff, 0 harmful; hallucination MTTR under 4h; flagged-DID share 0 the day after the flag",
+    "design": "17 override 3, 7.4",
+    "family": null
+  },
+  {
+    "name": "seed_p02_s2202",
+    "file": "scenarios/private/seed_p02_s2202.yaml",
+    "base": "scenarios/public_02_incidents.yaml",
+    "tests": "as seed_p02_s2201 with another seed",
+    "pass": "0 auto_apply_rejected, 0 lapsed, 0 expired, 0 apply conflicts, peak requests per 24h at most C_eff, 0 harmful; hallucination MTTR under 4h",
+    "design": "17 override 3",
+    "family": null
+  },
+  {
+    "name": "effects_flipped_p01",
+    "file": "scenarios/private/effects_flipped_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "every public_01 effect sign-flipped: yesterday's winners are today's losers, so nothing learned on public truth transfers",
+    "pass": "0 harmful; no promotion of a flipped-negative option; gap captured above 0 where a positive effect exists",
+    "design": "5.4, 5.5, UNDERSTANDING 7",
+    "family": null
+  },
+  {
+    "name": "effects_small_p01",
+    "file": "scenarios/private/effects_small_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "every public_01 effect halved: winners near the detection limit, the false-winner and futility regime",
+    "pass": "0 harmful; no winner declared on an option whose true effect is below the harm line",
+    "design": "5.5",
+    "family": null
+  },
+  {
+    "name": "effects_large_p01",
+    "file": "scenarios/private/effects_large_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "every public_01 effect x1.6 on the log scale: big wins and big losses, so exploration arms on the losers are near the 1% harm line",
+    "pass": "0 harmful exploration arms; winners found sooner than on public_01",
+    "design": "5.4",
+    "family": null
+  },
+  {
+    "name": "effects_flip_resize_p02",
+    "file": "scenarios/private/effects_flip_resize_p02.yaml",
+    "base": "scenarios/public_02_incidents.yaml",
+    "tests": "public_02 effects sign-flipped and x1.3, with the public_02 incidents unchanged",
+    "pass": "0 auto_apply_rejected, 0 lapsed, 0 expired, 0 apply conflicts, peak requests per 24h at most C_eff, 0 harmful; MTTR under 4h",
+    "design": "5.4, 7",
+    "family": null
+  },
+  {
+    "name": "last_listed_signflip_p01",
+    "file": "scenarios/private/last_listed_signflip_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (j): winners only among the last-listed options, with sign-flipping cohort effects (an option-order queue tests them last; a population test sees them diluted)",
+    "pass": "engagement gap captured above 0, 0 harmful, no cohort's predicted de_k below -x_k at any applied change",
+    "design": "10.1 (j), 5.3, 5.4",
+    "family": null
+  },
+  {
+    "name": "decaying_winner_highvol_p01",
+    "file": "scenarios/private/decaying_winner_highvol_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (g): a strong winner (W3 x1.20) that decays after 3 exposure days to x0.90, on nw_renewal at 3x volume so the ramp is fast and the stationary posterior is very confident when decay starts",
+    "pass": "no ramp or promotion graded harmful; decayed-variant share under 10% by onset + 2 days",
+    "design": "10.1 (g), 5.5, 5.7",
+    "family": null
+  },
+  {
+    "name": "decaying_winner_dev_p01",
+    "file": "scenarios/private/decaying_winner_dev_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (g) at dev volume: the same decaying W3 on nw_renewal at public volume",
+    "pass": "no ramp or promotion graded harmful; decay rolled back without a harmful rollback at onset",
+    "design": "5.7",
+    "family": null
+  },
+  {
+    "name": "did_flag_d1_p01",
+    "file": "scenarios/private/did_flag_d1_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "a caller ID (ks_cancel D2, half the traffic) flagged on D1 10:00, before most probes have classified the spare DID",
+    "pass": "flagged-DID share on the flag day within the 7.3 bound plus 0.01, 0 the day after; no change with dd below -2%",
+    "design": "7.3, 5.9",
+    "family": null
+  },
+  {
+    "name": "did_flag_d1_sole_p01",
+    "file": "scenarios/private/did_flag_d1_sole_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "the sole caller ID of nw_kyc flagged at D1 14:00: no concurrent comparator, so only the KPI drift detector can see it",
+    "pass": "KPI_DRIFT raised, probes start, then traffic moves to a healthy DID by approval (KYC has auto-apply off)",
+    "design": "7.5, 5.9",
+    "family": null
+  },
+  {
+    "name": "preflagged_unknown_did_p01",
+    "file": "scenarios/private/preflagged_unknown_did_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (h): spare caller IDs that are already flagged (health 0.3) and never used by the default config: probing them is graded on DID health",
+    "pass": "no change with dd below -2%; the bad DID is classified unhealthy from probe dials and never spread onto",
+    "design": "10.1 (h), 5.9",
+    "family": null
+  },
+  {
+    "name": "max_shift_005_did_third_p01",
+    "file": "scenarios/private/max_shift_005_did_third_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (d): max_shift 0.05 on every auto-apply policy and a caller ID flagged at a one-third share (ks_cancel default split over D1, D2, D3)",
+    "pass": "flag-day share at most 0.096 + 0.01 (7.3 formula for s = 0.333), 0 the day after; every chain step within max_shift",
+    "design": "10.1 (d), 6.5, 7.3",
+    "family": null
+  },
+  {
+    "name": "p4_like_supervisor_p01",
+    "file": "scenarios/private/p4_like_supervisor_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (f): the Kestrel supervisor ships a P4-like prompt (halluc 0.0275, engage x1.05) that passes the client gate about 69% of the time and LOOKS better on engagement",
+    "pass": "MTTR finite (a fix with a FULL verdict applied); never P5 for Kestrel; never a cherry-picked gate run",
+    "design": "10.1 (f), 7.1",
+    "family": null
+  },
+  {
+    "name": "p2_like_supervisor_p01",
+    "file": "scenarios/private/p2_like_supervisor_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "a Northwind supervisor ships a P2-like prompt (halluc 0.0545, engage x0.93) on nw_renewal at D2 14:00",
+    "pass": "MTTR under 4h; fix by last known good (P1) through an approval with evidence",
+    "design": "7.1",
+    "family": null
+  },
+  {
+    "name": "unsafe_default_prompt_p01",
+    "file": "scenarios/private/unsafe_default_prompt_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (i): the business default prompt is unsafe on two tenants (ks_cancel P4, nw_renewal a new P8 at halluc 0.03); no supervisor event and no relative detector can see it",
+    "pass": "D0 safety screen finds both; fix proposed with a FULL verdict and a designated gate run; never the strict script P5 on Kestrel",
+    "design": "10.1 (i), 7.1 F7",
+    "family": null
+  },
+  {
+    "name": "two_incidents_p02",
+    "file": "scenarios/private/two_incidents_p02.yaml",
+    "base": "scenarios/public_02_incidents.yaml",
+    "tests": "J2 case (e): a caller ID is flagged at D3 13:30 on ks_cancel while the prompt-fix approval for the D3 11:30 P2 edit is pending",
+    "pass": "the prompt-fix approval is never staled or superseded; the drain starts when it is terminal (or is bundled); MTTR under 4h",
+    "design": "10.1 (e), 6.2, 7.3",
+    "family": null
+  },
+  {
+    "name": "supervisor_edit_pending_p01",
+    "file": "scenarios/private/supervisor_edit_pending_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "supervisor edits land while our routine approval is pending (nw_renewal D1 11:30, ks_cancel D2 11:45)",
+    "pass": "our pending proposal goes STALE, is rebased and re-queued; the supervisor values are never reverted without an approval; 0 apply conflicts",
+    "design": "6.7, 6.1",
+    "family": null
+  },
+  {
+    "name": "gov_a_ttl12_lat480_p01",
+    "file": "scenarios/private/gov_a_ttl12_lat480_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (a): TTL 12h with approver latency 60-480 on every workflow, so most of the day has no expiry-safe submit minute",
+    "pass": "0 auto_apply_rejected, 0 lapsed, 0 expired, 0 apply conflicts, peak requests per 24h at most C_eff, 0 harmful; no expiry; at least one approval applied per day",
+    "design": "10.1 (a), 6.3",
+    "family": null
+  },
+  {
+    "name": "gov_b_approvers_14_16_ttl4_p01",
+    "file": "scenarios/private/gov_b_approvers_14_16_ttl4_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (b): approvers 14-16 with TTL 4h and latency 30-240: the only safe submit is before the approvers open",
+    "pass": "0 auto_apply_rejected, 0 lapsed, 0 expired, 0 apply conflicts, peak requests per 24h at most C_eff, 0 harmful; no expiry; at least one approval applied per day",
+    "design": "10.1 (b), 6.3, 9.7",
+    "family": null
+  },
+  {
+    "name": "gov_c_cap1_p01",
+    "file": "scenarios/private/gov_c_cap1_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (c): fatigue cap 1 per 24h and auto-apply off everywhere",
+    "pass": "0 auto_apply_rejected, 0 lapsed, 0 expired, 0 apply conflicts, peak requests per 24h at most C_eff, 0 harmful; the D0 foundation approval ships on D0; routine at most once per 48h",
+    "design": "10.1 (c), 6.4 F2",
+    "family": null
+  },
+  {
+    "name": "gov_prompt_auto_allowed_p02",
+    "file": "scenarios/private/gov_prompt_auto_allowed_p02.yaml",
+    "base": "scenarios/public_02_incidents.yaml",
+    "tests": "policy lets prompt_version auto-apply on the two auto-apply workflows, and public_02 has a P2 supervisor prompt incident",
+    "pass": "0 auto_apply_rejected, 0 lapsed, 0 expired, 0 apply conflicts, peak requests per 24h at most C_eff, 0 harmful; the stricter of policy and directives decides; a prompt is never changed without a SAFE verdict",
+    "design": "6.5, 7.1",
+    "family": null
+  },
+  {
+    "name": "tick5_p01",
+    "file": "scenarios/private/tick5_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "tick_minutes 5: three times as many decision points, a visibility lag of 5 to 9 minutes",
+    "pass": "0 auto_apply_rejected, 0 lapsed, 0 expired, 0 apply conflicts, peak requests per 24h at most C_eff, 0 harmful; every advance a multiple of 5",
+    "design": "4.2, 9.7",
+    "family": null
+  },
+  {
+    "name": "credits50_p02",
+    "file": "scenarios/private/credits50_p02.yaml",
+    "base": "scenarios/public_02_incidents.yaml",
+    "tests": "credits 50 with the public_02 incidents: R = 40 < W = 65, LOW credit mode from the start",
+    "pass": "0 auto_apply_rejected, 0 lapsed, 0 expired, 0 apply conflicts, peak requests per 24h at most C_eff, 0 harmful; never a 402; stage-1-only verdicts; the hallucination incident still fixed",
+    "design": "7.2, 9.7",
+    "family": null
+  },
+  {
+    "name": "credits60_p02",
+    "file": "scenarios/private/credits60_p02.yaml",
+    "base": "scenarios/public_02_incidents.yaml",
+    "tests": "credits 60 with the public_02 incidents: just above the credits-50 case",
+    "pass": "0 auto_apply_rejected, 0 lapsed, 0 expired, 0 apply conflicts, peak requests per 24h at most C_eff, 0 harmful; never a 402; credits above the incident reserve",
+    "design": "7.2",
+    "family": null
+  },
+  {
+    "name": "reject60_p01",
+    "file": "scenarios/private/reject60_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (k): the approver rejects 60% of requests",
+    "pass": "0 auto_apply_rejected, 0 lapsed, 0 expired, 0 apply conflicts, peak requests per 24h at most C_eff, 0 harmful; rejected work re-queued with fresh data; fatigue never exceeded",
+    "design": "10.1 (k), 6.1",
+    "family": null
+  },
+  {
+    "name": "tick30_p02",
+    "file": "scenarios/private/tick30_p02.yaml",
+    "base": "scenarios/public_02_incidents.yaml",
+    "tests": "9.7 row: tick_minutes 30",
+    "pass": "0 auto_apply_rejected, 0 lapsed, 0 expired, 0 apply conflicts, peak requests per 24h at most C_eff, 0 harmful; MTTR under 4h",
+    "design": "9.7, 4.2",
+    "family": null
+  },
+  {
+    "name": "apply_window_1h_p01",
+    "file": "scenarios/private/apply_window_1h_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "9.7 row: apply_window_hours 1 everywhere",
+    "pass": "0 auto_apply_rejected, 0 lapsed, 0 expired, 0 apply conflicts, peak requests per 24h at most C_eff, 0 harmful; 0 lapsed (steps of at most S_watch_max - tick)",
+    "design": "9.7, 4.2",
+    "family": null
+  },
+  {
+    "name": "max_shift_0_p02",
+    "file": "scenarios/private/max_shift_0_p02.yaml",
+    "base": "scenarios/public_02_incidents.yaml",
+    "tests": "9.7 row: max_shift 0 on every auto-apply policy, with the public_02 DID flag",
+    "pass": "0 auto_apply_rejected, 0 lapsed, 0 expired, 0 apply conflicts, peak requests per 24h at most C_eff, 0 harmful; drains become P0 approvals",
+    "design": "9.7, 6.5",
+    "family": null
+  },
+  {
+    "name": "auto_apply_off_p02",
+    "file": "scenarios/private/auto_apply_off_p02.yaml",
+    "base": "scenarios/public_02_incidents.yaml",
+    "tests": "9.7 row: auto-apply disabled everywhere, with the public_02 incidents",
+    "pass": "0 auto_apply_rejected, 0 lapsed, 0 expired, 0 apply conflicts, peak requests per 24h at most C_eff, 0 harmful; the DID drain is a P0 approval, bundled with the prompt fix if both are open",
+    "design": "9.7, 6.5",
+    "family": null
+  },
+  {
+    "name": "history0_p01",
+    "file": "scenarios/private/history0_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "9.7 row: history_days 0 (no history chunks at all)",
+    "pass": "0 auto_apply_rejected, 0 lapsed, 0 expired, 0 apply conflicts, peak requests per 24h at most C_eff, 0 harmful; no schedule change for the first 3 dialling days",
+    "design": "9.7, C3",
+    "family": null
+  },
+  {
+    "name": "gate099_p02",
+    "file": "scenarios/private/gate099_p02.yaml",
+    "base": "scenarios/public_02_incidents.yaml",
+    "tests": "9.7 row: min_validation_pass_rate 0.99, a tight client gate",
+    "pass": "0 auto_apply_rejected, 0 lapsed, 0 expired, 0 apply conflicts, peak requests per 24h at most C_eff, 0 harmful; no safe prompt declared UNSAFE; designated evidence run at n = 100",
+    "design": "9.7, 7.1",
+    "family": null
+  },
+  {
+    "name": "next_campaign_only_p01",
+    "file": "scenarios/private/next_campaign_only_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "9.7 row: mid_flight next_campaign_only on every workflow",
+    "pass": "0 auto_apply_rejected, 0 lapsed, 0 expired, 0 apply conflicts, peak requests per 24h at most C_eff, 0 harmful; verification counts new campaigns only",
+    "design": "9.7, 6.6",
+    "family": null
+  },
+  {
+    "name": "approvers_14_16_ttl24_p01",
+    "file": "scenarios/private/approvers_14_16_ttl24_p01.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "9.7 row: approvers 14-16 with TTL 24h and latency 30-240",
+    "pass": "0 auto_apply_rejected, 0 lapsed, 0 expired, 0 apply conflicts, peak requests per 24h at most C_eff, 0 harmful; routine slot 14:30",
+    "design": "9.7, 6.3",
+    "family": null
+  },
+  {
+    "name": "p4_like_supervisor_p01_s6001",
+    "file": "scenarios/private/p4_like_supervisor_p01_s6001.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (f) seed family member 1 of 20 (seed 6001)",
+    "pass": "MTTR finite in at least 18 of the 20 family members",
+    "design": "10.1 (f), 15.1 M6",
+    "family": "p4_like_seeds"
+  },
+  {
+    "name": "p4_like_supervisor_p01_s6002",
+    "file": "scenarios/private/p4_like_supervisor_p01_s6002.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (f) seed family member 2 of 20 (seed 6002)",
+    "pass": "MTTR finite in at least 18 of the 20 family members",
+    "design": "10.1 (f), 15.1 M6",
+    "family": "p4_like_seeds"
+  },
+  {
+    "name": "p4_like_supervisor_p01_s6003",
+    "file": "scenarios/private/p4_like_supervisor_p01_s6003.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (f) seed family member 3 of 20 (seed 6003)",
+    "pass": "MTTR finite in at least 18 of the 20 family members",
+    "design": "10.1 (f), 15.1 M6",
+    "family": "p4_like_seeds"
+  },
+  {
+    "name": "p4_like_supervisor_p01_s6004",
+    "file": "scenarios/private/p4_like_supervisor_p01_s6004.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (f) seed family member 4 of 20 (seed 6004)",
+    "pass": "MTTR finite in at least 18 of the 20 family members",
+    "design": "10.1 (f), 15.1 M6",
+    "family": "p4_like_seeds"
+  },
+  {
+    "name": "p4_like_supervisor_p01_s6005",
+    "file": "scenarios/private/p4_like_supervisor_p01_s6005.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (f) seed family member 5 of 20 (seed 6005)",
+    "pass": "MTTR finite in at least 18 of the 20 family members",
+    "design": "10.1 (f), 15.1 M6",
+    "family": "p4_like_seeds"
+  },
+  {
+    "name": "p4_like_supervisor_p01_s6006",
+    "file": "scenarios/private/p4_like_supervisor_p01_s6006.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (f) seed family member 6 of 20 (seed 6006)",
+    "pass": "MTTR finite in at least 18 of the 20 family members",
+    "design": "10.1 (f), 15.1 M6",
+    "family": "p4_like_seeds"
+  },
+  {
+    "name": "p4_like_supervisor_p01_s6007",
+    "file": "scenarios/private/p4_like_supervisor_p01_s6007.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (f) seed family member 7 of 20 (seed 6007)",
+    "pass": "MTTR finite in at least 18 of the 20 family members",
+    "design": "10.1 (f), 15.1 M6",
+    "family": "p4_like_seeds"
+  },
+  {
+    "name": "p4_like_supervisor_p01_s6008",
+    "file": "scenarios/private/p4_like_supervisor_p01_s6008.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (f) seed family member 8 of 20 (seed 6008)",
+    "pass": "MTTR finite in at least 18 of the 20 family members",
+    "design": "10.1 (f), 15.1 M6",
+    "family": "p4_like_seeds"
+  },
+  {
+    "name": "p4_like_supervisor_p01_s6009",
+    "file": "scenarios/private/p4_like_supervisor_p01_s6009.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (f) seed family member 9 of 20 (seed 6009)",
+    "pass": "MTTR finite in at least 18 of the 20 family members",
+    "design": "10.1 (f), 15.1 M6",
+    "family": "p4_like_seeds"
+  },
+  {
+    "name": "p4_like_supervisor_p01_s6010",
+    "file": "scenarios/private/p4_like_supervisor_p01_s6010.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (f) seed family member 10 of 20 (seed 6010)",
+    "pass": "MTTR finite in at least 18 of the 20 family members",
+    "design": "10.1 (f), 15.1 M6",
+    "family": "p4_like_seeds"
+  },
+  {
+    "name": "p4_like_supervisor_p01_s6011",
+    "file": "scenarios/private/p4_like_supervisor_p01_s6011.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (f) seed family member 11 of 20 (seed 6011)",
+    "pass": "MTTR finite in at least 18 of the 20 family members",
+    "design": "10.1 (f), 15.1 M6",
+    "family": "p4_like_seeds"
+  },
+  {
+    "name": "p4_like_supervisor_p01_s6012",
+    "file": "scenarios/private/p4_like_supervisor_p01_s6012.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (f) seed family member 12 of 20 (seed 6012)",
+    "pass": "MTTR finite in at least 18 of the 20 family members",
+    "design": "10.1 (f), 15.1 M6",
+    "family": "p4_like_seeds"
+  },
+  {
+    "name": "p4_like_supervisor_p01_s6013",
+    "file": "scenarios/private/p4_like_supervisor_p01_s6013.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (f) seed family member 13 of 20 (seed 6013)",
+    "pass": "MTTR finite in at least 18 of the 20 family members",
+    "design": "10.1 (f), 15.1 M6",
+    "family": "p4_like_seeds"
+  },
+  {
+    "name": "p4_like_supervisor_p01_s6014",
+    "file": "scenarios/private/p4_like_supervisor_p01_s6014.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (f) seed family member 14 of 20 (seed 6014)",
+    "pass": "MTTR finite in at least 18 of the 20 family members",
+    "design": "10.1 (f), 15.1 M6",
+    "family": "p4_like_seeds"
+  },
+  {
+    "name": "p4_like_supervisor_p01_s6015",
+    "file": "scenarios/private/p4_like_supervisor_p01_s6015.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (f) seed family member 15 of 20 (seed 6015)",
+    "pass": "MTTR finite in at least 18 of the 20 family members",
+    "design": "10.1 (f), 15.1 M6",
+    "family": "p4_like_seeds"
+  },
+  {
+    "name": "p4_like_supervisor_p01_s6016",
+    "file": "scenarios/private/p4_like_supervisor_p01_s6016.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (f) seed family member 16 of 20 (seed 6016)",
+    "pass": "MTTR finite in at least 18 of the 20 family members",
+    "design": "10.1 (f), 15.1 M6",
+    "family": "p4_like_seeds"
+  },
+  {
+    "name": "p4_like_supervisor_p01_s6017",
+    "file": "scenarios/private/p4_like_supervisor_p01_s6017.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (f) seed family member 17 of 20 (seed 6017)",
+    "pass": "MTTR finite in at least 18 of the 20 family members",
+    "design": "10.1 (f), 15.1 M6",
+    "family": "p4_like_seeds"
+  },
+  {
+    "name": "p4_like_supervisor_p01_s6018",
+    "file": "scenarios/private/p4_like_supervisor_p01_s6018.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (f) seed family member 18 of 20 (seed 6018)",
+    "pass": "MTTR finite in at least 18 of the 20 family members",
+    "design": "10.1 (f), 15.1 M6",
+    "family": "p4_like_seeds"
+  },
+  {
+    "name": "p4_like_supervisor_p01_s6019",
+    "file": "scenarios/private/p4_like_supervisor_p01_s6019.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (f) seed family member 19 of 20 (seed 6019)",
+    "pass": "MTTR finite in at least 18 of the 20 family members",
+    "design": "10.1 (f), 15.1 M6",
+    "family": "p4_like_seeds"
+  },
+  {
+    "name": "p4_like_supervisor_p01_s6020",
+    "file": "scenarios/private/p4_like_supervisor_p01_s6020.yaml",
+    "base": "scenarios/public_01_dev.yaml",
+    "tests": "J2 case (f) seed family member 20 of 20 (seed 6020)",
+    "pass": "MTTR finite in at least 18 of the 20 family members",
+    "design": "10.1 (f), 15.1 M6",
+    "family": "p4_like_seeds"
+  }
+]

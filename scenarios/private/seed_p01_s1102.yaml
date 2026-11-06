@@ -1,0 +1,187 @@
+# Private variant: seed_p01_s1102
+# Generated from scenarios/public_01_dev.yaml by scripts/variants/make_variants.py; do not edit by
+#   hand.
+# Tests: as seed_p01_s1101 with another seed
+# Pass: 0 auto_apply_rejected, 0 lapsed, 0 expired, 0 apply conflicts, peak requests per 24h at most
+#   C_eff, 0 harmful; engagement gap captured above 0
+# Design: DESIGN.md 17 override 3
+# Changes from the base:
+#   - seed: 101 -> 1102
+# Only tests and harness scripts read this file; the controller never does.
+name: seed_p01_s1102
+seed: 1102
+days: 8
+history_days: 14
+tick_minutes: 15
+credits: 200
+tenants:
+- id: northwind_life
+  workflows:
+  - id: nw_renewal
+    use_case: life-insurance renewal premium reminder (persistency)
+    language_mix: {hi: 0.5, en: 0.3, ta: 0.2}
+    dialling_window: [9, 21]
+    dials_per_hour: 300
+    daily_batch: {size: 1100, at_hour: 8, returning_share: 0.4}
+    cadence: [2, 3, 3]
+    base_pickup: 0.3
+    base_engage: 0.55
+    mid_flight: allowed
+    options:
+      welcome_message: [W1, W2, W3]
+      voice: [V1, V2, V3, V4]
+      caller_id: [D1, D2, D3, D4]
+      prompt_version: [P1, P3, P4, P5]
+    default_config:
+      allocations:
+        default:
+          welcome_message: {W1: 1}
+          voice: {V1: 1}
+          caller_id: {D1: 0.5, D2: 0.5}
+      prompt_version: P1
+    objective:
+      primary: engagement_rate
+      guardrail: {pickup_rate_max_drop: 0.02}
+    governance:
+      auto_apply:
+        enabled: true
+        allowed_dims: [schedule, caller_id]
+        max_shift: 0.5
+      approver_hours: [10, 19]
+      approver_latency_minutes: [30, 240]
+      proposal_ttl_hours: 24
+      apply_window_hours: 2
+      max_requests_per_24h: 3
+      base_reject_rate: 0.1
+      min_validation_pass_rate: 0.97
+    did_base_health: {D4: 0.55}
+  - id: nw_kyc
+    use_case: KYC document reminder for new policies
+    language_mix: {en: 0.6, hi: 0.4}
+    dialling_window: [10, 20]
+    dials_per_hour: 200
+    daily_batch: {size: 700, at_hour: 8, returning_share: 0.2}
+    cadence: [2, 2, 3]
+    base_pickup: 0.34
+    base_engage: 0.6
+    mid_flight: next_campaign_only
+    options:
+      welcome_message: [W1, W2]
+      voice: [V1, V2]
+      caller_id: [D1, D2, D3]
+      prompt_version: [P1, P3]
+    default_config:
+      allocations:
+        default:
+          welcome_message: {W1: 1}
+          voice: {V1: 1}
+          caller_id: {D1: 1}
+      prompt_version: P1
+    objective:
+      primary: pickup_rate
+      guardrail: {engagement_rate_max_drop: 0.02}
+    governance:
+      auto_apply:
+        enabled: false
+        allowed_dims: []
+        max_shift: 0
+      approver_hours: [10, 18]
+      approver_latency_minutes: [60, 480]
+      proposal_ttl_hours: 24
+      apply_window_hours: 2
+      max_requests_per_24h: 2
+      base_reject_rate: 0.15
+- id: kestrel_finance
+  workflows:
+  - id: ks_cancel
+    use_case: consumer-loan cancellation reconfirmation
+    language_mix: {hi: 0.6, en: 0.2, kn: 0.2}
+    dialling_window: [9, 21]
+    dials_per_hour: 400
+    daily_batch: {size: 1500, at_hour: 8, returning_share: 0.3}
+    cadence: [2, 2, 2]
+    base_pickup: 0.28
+    base_engage: 0.5
+    tier_mix: [0.5, 0.3, 0.2]
+    mid_flight: allowed
+    options:
+      welcome_message: [W1, W2, W3]
+      voice: [V1, V2, V3, V4]
+      caller_id: [D1, D2, D3]
+      prompt_version: [P1, P3, P4]
+    default_config:
+      allocations:
+        default:
+          welcome_message: {W1: 1}
+          voice: {V1: 1}
+          caller_id: {D1: 0.5, D2: 0.5}
+      prompt_version: P1
+    objective:
+      primary: engagement_rate
+      guardrail: {pickup_rate_max_drop: 0.02}
+    governance:
+      auto_apply:
+        enabled: true
+        allowed_dims: [schedule, caller_id, welcome_message, voice]
+        max_shift: 0.2
+      approver_hours: [10, 19]
+      approver_latency_minutes: [20, 120]
+      proposal_ttl_hours: 12
+      apply_window_hours: 2
+      max_requests_per_24h: 4
+      base_reject_rate: 0.05
+prompts:
+  P1: {summary: Current production prompt, halluc: 0.006, engage_mult: 1.0}
+  P3: {summary: 'Grounded: benefit claims restricted to policy-schedule fields; tighter objection handling',
+    halluc: 0.004, engage_mult: 1.03}
+  P4: {summary: 'Persuasive: freer objection handling and richer benefit explanations', halluc: 0.025,
+    engage_mult: 1.06}
+  P5: {summary: 'Strict: near-verbatim compliance script', halluc: 0.003, engage_mult: 0.86}
+# ---- hidden ground truth (do not read from your controller) ----
+did_l0_per_dph: 30
+did_tau_days: 2
+effects:
+- workflow: nw_renewal
+  dim: voice
+  value: V3
+  mult: 1.22
+  where:
+    age_band: [60+]
+- workflow: nw_renewal
+  dim: voice
+  value: V3
+  mult: 0.88
+  where:
+    age_band: [18-30]
+- workflow: nw_renewal
+  dim: welcome_message
+  value: W2
+  mult: 1.1
+  where:
+    lang: [hi]
+- workflow: nw_renewal
+  dim: welcome_message
+  value: W3
+  mult: 1.15
+  decay: {after_exposure_days: 3, to_mult: 0.93, over_days: 2}
+- {workflow: nw_kyc, dim: welcome_message, value: W2, mult: 1.08}
+- workflow: nw_kyc
+  dim: voice
+  value: V2
+  mult: 1.12
+  where:
+    lang: [en]
+- workflow: ks_cancel
+  dim: voice
+  value: V4
+  mult: 1.15
+  where:
+    age_band: [18-30, 31-45]
+- {workflow: ks_cancel, dim: welcome_message, value: W3, mult: 0.9}
+- workflow: ks_cancel
+  dim: welcome_message
+  value: W2
+  mult: 1.06
+  where:
+    city_tier: ['1']
+incidents: []

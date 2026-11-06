@@ -25,13 +25,13 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 from controller.governance.builder import RequestPackage
-from controller.governance.policy import needs_notice
+from controller.governance.policy import needs_notice, sim_verdict
 from controller.governance.timing import (ROUTINE_CLASSES, fatigue_ok, is_slot_minute, p_expire)
 from controller.planner.overlay import Overlay
 from controller.settings import Thresholds
 from controller.simclient import errors as E
 from controller.types import (IN_FLIGHT_STATES, P0_INCIDENT, P0A_PROMPT_SAFETY, P0B_DID_DRAIN,
-                              P1_ROLLBACK, ApplyResult, ApprovalPublic,
+                              P1_ROLLBACK, ApplyResult, ApprovalPublic, AutoApplyPolicy,
                               AutoApplyRequest, Composition, Decision, EffectivePolicy,
                               FrozenDict, Hold, Proposal, SimEpoch, freeze, make_proposal_id)
 
@@ -430,11 +430,19 @@ class ProposalLifecycle:
                         code_version=self.d.code_version, sim_minute=self.d.clock())
 
     def used(self, wf: str) -> list[int]:
-        """Our request minutes for fatigue: our store, cross-checked with GET /approvals."""
-        mine = set(self.d.store.submitted_minutes(wf))
-        for a in self.d.sim.approvals(wf):
-            mine.add(self.d.epoch.minute(a.created_at))
-        return sorted(mine)
+        """Request minutes for fatigue: every record `GET /approvals` lists for the workflow
+        (the simulator counts all of them), plus any of ours it does not list yet. A list, not
+        a set: two requests in one minute (a supersede) count twice."""
+        listed = self.d.sim.approvals(wf)
+        ids = {a.approval_id for a in listed}
+        mins = [self.d.epoch.minute(a.created_at) for a in listed]
+        mins += [p.submitted_minute for p in self.d.store.in_states(
+                     ("pending", "approved", "applying", "applied", "verifying", "verified",
+                      "rejected", "expired", "stale", "lapsed_local", "superseded", "abandoned",
+                      "rollback"), wf)
+                 if p.route == "approval" and p.approval_id and p.approval_id not in ids
+                 and p.submitted_minute is not None]
+        return sorted(mins)
 
     def submit_blockers(self, comp: Composition, now: int, *, superseding: bool = False
                         ) -> list[str]:
@@ -754,6 +762,15 @@ class ProposalLifecycle:
             return p
         if p.wf in self.auto_blocked:
             p = self.d.store.apply(p.proposal_id, "hold", now, self.auto_blocked[p.wf])
+            self.d.overlay.return_to_open(p.proposal_id)
+            return p
+        pol = self.d.policy_of(p.wf)      # the policy may have been re-read during the notice
+        live = self.d.sim.config(p.wf).config
+        sv = sim_verdict(AutoApplyPolicy(pol.auto_enabled, pol.allowed_dims, pol.max_shift),
+                         live, p.proposed_config, "x", margin=self.d.t.max_shift_margin)
+        if not sv.permitted:
+            p = self.d.store.apply(p.proposal_id, "hold", now,
+                                   "policy no longer permits: " + "; ".join(sv.problems(pol.max_shift)))
             self.d.overlay.return_to_open(p.proposal_id)
             return p
         p = self.d.store.apply(p.proposal_id, "notice_elapsed", now, "notice period elapsed")

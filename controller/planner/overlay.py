@@ -306,8 +306,17 @@ class Overlay:
         (a new proposal with fresh data, rebased on the live config)."""
         ids = [p.patch_id for p in self.patches.values()
                if p.proposal_id == proposal_id and p.state == PROPOSED]
-        self.set_state(ids, OPEN)        # proposal_id kept: the proposal it last rode (requeue)
-        return ids
+        back = []
+        for pid in ids:
+            p = self.patches[pid]
+            newer = [q for q in self._live_on(p.wf, p.path)
+                     if q.state == OPEN and q.patch_id > pid]
+            if newer:        # superseded by a newer patch on the same path while in flight
+                self.patches[pid] = replace(p, state=REPLACED)
+            else:            # proposal_id kept: the proposal it last rode (requeue)
+                self.patches[pid] = replace(p, state=OPEN)
+                back.append(pid)
+        return back
 
     def drop(self, proposal_id: str) -> list[int]:
         """Drop a proposal's patches ('needs discussion', or no net change)."""

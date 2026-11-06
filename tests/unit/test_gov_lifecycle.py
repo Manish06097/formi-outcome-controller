@@ -99,7 +99,7 @@ def test_rejection_plans():
     assert rejection_plan(1, jc, 3).action == "resubmit_now"
     assert rejection_plan(3, jc, 0).action == "requeue_next_slot"
     assert rejection_plan(2, jc, 1).action == "drop_needs_discussion"
-    fat = ["approver fatigue: more than 3 requests in 24h for this workflow — batch your changes"]
+    fat = ["approver fatigue: more than 3 requests in 24h for this workflow, batch your changes"]
     plan = rejection_plan(3, fat, 0)
     assert (plan.kind, plan.action, plan.page) == ("local_check", "hold", "GOV_INVARIANT")
 
@@ -143,3 +143,29 @@ def test_store_enforces_one_in_flight_and_atomic_supersede():
     assert st.holder("wf").proposal_id == "c"
     rows = [(t.from_state, t.to_state) for t in st.transitions_of("a")]
     assert rows == [(None, "pending"), ("pending", "superseded")]
+
+
+# ---------------------------------------------------------------- fatigue source of truth
+class _Sim:
+    def __init__(self, approvals):
+        self._a = approvals
+
+    def approvals(self, wf=None, status=None):
+        return list(self._a)
+
+
+def test_used_counts_every_listed_record_even_in_one_minute():
+    from controller.governance.lifecycle import LifecycleDeps, ProposalLifecycle
+    from controller.types import ApprovalPublic, SimEpoch
+
+    epoch = SimEpoch.from_state(type("S", (), {"ts": "2027-01-04T00:00:00+05:30",
+                                               "sim_minute": 0})())
+    listed = [ApprovalPublic(f"apr_{i}", f"p{i}", "wf", "pending", 3, ("voice",),
+                             epoch.ts(hm(1, 11)), epoch.ts(hm(2, 11))) for i in (1, 2)]
+    st = InMemoryProposalStore()
+    st.insert(prop("pending", 1, proposal_id="p3", approval_id="apr_3",
+                   submitted_minute=hm(1, 12)), hm(1, 12), "not listed yet")
+    lc = ProposalLifecycle(LifecycleDeps(store=st, overlay=None, sim=_Sim(listed),
+                                         executor=None, policy_of=None,
+                                         clock=lambda: hm(1, 12), epoch=epoch, run6="r"))
+    assert lc.used("wf") == [hm(1, 11), hm(1, 11), hm(1, 12)]

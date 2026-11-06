@@ -99,6 +99,17 @@ def test_same_owner_replaces_other_owner_refused_unless_more_urgent():
     assert d.state == "open" and ov.patches[b.patch_id].state == "replaced"
 
 
+def test_requeued_patch_yields_to_a_newer_one_on_its_path():
+    ov = make_overlay(Clock(hm(1, 11)))
+    a = ov.add(req(("alloc", "default", "caller_id"), {"D1": 0.6, "D2": 0.4}, owner="did"))
+    ov.mark_proposed([a.patch_id], "prop-1")
+    b = ov.add(req(("alloc", "default", "caller_id"), {"D1": 0.7, "D2": 0.3}, owner="did"))
+    assert b.state == "open"                                   # a is in flight: both live
+    assert ov.return_to_open("prop-1") == []                   # stale: a yields to b
+    assert ov.patches[a.patch_id].state == "replaced"
+    assert [p.patch_id for p in ov.open_patches("wf_test")] == [b.patch_id]
+
+
 def test_business_cohorts_are_supervisor_owned():
     live = base_config().with_cohorts([CohortDef.make("vip", {"value_band": ["high"]})])
     ov = make_overlay(Clock(hm(1, 11)))

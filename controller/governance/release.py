@@ -250,6 +250,10 @@ class ReleaseTrain:
         if prec.action == "bundle_supersede":
             ov.return_to_open(holder.proposal_id)      # the bundle must keep the drain
         comp = self._compose(wf, composition_classes(need_cls))
+        if not comp.patches:
+            skipped = self.d.overlay.last_compose[wf].skipped
+            return ReleaseDecision(wf, "skipped", "; ".join(f"patch {i}: {why}"
+                                                            for i, why in skipped))
         if not comp.changed_dims:
             p = lc.submit(comp, now, check=False)
             return ReleaseDecision(wf, "discard", "no net change", p.proposal_id)

@@ -120,7 +120,7 @@ def test_page_cusum_in_control_run_length():
 
 
 def test_bernoulli_cusum_and_sprt_decide_on_hand_computed_llrs():
-    b = BernoulliCusum(p0=0.01, p1=0.02, h=3.0).update_counts(5, 100)
+    b = BernoulliCusum(p0=0.01, p1=0.02, h=3.0).update_counts(n=100, k=5)
     assert b.stat == pytest.approx(5 * math.log(2) + 95 * math.log(0.98 / 0.99))
     assert not b.alarm
     s = Sprt(p_h=0.26, p_u=0.182, alpha=0.01, beta=0.05, n_max=1000, p_mid=0.221)

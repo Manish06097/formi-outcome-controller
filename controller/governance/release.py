@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Mapping, Sequence
 
 from controller.governance.builder import BuildContext, RequestPackage, build_request
-from controller.governance.lifecycle import ProposalLifecycle, SubmitBlocked, p0_rank_of
+from controller.governance.lifecycle import ProposalLifecycle, SubmitBlocked
 from controller.governance.policy import check_auto_apply, needs_notice
 from controller.governance.timing import ROUTINE_CLASSES, choose_submit
 from controller.planner.overlay import CompositionInvalid, Overlay
@@ -120,7 +120,7 @@ def precedence(holder: Proposal | None, need_cls: int, need_rank: int | None, no
                               f"{chain_k_rem} drain steps left: stop the chain and bundle the "
                               "rest of the drain into the prompt-fix approval")
         return Precedence("submit", "workflow free")
-    h_rank = p0_rank_of(holder)
+    h_rank = holder.p0_rank
     if need_cls in ROUTINE_CLASSES:
         return Precedence("wait", f"{holder.proposal_id} in flight; routine work waits")
     if holder.state not in ("pending", "approved", "noticed"):

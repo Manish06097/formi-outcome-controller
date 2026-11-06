@@ -193,3 +193,20 @@ def test_proposal_state_check_matches_types(db):
         idx = conn.execute("SELECT pg_get_indexdef('one_in_flight'::regclass)").fetchone()[0]
     for state in IN_FLIGHT_STATES:
         assert f"'{state}'" in idx
+
+
+def test_proposal_p0_rank_column_is_set_exactly_for_class_0(db):
+    """Migration 0009 (ADR 0028): p0_rank is a column, NULL unless the proposal is class 0."""
+    s = db.create_run_schema(_fp(), "http://127.0.0.1:8700")
+    db._created.append(s)
+    db.open(s)
+    ins = ("INSERT INTO proposal (proposal_id, wf, class, route, state, base_version, p0_rank) "
+           "VALUES (%s, %s, %s, 'approval', 'draft', 1, %s)")
+    with db.tx() as conn:
+        conn.execute(ins, ("a", 1, 0, 0))
+        conn.execute(ins, ("b", 2, 0, 1))
+        conn.execute(ins, ("c", 3, 3, None))
+    for bad in (("d", 4, 0, None), ("e", 5, 2, 1), ("f", 6, 0, 2)):
+        with pytest.raises(psycopg.errors.CheckViolation):
+            with db.tx() as conn:
+                conn.execute(ins, bad)

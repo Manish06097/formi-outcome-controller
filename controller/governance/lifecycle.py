@@ -122,13 +122,6 @@ def pre_apply_event(p: Proposal, now: int, current_version: int, tick: int,
     return "apply_start"
 
 
-def p0_rank_of(p: Proposal) -> int | None:
-    """Proposal rows carry no p0_rank column (contract change requested); the builder writes it
-    into the evidence we send, so it is recoverable from the row."""
-    r = (p.evidence or {}).get("p0_rank")
-    return None if r is None else int(r)
-
-
 def can_supersede(holder: Proposal, cls: int, p0_rank: int | None,
                   bundle_keeps_drain: bool = False) -> bool:
     """May a new composition of class `cls` supersede the in-flight `holder` (ADR 0013)?
@@ -141,7 +134,7 @@ def can_supersede(holder: Proposal, cls: int, p0_rank: int | None,
     if cls < holder.cls:
         return True
     if (cls == holder.cls == P0_INCIDENT and p0_rank == P0A_PROMPT_SAFETY
-            and p0_rank_of(holder) == P0B_DID_DRAIN and holder.state == "pending"):
+            and holder.p0_rank == P0B_DID_DRAIN and holder.state == "pending"):
         return bundle_keeps_drain
     return False
 
@@ -471,9 +464,10 @@ class ProposalLifecycle:
         prev = sorted({p.proposal_id for p in comp.patches if p.proposal_id})
         stored = comp.proposed.as_stored()
         pkg = package
-        evidence = dict(pkg.evidence) if pkg else {"class": comp.cls, "p0_rank": comp.p0_rank}
+        evidence = dict(pkg.evidence) if pkg else {"class": comp.cls}
         return Proposal(
-            proposal_id=pid, wf=wf, cls=comp.cls, route=route, state="draft",
+            proposal_id=pid, wf=wf, cls=comp.cls, p0_rank=comp.p0_rank, route=route,
+            state="draft",
             base_version=comp.base_version, proposed_config=stored,
             change_summary=pkg.change_summary if pkg else rationale,
             diff=pkg.diff if pkg else freeze({"changed_dims": list(comp.changed_dims)}),

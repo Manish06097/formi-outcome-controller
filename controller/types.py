@@ -2,7 +2,8 @@
 
 Owner: M0. Implements DESIGN.md section 11.2 (public interfaces), with the simulator's wire types
 from docs/SIMULATOR.md and the persisted shapes of section 3.2. After M0 no track edits this file;
-contract changes go to the lead (docs/design/BUILD_BRIEF.md, "Ownership").
+contract changes go to the lead (docs/design/BUILD_BRIEF.md, "Ownership"). The track requests were
+merged in step I1 (ADR 0028).
 
 Rules every type here follows:
 - Frozen dataclasses. Mappings are `FrozenDict` (a read-only, hashable, picklable dict), sequences
@@ -1041,6 +1042,33 @@ class EffectivePolicy:
     notice_inside_approver_hours: bool = False
     weekly_digest: bool = False
     dialling_window: tuple[int, int] = (0, 24)
+    # Additions of step I1 (T2 request, ADR 0028).
+    pre_open_submits: str = "only_if_no_safe_in_hours"
+    """Directive: only_if_no_safe_in_hours | never."""
+    api_auto_enabled: bool | None = None
+    """What the API policy permits before directives ("policy permits, client forbids", F15).
+    None means "same as `auto_enabled`" and is resolved in `__post_init__`."""
+    api_allowed_dims: frozenset[str] | None = None
+    """API `allowed_dims` before directives; None resolves to `allowed_dims`."""
+    use_case: str = ""
+    directive_scopes: tuple[str, ...] = ()
+    """The directive scopes that matched, least specific first (audit and supervisor view)."""
+
+    def __post_init__(self) -> None:
+        if self.api_auto_enabled is None:
+            object.__setattr__(self, "api_auto_enabled", self.auto_enabled)
+        if self.api_allowed_dims is None:
+            object.__setattr__(self, "api_allowed_dims", frozenset(self.allowed_dims))
+
+    @property
+    def approver_close_min(self) -> int:
+        """Minute of day the approvers stop deciding."""
+        return self.approver_hours[1] * 60
+
+    @property
+    def ttl_min(self) -> int:
+        """Proposal TTL in whole minutes, with the simulator's own rounding `int(ttl * 60)`."""
+        return int(self.ttl_hours * 60)
 
 
 # =============================================================================== world and ingest
@@ -1655,6 +1683,9 @@ class Proposal:
     requeued_from: str | None = None
     decision_id: int | None = None
     verify: FrozenDict = field(default_factory=FrozenDict)
+    p0_rank: int | None = None
+    """0 = P0a prompt safety, 1 = P0b DID drain, None unless cls == 0 (`proposal.p0_rank`,
+    migration 0009; release precedence and supersede read it, ADR 0013)."""
 
     @property
     def in_flight(self) -> bool:
@@ -1708,6 +1739,20 @@ class VelocityLedger:
 
 
 @dataclass(frozen=True)
+class Substitution:
+    """Rebase step 5 (DESIGN.md 6.7): a cohort override moved from the supervisor's old control
+    to the new one."""
+
+    patch_id: int
+    cohort: str
+    dim: str
+    old_control: str
+    new_control: str
+    applied: bool
+    """False: the new control is credibly worse in this cohort; kept and listed for approval"""
+
+
+@dataclass(frozen=True)
 class RebaseReport:
     """What `Overlay.rebase_on_supervisor_edit` did (DESIGN.md 6.7)."""
 
@@ -1719,6 +1764,7 @@ class RebaseReport:
     stale_proposals: tuple[str, ...]
     cooldown_paths: tuple[tuple[str, ...], ...]
     cooldown_until: Minute | None
+    substitutions: tuple[Substitution, ...] = ()
 
 
 # =============================================================================== audit, loop, reliability
@@ -1979,20 +2025,29 @@ class CreditBudget(Protocol):
 class Overlay(Protocol):
     """planner/overlay.py"""
 
-    def add(self, req: PatchRequest) -> Patch: ...
-    def compose(self, wf: str, live: Config, classes: set[int]) -> Composition: ...
+    def add(self, req: PatchRequest) -> Patch: ...   # refuses a request with no decision_id
+    # `paths`: an optional predicate over patch paths; compose only the patches it accepts.
+    def compose(self, wf: str, live: Config, classes: set[int], *, base_version: int = 0,
+                paths: Any = None) -> Composition: ...
     def rebase_on_supervisor_edit(self, wf: str, old: Config | None, new: Config,
                                   v: int) -> RebaseReport: ...
 
 
 @runtime_checkable
 class ProposalLifecycle(Protocol):
-    """governance/lifecycle.py"""
+    """governance/lifecycle.py. `package` is a `governance.builder.RequestPackage`."""
 
-    def tick(self, now: int) -> None: ...
-    def submit(self, comp: Composition, now: int) -> Proposal: ...
-    def supersede(self, holder: Proposal, by: Composition) -> Proposal: ...
-    def verify(self, now: int) -> None: ...
+    def tick(self, now: int) -> list[Proposal]: ...
+    def submit(self, comp: Composition, now: int, *, package: Any = None,
+               check: bool = True) -> Proposal: ...
+    def supersede(self, holder: Proposal, by: Composition, *, now: int | None = None,
+                  package: Any = None, route: str = "approval",
+                  bundle_keeps_drain: bool = False, rationale: str = "") -> Proposal: ...
+    def auto_apply(self, comp: Composition, now: int, *, rationale: str,
+                   notice_until: int | None = None, package: Any = None) -> Proposal: ...
+    def verify(self, now: int) -> list[Proposal]: ...
+    def mark_stale(self, wf: str, version: int, now: int) -> list[Proposal]: ...
+    def policy_reread(self, wf: str) -> None: ...
 
 
 @runtime_checkable

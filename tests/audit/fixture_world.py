@@ -210,11 +210,11 @@ def _fill(c: Any) -> None:
        (PID_AUTO, _j({"kpi": "pickup_rate"}), m(3, 9, 15)))
     ex("""INSERT INTO proposal (proposal_id, wf, class, route, state, base_version, change_summary,
                                 impact_score, evidence, approval_id, submitted_minute, decision_id,
-                                affected_leads, dry_run)
+                                affected_leads, dry_run, p0_rank)
           VALUES (%s, 1, 3, 'approval', 'pending', 3, 'Ramp V3 for over-60s to 25%%', 0.02, %s,
-                  'apr_00015', %s, 5, 640, %s),
+                  'apr_00015', %s, 5, 640, %s, NULL),
                  (%s, 2, 0, 'approval', 'pending', 2, 'Restore prompt P1 (incident INC-0001)',
-                  0.05, %s, 'apr_00016', %s, 4, 1500, %s)""",
+                  0.05, %s, 'apr_00016', %s, 4, 1500, %s, 0)""",
        (PID_PENDING, _j({"kpi": "engagement_rate", "expected_decision_window": ["D3 11:30",
                                                                                 "D3 15:00"]}),
         m(3, 11), _j({"headline": "engagement +0.3%, worst case -0.2%"}),

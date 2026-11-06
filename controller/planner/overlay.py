@@ -38,7 +38,7 @@ from controller.governance.policy import classify_risk, tv_by_cohort_dim
 from controller.settings import Thresholds
 from controller.types import (AGENT_DIMS, DEFAULT_COHORT, P0_INCIDENT, CohortDef, Composition,
                               Config, FrozenDict, Patch, PatchRequest, Proposal, RebaseReport,
-                              WorkflowSpec, freeze, label, thaw)
+                              Substitution, WorkflowSpec, freeze, label, thaw)
 
 Path = tuple[str, ...]
 PATH_ORDER = {"cohorts": 0, "alloc": 1, "hour_weights": 2, "prompt": 3}
@@ -86,26 +86,6 @@ class Cooldown:
     until_minute: int
     source_version: int | None
     reason: str
-
-
-@dataclass(frozen=True)
-class Substitution:
-    """Step 5: an override rebased onto the supervisor's new control."""
-
-    patch_id: int
-    cohort: str
-    dim: str
-    old_control: str
-    new_control: str
-    applied: bool
-    """False: the new control is credibly worse in this cohort; kept and listed for approval"""
-
-
-@dataclass(frozen=True)
-class RebaseOutcome(RebaseReport):
-    """RebaseReport plus the step-5 substitutions (local extension of the M0 type)."""
-
-    substitutions: tuple[Substitution, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -447,7 +427,7 @@ class Overlay:
 
     # ------------------------------------------------------------ supervisor edits (6.7)
     def rebase_on_supervisor_edit(self, wf: str, old: Config | None, new: Config,
-                                  v: int) -> RebaseOutcome:
+                                  v: int) -> RebaseReport:
         now = self.clock()
         sup_paths = diff_paths(old, new)
         removed = (set(old.cohort_ids()) - set(new.cohort_ids())) if old is not None else set()
@@ -468,12 +448,12 @@ class Overlay:
             self.cooldowns[(wf, path)] = Cooldown(until, v, f"supervisor edit v{v}")
             self.owners[(wf, path)] = PathOwner("supervisor", v, now)
         subs = self._rebase_controls(wf, old, new, sup_paths) if old is not None else []
-        return RebaseOutcome(wf=wf, version=v, sup_paths=tuple(sup_paths),
-                             invalidated_patches=tuple(invalidated),
-                             interrupted_experiments=tuple(experiments),
-                             stale_proposals=tuple(stale), cooldown_paths=tuple(sup_paths),
-                             cooldown_until=until if sup_paths else None,
-                             substitutions=tuple(subs))
+        return RebaseReport(wf=wf, version=v, sup_paths=tuple(sup_paths),
+                            invalidated_patches=tuple(invalidated),
+                            interrupted_experiments=tuple(experiments),
+                            stale_proposals=tuple(stale), cooldown_paths=tuple(sup_paths),
+                            cooldown_until=until if sup_paths else None,
+                            substitutions=tuple(subs))
 
     def _rebase_controls(self, wf: str, old: Config, new: Config,
                          sup_paths: Sequence[Path]) -> list[Substitution]:

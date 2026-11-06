@@ -82,13 +82,13 @@ def test_supersede_strictly_higher_class_only():
 
 
 def test_p0a_bundle_is_the_only_same_class_supersede():
-    p0b = prop("pending", 0, evidence=FrozenDict({"p0_rank": 1}))
-    p0a = prop("pending", 0, evidence=FrozenDict({"p0_rank": 0}))
+    p0b = prop("pending", 0, p0_rank=1)
+    p0a = prop("pending", 0, p0_rank=0)
     assert can_supersede(p0b, 0, 0, bundle_keeps_drain=True)
     assert not can_supersede(p0b, 0, 0, bundle_keeps_drain=False)  # would drop the drain
     assert not can_supersede(p0a, 0, 1)                            # a P0a is never superseded
     assert not can_supersede(p0a, 0, 0, bundle_keeps_drain=True)
-    assert not can_supersede(prop("approved", 0, evidence=FrozenDict({"p0_rank": 1})), 0, 0,
+    assert not can_supersede(prop("approved", 0, p0_rank=1), 0, 0,
                              bundle_keeps_drain=True)              # about to apply: let it
 
 

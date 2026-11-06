@@ -26,7 +26,6 @@ from controller.types import (P0_INCIDENT, P1_ROLLBACK, P2_PROMOTION, P3_ROUTINE
                               EffectivePolicy)
 from controller.world.clock import (MINUTES_PER_DAY, ceil_to_tick, decide_minutes,
                                     expected_visible_minute, in_approver_hours, p_expire_raw)
-from controller.world.registry import ext
 
 ROUTINE_CLASSES = (P2_PROMOTION, P3_ROUTINE)
 URGENT_CLASSES = (P0_INCIDENT, P1_ROLLBACK)
@@ -45,7 +44,7 @@ def _t(t: Thresholds | None) -> Thresholds:
 def p_expire(t: int, pol: EffectivePolicy) -> float:
     """Exact P(expire) of a request submitted at minute t with `expires_in_hours` left at the
     policy TTL: the share of latencies L whose `next_working(t + L)` is later than `t + TTL`."""
-    return p_expire_raw(t, pol.latency_minutes, pol.approver_hours, ext(pol, "ttl_min"))
+    return p_expire_raw(t, pol.latency_minutes, pol.approver_hours, pol.ttl_min)
 
 
 def expected_apply_minute(t: int, pol: EffectivePolicy) -> float:
@@ -136,7 +135,7 @@ def _slot1(base: int, pol: EffectivePolicy, p_max: float) -> int | None:
     in_hours = [m for m in range(open_min, preferred, pol.tick) if ok(m)]
     if in_hours:
         return max(in_hours)
-    if ext(pol, "pre_open_submits") == "never":
+    if pol.pre_open_submits == "never":
         return None
     pre_open = [m for m in range(base, open_min, pol.tick) if ok(m)]
     return max(pre_open) if pre_open else None

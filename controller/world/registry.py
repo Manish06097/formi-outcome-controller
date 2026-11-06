@@ -21,9 +21,8 @@ How each field of `EffectivePolicy` is formed (API = `GET /workflows/{id}`, D = 
 | preferred_slot_min | max(open, D.not_before) with a not_before; else open + min(60, 25% of the
   approver window) floored to the tick (the `*` default) |
 
-`ExtendedPolicy` adds the fields governance needs that the M0 `EffectivePolicy` lacks (requested as
-a contract change in the T2 report); every consumer reads them with `ext()` so a plain
-`EffectivePolicy` still works with the documented defaults.
+Every field lives on `types.EffectivePolicy` (the T2 request was merged in step I1, ADR 0028);
+`approver_close_min` and `ttl_min` are properties derived from the API fields.
 """
 from __future__ import annotations
 
@@ -34,38 +33,8 @@ from typing import Any, Iterable, Mapping
 from controller.settings import Thresholds
 from controller.types import (CUSTOMER_FACING_DIMS, EffectivePolicy, ResolvedDirective,
                               WorkflowSpec)
-from controller.world.clock import apply_window_minutes, floor_to_tick, ttl_minutes
+from controller.world.clock import apply_window_minutes, floor_to_tick
 from controller.world.directives import DirectiveLayer
-
-
-@dataclass(frozen=True)
-class ExtendedPolicy(EffectivePolicy):
-    """EffectivePolicy plus the fields of the T2 contract-change request."""
-
-    pre_open_submits: str = "only_if_no_safe_in_hours"
-    """only_if_no_safe_in_hours | never (directive)"""
-    approver_close_min: int = 0
-    ttl_min: int = 0
-    """int(60 x ttl_hours), the simulator's own rounding"""
-    api_auto_enabled: bool = False
-    api_allowed_dims: frozenset[str] = frozenset()
-    """What the API policy permits before directives (the 'policy permits, client forbids' view)."""
-    use_case: str = ""
-    directive_scopes: tuple[str, ...] = ()
-
-
-def ext(pol: EffectivePolicy, name: str, default: Any = None) -> Any:
-    """Read an ExtendedPolicy field from any EffectivePolicy, with the documented fallback."""
-    if hasattr(pol, name):
-        return getattr(pol, name)
-    fallbacks = {
-        "pre_open_submits": "only_if_no_safe_in_hours",
-        "approver_close_min": pol.approver_hours[1] * 60,
-        "ttl_min": ttl_minutes(pol.ttl_hours),
-        "api_auto_enabled": pol.auto_enabled,
-        "api_allowed_dims": pol.allowed_dims,
-    }
-    return fallbacks.get(name, default)
 
 
 def preferred_slot_min(approver_hours: tuple[int, int], not_before_min: int | None, tick: int,
@@ -79,7 +48,7 @@ def preferred_slot_min(approver_hours: tuple[int, int], not_before_min: int | No
 
 
 def effective_policy(spec: WorkflowSpec, directive: ResolvedDirective, tick: int,
-                     t: Thresholds) -> ExtendedPolicy:
+                     t: Thresholds) -> EffectivePolicy:
     """Combine one workflow's API policy with its directive, taking the stricter of each."""
     gov = spec.governance
     c_policy = gov.max_requests_per_24h
@@ -89,7 +58,7 @@ def effective_policy(spec: WorkflowSpec, directive: ResolvedDirective, tick: int
     allowed = frozenset(gov.auto_apply.allowed_dims)
     if directive.customer_facing_auto_apply == "none":
         allowed = allowed - CUSTOMER_FACING_DIMS
-    return ExtendedPolicy(
+    return EffectivePolicy(
         tick=tick,
         approver_hours=gov.approver_hours,
         approver_open_min=gov.approver_hours[0] * 60,
@@ -117,8 +86,6 @@ def effective_policy(spec: WorkflowSpec, directive: ResolvedDirective, tick: int
         weekly_digest=directive.weekly_digest,
         dialling_window=spec.dialling_window,
         pre_open_submits=directive.pre_open_submits,
-        approver_close_min=gov.approver_hours[1] * 60,
-        ttl_min=ttl_minutes(gov.proposal_ttl_hours),
         api_auto_enabled=gov.auto_apply.enabled,
         api_allowed_dims=frozenset(gov.auto_apply.allowed_dims),
         use_case=spec.use_case,
@@ -162,7 +129,7 @@ class WorkflowRegistry:
         self.directives = directives
         self.t = thresholds or Thresholds()
         self._specs: dict[str, WorkflowSpec] = {}
-        self._policies: dict[str, ExtendedPolicy] = {}
+        self._policies: dict[str, EffectivePolicy] = {}
         self._resolved: dict[str, ResolvedDirective] = {}
         self._tick: int | None = None
 
@@ -194,13 +161,13 @@ class WorkflowRegistry:
     def spec(self, wf: str) -> WorkflowSpec:
         return self._specs[wf]
 
-    def policy(self, wf: str) -> ExtendedPolicy:
+    def policy(self, wf: str) -> EffectivePolicy:
         return self._policies[wf]
 
     def directive(self, wf: str) -> ResolvedDirective:
         return self._resolved[wf]
 
-    def policies(self) -> Mapping[str, ExtendedPolicy]:
+    def policies(self) -> Mapping[str, EffectivePolicy]:
         return dict(self._policies)
 
     def auto_apply_conflict(self, wf: str) -> AutoApplyConflict | None:

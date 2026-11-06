@@ -9,9 +9,9 @@ import copy
 from typing import Any
 
 from controller.settings import Thresholds
-from controller.types import Config, WorkflowSpec
+from controller.types import Config, EffectivePolicy, WorkflowSpec
 from controller.world.directives import load_directives
-from controller.world.registry import ExtendedPolicy, effective_policy
+from controller.world.registry import effective_policy
 
 BASE_SPEC: dict[str, Any] = {
     "workflow_id": "wf_test", "tenant_id": "acme", "use_case": "renewal reminder",
@@ -46,7 +46,7 @@ def spec(**gov: Any) -> WorkflowSpec:
     return WorkflowSpec.from_api(d)
 
 
-def policy(tick: int = 15, t: Thresholds | None = None, **gov: Any) -> ExtendedPolicy:
+def policy(tick: int = 15, t: Thresholds | None = None, **gov: Any) -> EffectivePolicy:
     s = spec(**gov)
     layer = load_directives()
     d = layer.resolve(s.tenant_id, s.workflow_id, s.use_case)

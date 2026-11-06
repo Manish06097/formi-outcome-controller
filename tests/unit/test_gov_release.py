@@ -18,8 +18,7 @@ POL = policy(allowed_dims=["caller_id", "schedule"])           # 10-19, latency 
 
 def holder(cls, state="pending", rank=None, submitted=hm(1, 11)) -> Proposal:
     return Proposal(proposal_id=f"h-{cls}", wf="wf_test", cls=cls, route="approval", state=state,
-                    base_version=3, submitted_minute=submitted,
-                    evidence=FrozenDict({"p0_rank": rank}))
+                    base_version=3, submitted_minute=submitted, p0_rank=rank)
 
 
 def act(h, cls, rank=None, now=hm(1, 12), **kw):

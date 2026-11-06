@@ -107,7 +107,7 @@ def step_summary(conn: Tx) -> dict[str, Any]:
                   coalesce(sum(bytes), 0)
            FROM ingested_chunk GROUP BY kind ORDER BY kind""").fetchall()
     steps = conn.execute(
-        """SELECT to_minute / 1440 AS day, count(*),
+        """SELECT (to_minute - 1) / 1440 AS day, count(*),
                   sum(coalesce((SELECT sum(value::int) FROM jsonb_each_text(phase_ms)), 0)),
                   sum(events), max(rss_mb), max(db_bytes)
            FROM loop_step GROUP BY 1 ORDER BY 1""").fetchall()

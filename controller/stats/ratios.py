@@ -172,12 +172,23 @@ def mantel_haenszel(a: np.ndarray, n1: np.ndarray, c: np.ndarray,
     fractional (recency-weighted counts are scaled before they get here, which is the power
     likelihood the EW posterior uses, DESIGN.md 5.3).
 
-    Variance by the delta method treating the stratum sizes as fixed:
-      var(log A) = sum_j (n0_j/N_j)^2 a_j (1 - a_j/n1_j) / A^2,   A = sum_j a_j n0_j / N_j
-      var(log C) = sum_j (n1_j/N_j)^2 c_j (1 - c_j/n0_j) / C^2,   C = sum_j c_j n1_j / N_j
-    With one stratum this is (1-p1)/(n1 p1) + (1-p0)/(n0 p0), the unequal-size variance of 5.5.
-    A side with zero events gets a 0.5 continuity correction. Returns None without any stratum
-    holding both sides.
+    Variance: the Greenland-Robins (1985) estimator for the MH log risk ratio,
+      var = sum_j (n1_j n0_j (a_j + c_j) / N_j - a_j c_j) / N_j  /  (A C),
+      A = sum_j a_j n0_j / N_j,   C = sum_j c_j n1_j / N_j,
+    which stays consistent when there are many strata with one or two calls each (an arm at a
+    few percent of a small cohort has about one call per segment). The delta method that
+    treats each stratum's own rate as known does not: a stratum with n1_j = 1 has
+    a_j (1 - a_j / n1_j) = 0, so an arm seen once per stratum got a near-zero variance and a
+    posterior far too sure of itself (found end to end in step I4, ADR 0031). With one stratum
+    both give (1-p1)/(n1 p1) + (1-p0)/(n0 p0), the unequal-size variance of 5.5.
+    A side with zero events gets a 0.5 continuity correction (and the delta-method variance
+    with its floor). Returns None without any stratum holding both sides.
+
+    Both plug-in estimators are zero for a side whose observed rate is 0 or 1 (one engaged call
+    out of one), so the variance is floored at the unstratified one with each side's rate
+    smoothed by half an event and half a non-event, sum over sides of (1 - q) / (n q) with
+    q = (x + 0.5) / (n + 1): a handful of calls can never look like strong evidence, and with
+    many calls the floor is the plain two-sample variance, which stratification only lowers.
     """
     a, n1, c, n0 = (np.asarray(x, dtype=float) for x in (a, n1, c, n0))
     keep = (n1 > 0) & (n0 > 0)
@@ -188,15 +199,27 @@ def mantel_haenszel(a: np.ndarray, n1: np.ndarray, c: np.ndarray,
     w1, w0 = n0 / N, n1 / N
     A = float((a * w1).sum())
     C = float((c * w0).sum())
-    va = float((w1 * w1 * a * (1.0 - a / n1)).sum())
-    vc = float((w0 * w0 * c * (1.0 - c / n0)).sum())
-    if A <= 0.0:
-        A, va = 0.5, max(va, 0.25)
-    if C <= 0.0:
-        C, vc = 0.5, max(vc, 0.25)
-    var = va / (A * A) + vc / (C * C)
+    if A > 0.0 and C > 0.0:
+        gr = float(((n1 * n0 * (a + c) / N - a * c) / N).sum()) / (A * C)
+        var = gr
+    else:
+        va = float((w1 * w1 * a * (1.0 - a / n1)).sum())
+        vc = float((w0 * w0 * c * (1.0 - c / n0)).sum())
+        if A <= 0.0:
+            A, va = 0.5, max(va, 0.25)
+        if C <= 0.0:
+            C, vc = 0.5, max(vc, 0.25)
+        var = va / (A * A) + vc / (C * C)
+    var = max(var, _smoothed_var(float(a.sum()), float(n1.sum())) +
+              _smoothed_var(float(c.sum()), float(n0.sum())))
     return RatioEstimate(log_rr=math.log(A / C), var=max(var, 1e-12), n_arm=float(n1.sum()),
                          n_ctrl=float(n0.sum()), a_std=A, c_std=C)
+
+
+def _smoothed_var(x: float, n: float) -> float:
+    """(1 - q) / (n q), q = (x + 0.5) / (n + 1): var of a log rate with half-event smoothing."""
+    q = (x + 0.5) / (n + 1.0)
+    return (1.0 - q) / (n * q)
 
 
 def shared_control_cov(n1_a: np.ndarray, n1_b: np.ndarray, c: np.ndarray, n0: np.ndarray,

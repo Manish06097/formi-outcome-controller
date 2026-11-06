@@ -5,7 +5,9 @@ Owner: integration step I2 (milestone M3). Implements DESIGN.md 4.1 steps 4, 5, 
 supervisor-edit handler, LIFECYCLE, GOVERN, VERIFY), 2 restart step 5 (the proposal sweep), 6.1 to
 6.7 through `governance/*` and `planner/overlay.py`, and 8.2 and 8.3 through
 `governance/effects.py`. It also runs the probe-only learner (`learning/probe.py`) in DETECT and
-DECIDE when `CTL_LEARNER=probe`. ADR 0029.
+DECIDE when `CTL_LEARNER=probe` or `probe_only`, and the engagement learner (`loop/engagement.py`,
+step I4, ADR 0031) in DETECT, DECIDE, the release train's composed-change gate, the lifecycle's
+re-gate and verifiers, and the held-patch re-check, when `CTL_LEARNER=probe`. ADR 0029.
 
 State: nothing lives only here. Proposals, transitions, the approval mirror, the overlay
 (patches, owners, cooldowns), DID states and every decision are in the run schema; `attach`
@@ -42,6 +44,7 @@ from controller.governance.release import ReleaseDeps, ReleaseTrain
 from controller.governance.store_pg import OverlayStore, PgProposalStore, TxScope, holds_of
 from controller.governance.timing import choose_submit, routine_slots
 from controller.learning.probe import OWNER_COHORTS, ProbeLearner, did_rows
+from controller.loop.engagement import EngagementLoop
 from controller.loop.orchestrator import LoopHooks, Runtime, StageCounts
 from controller.obs.alerts import raise_alert
 from controller.planner.overlay import LIVE_STATES, OverlayContext, dominant
@@ -66,7 +69,8 @@ class GovernanceHooks(LoopHooks):
 
     def __init__(self, learner: str = "probe"):
         self.learner_kind = learner
-        self.learner = ProbeLearner() if learner == "probe" else None
+        self.learner = ProbeLearner() if learner in ("probe", "probe_only") else None
+        self.engagement = EngagementLoop(self) if learner == "probe" else None
         self.now = 0
 
     # ------------------------------------------------------------------ wiring (on every start)
@@ -77,6 +81,8 @@ class GovernanceHooks(LoopHooks):
         self.t = rt.settings.t
         if self.learner is not None:
             self.learner = ProbeLearner(self.t)
+        if self.engagement is not None:
+            self.engagement.attach()
         self.scope = TxScope(rt.db)
         self.store = PgProposalStore(self.scope, rt.catalog)
         self.registry = WorkflowRegistry(load_directives(), self.t)
@@ -96,12 +102,17 @@ class GovernanceHooks(LoopHooks):
             executor=IntentEffects(rt.intents, self.scope), policy_of=self.registry.policy,
             clock=self._clock, epoch=rt.epoch, run6=rt.run6,
             settings_hash=rt.settings.settings_hash(), code_version=rt.settings.env.code_version,
-            t=self.t, holds=self._holds, on_alert=self._alert, on_applied=self._on_applied))
+            t=self.t, holds=self._holds, on_alert=self._alert, on_applied=self._on_applied,
+            regate=self.engagement.regate if self.engagement else None,
+            verifiers=self.engagement.verifiers() if self.engagement else {},
+            on_rollback=self.engagement.on_verify_failed if self.engagement
+            else (lambda p, r: None)))
         self.release = ReleaseTrain(ReleaseDeps(
             overlay=self.overlay, lifecycle=self.lc, policy_of=self.registry.policy,
             workflows=self.registry.workflow_ids, live=self._live,
             build_context=self._build_context, holds=self._holds,
-            suspect_since=self._suspect_since, t=self.t))
+            suspect_since=self._suspect_since, t=self.t,
+            gate=self.engagement.gate if self.engagement else None))
         attach_effect_hooks(rt.registry, lambda: self.lc, self.scope)
 
     def _business_cohorts(self, tx: Tx, wid: str) -> tuple[CohortDef, ...]:
@@ -198,10 +209,11 @@ class GovernanceHooks(LoopHooks):
             hist = {int(c): float(a or 0) for c, _, a in first}
         total = sum(hist.values())
         share = {c: v / total for c, v in hist.items()} if total > 0 else {}
-        return BuildContext(primary_kpi=spec.objective.primary, batch_size=spec.daily_batch.size,
-                            mid_flight=spec.mid_flight, cells=cells,
-                            active_by_cell=FrozenDict(active),
-                            hist_share_by_cell=FrozenDict(share))
+        ctx = BuildContext(primary_kpi=spec.objective.primary, batch_size=spec.daily_batch.size,
+                           mid_flight=spec.mid_flight, cells=cells,
+                           active_by_cell=FrozenDict(active),
+                           hist_share_by_cell=FrozenDict(share))
+        return self.engagement.enrich(wf, ctx) if self.engagement else ctx
 
     def _decision(self, wf: str | None, module: str, kind: str, rule: str,
                   inputs: Mapping[str, Any], outcome: Mapping[str, Any] | None = None) -> Decision:
@@ -289,7 +301,8 @@ class GovernanceHooks(LoopHooks):
         before = self._applied_count()
         self.lc.recover(now)
         self.lc.tick(now)
-        released = self.overlay.release_held(now, lambda p: True)
+        released = self.overlay.release_held(
+            now, self.engagement.release_ok if self.engagement else (lambda p: True))
         self.scope.flush()
         if released["released"] or released["dropped"]:
             with self.scope.tx() as tx:
@@ -349,6 +362,8 @@ class GovernanceHooks(LoopHooks):
                         wf, "learning.did", "did_state", f"5.9/{f.kind}",
                         {"did": f.scope, "stat": f.stat, "threshold": f.threshold},
                         {"status": changed[f.scope].status} if f.scope in changed else {}))
+        if self.engagement is not None:
+            self.engagement.detect(now)
         return None
 
     def _write_did_states(self, tx: Tx, wf: str, states: Mapping[str, DidState]) -> None:
@@ -380,6 +395,8 @@ class GovernanceHooks(LoopHooks):
             with self.scope.tx() as tx:
                 ws = self._snapshot(tx, wf)
                 reqs = self.learner.plan(ws, self.business[wf])
+                if self.engagement is not None:
+                    reqs = self.engagement.guardrail_filter(tx, ws, reqs)
                 for req in reqs:
                     if self._already_wanted(req):
                         continue
@@ -389,6 +406,8 @@ class GovernanceHooks(LoopHooks):
                         {"value": _json_value(req.value), "class": req.cls}))
                     self.overlay.add(dataclasses.replace(req, decision_id=did))
                     n += 1
+        if self.engagement is not None:
+            n += self.engagement.decide(now)
         return StageCounts(decisions=n)
 
     def _already_wanted(self, req: PatchRequest) -> bool:

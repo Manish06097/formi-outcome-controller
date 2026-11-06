@@ -127,3 +127,88 @@ def test_rollback_is_timed_to_the_predicted_apply_time():
     assert info["slope"] < 0 and info["delta_segments"] > 3
     assert w.grade(cfg, cfg.with_allocation("default", "welcome_message", {"W1": 1.0}), 8.0)[0] \
         != "harmful"
+
+
+def _small_cohort_world(mult, segments=12, per_day=950, share=0.4):
+    """A population with several small cohorts, the shape that made a population rollback fail
+    every cohort line: each cohort's posterior is wide, and the arm holds 40% of each."""
+    from controller.types import CohortDef
+    cohorts = [CohortDef.make(f"lang_{x}~{i:06d}", {"lang": [x]}) for i, x in enumerate(("en", "hi"))]
+    cohorts += [CohortDef.make("old~000009", {"age_band": ["60+"]})]
+    w = uniform_world(seed=3, connected_per_day=per_day, mult=mult)
+    cfg0 = base_config(SPEC, cohorts)
+    exps = open_experiments(w.snapshot(cfg0, 0))
+    cfg = cfg0.with_allocation("default", "welcome_message", {"W1": 1 - share, "W2": share})
+    for s in range(segments):
+        w.simulate_segment(cfg, s)
+    return w, cfg, exps
+
+
+def test_a_population_rollback_is_cut_to_pass_the_gate_it_will_meet():
+    """Reproduces the step I4 defect: the plan passed the population line alone, the composed gate
+    refused it on the cohort lines, and the variant kept its share to the end of the run."""
+    from controller.learning.decay import apply_time_shifts
+    from controller.learning.engagement import EffectCache
+    from controller.learning.harm import GateContext
+    from controller.settings import Thresholds
+    from controller.snapshot import active_population
+    from controller.types import DEFAULT_COHORT
+    t = Thresholds()
+    # the arm is well below the control over the whole recent past
+    w, cfg, exps = _small_cohort_world(lambda dim, o, cell, days:
+                                       0.8 if (dim, o) == ("welcome_message", "W2") else 1.0)
+    ws = w.snapshot(cfg, 12, experiments=exps)
+    state = DecayMonitorState(wf=ws.spec.workflow_id, scope="population", dim="welcome_message",
+                              arm="W2", cusum=6.0, seg_last=11, theta_ref=0.1, alarm=True)
+    mon = PageDecayMonitor(t, [state])
+    ew = M.draws(M.fit(ws, "ew"), 11)
+    t_apply = ws.now + 120
+    patches = mon.rollback_plan(ws, ew, t_apply)
+    assert patches and all(p.cls == P1_ROLLBACK for p in patches)
+    new = cfg
+    for p in patches:
+        new = new.with_allocation(p.path[1], p.path[2], dict(p.value))
+    cache = EffectCache(ew, apply_time_shifts(ws, int(ew.params.shape[0]), int(ew.seed), t_apply, t))
+    r = GateContext(cache, active_population(ws), cells=ws.cells, settings=t).evaluate(
+        cfg, new, ws.policy, t.alpha_h_rollback, t.alpha_d, None, None)
+    assert r.report.failed == (), r.report.failed
+    # and it is a real rollback, not a token move
+    moved = [cfg.dist(k, "welcome_message").get("W2", 0) - new.dist(k, "welcome_message").get("W2", 0)
+             for k in [*cfg.cohort_ids(), DEFAULT_COHORT]]
+    assert max(moved) > 0.2
+
+
+def test_a_latched_alarm_with_faded_evidence_gets_no_rollback_test():
+    """A false alarm stays latched for increases, but it is not re-tested for a rollback at every
+    step for the rest of the run once its CUSUM has fallen under h / 2."""
+    from controller.settings import Thresholds
+    t = Thresholds()
+    w, cfg, exps = _small_cohort_world(lambda dim, o, cell, days:
+                                       0.8 if (dim, o) == ("welcome_message", "W2") else 1.0)
+    ws = w.snapshot(cfg, 12, experiments=exps)
+    ew = M.draws(M.fit(ws, "ew"), 11)
+    faded = DecayMonitorState(wf=ws.spec.workflow_id, scope="population", dim="welcome_message",
+                              arm="W2", cusum=t.w4_cusum_frac * t.decay_cusum_h - 0.01,
+                              seg_last=11, theta_ref=0.1, alarm=True)
+    assert PageDecayMonitor(t, [faded]).rollback_plan(ws, ew, ws.now + 120) == []
+    live = DecayMonitorState(wf=ws.spec.workflow_id, scope="population", dim="welcome_message",
+                             arm="W2", cusum=t.w4_cusum_frac * t.decay_cusum_h, seg_last=11,
+                             theta_ref=0.1, alarm=True)
+    assert PageDecayMonitor(t, [live]).rollback_plan(ws, ew, ws.now + 120) != []
+
+
+def test_the_segment_ratio_keeps_the_calls_of_sparse_cells():
+    """Reproduces the step I4 defect: stratified by cell, a segment with a few calls per cell
+    dropped every cell missing one side. By cohort, every call counts."""
+    from controller.learning.decay import segment_ratio
+    w, cfg, exps = _small_cohort_world(lambda dim, o, cell, days: 1.0, segments=2, per_day=400,
+                                       share=0.15)
+    ws = w.snapshot(cfg, 2, experiments=exps)
+    cells = [int(c) for c in ws.cells]
+    r = segment_ratio(ws, "welcome_message", "W2", "W1", cells, 1)
+    e = ws.engage
+    n_arm = int(e.connected[(e.seg == 1) & (e.w == 1)].sum())
+    n_ctl = int(e.connected[(e.seg == 1) & (e.w == 0)].sum())
+    q = 0.55
+    full = ((1 - q) / (n_arm * q) + (1 - q) / (n_ctl * q)) ** 0.5
+    assert r is not None and r[1] < 1.15 * full, (r, full, n_arm, n_ctl)

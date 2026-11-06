@@ -12,7 +12,7 @@ Status of the pieces this guide mentions (so nothing here surprises you):
 | Private scenario variants and the matrix runner | `scenarios/private/`, `scripts/variants/` | built (M0b) |
 | `run.sh` with Docker Compose, the loop, ingest, crash safety | `run.sh`, `compose*.yml`, `controller/loop`, `controller/ingest`, `controller/reliability` | built (M1, M2) |
 | Governance in the loop: proposals and overlay in Postgres, lifecycle, release train, supervisor-edit rebase | `controller/governance`, `controller/planner`, `controller/loop/governance.py` | built (M3, step I2, ADR 0029) |
-| Learners | `controller/learning`, `controller/incidents` | the probe-only learner runs (`CTL_LEARNER=probe`: caller-ID probes and spreads, per-cohort call times from history); engagement learning and incident response land with M4 to M6 |
+| Learners | `controller/learning`, `controller/incidents` | `CTL_LEARNER=probe` runs caller-ID probes and spreads, per-cohort call times from history, and engagement learning (welcome and voice experiments, winners, decay rollback, the harm gate on every change); incident response lands with M4 and M6 |
 
 ## 1. Prerequisites
 
@@ -46,7 +46,7 @@ CTL_NO_DOCKER=1 PG_DSN="host=127.0.0.1 port=5432 user=postgres password=... dbna
 Every setting is an environment variable read by `controller/settings.py` (`EnvSettings`):
 `CTL_SIM_URL`, `PG_DSN` or `CTL_PG_HOST/PORT/USER/PASSWORD/DB`, `CTL_API_PORT` (8780),
 `CTL_INGEST` (`sql` or `python`), `CTL_ENGAGEMENT_MODEL`, `CTL_LLM_SUGGEST`, `CTL_FAULT`,
-`CTL_LEARNER` (`probe`, the default, or `none`: governance runs but nothing proposes changes),
+`CTL_LEARNER` (`probe`, the default; `probe_only`: no engagement learning; or `none`: governance runs but nothing proposes changes),
 `CTL_CODE_VERSION`. Thresholds are overridden with `CTL_T_<NAME>` (only for private-variant
 experiments; an override changes `settings_hash`, which every decision row stores).
 

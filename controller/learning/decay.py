@@ -6,7 +6,7 @@ Monitored: every non-control arm with at least 10% share in some scope (populati
 cohort), and every promoted winner against its holdout. Per completed half-window segment j:
 
     z_j = (log RR_j - theta_ref) / SE_j     RR_j: arm vs control in segment j, Mantel-Haenszel
-                                             across (cell, prompt) strata of the scope
+                                             across (cohort, prompt) strata of the scope
     S_j = max(0, S_{j-1} - z_j - k)          k = 0.5, alarm at h = 4
 
 theta_ref is the stationary posterior mean of the arm's scope effect when monitoring starts.
@@ -15,14 +15,21 @@ An alarm only freezes increases (allocator) and starts the rollback evaluation; 
 anything back by itself.
 
 Rollback (every step once an alarm is on): the arm's effect is predicted to the expected apply
-time t_a from the EW posterior plus a local linear trend over the last 4 segments (slope drawn
-with its standard error, seeded), and the arm's share in the scope is moved to the control when
+time t_a from the EW posterior plus a local linear trend over the last 4 segments, and the arm's
+share in the scope is moved to the control when
 
     E[de_rollback(t_a)] > 0   and   P(de_rollback(t_a) < -1%) <= 10%
 
 or, failing the tail condition, the largest share cut that passes it. Predicting to t_a, not
 to now, is what keeps a rollback from being graded harmful at onset (UNDERSTANDING 5): we
-propose when the variant is expected to be below the control by the time it applies.
+propose when the variant is expected to be below the control by the time it applies. The trend
+enters only when it is credibly falling (slope + z SE < 0, p = apply_time_trend_p), as in
+`apply_time_shifts`: a noisy negative slope on a healthy arm must not read as a rollback case.
+
+The cut is then limited by the whole gate of 0.1 at the rollback tail, not by the population
+line alone (ADR 0031): per cohort the largest cut whose cohort line passes on the same predicted
+draws, then one common factor for the population line. Without this, a population rollback that
+passes the population line can fail every small cohort's line and never reach the simulator.
 """
 from __future__ import annotations
 
@@ -34,12 +41,12 @@ import numpy as np
 from controller.learning.allocator import _cohorts, _round_shares, build_config
 from controller.learning.engagement import (ENGAGEMENT_DIMS, CLOSED_EXPERIMENT_STATES,
                                             EffectCache, dim_arms)
-from controller.learning.harm import largest_passing
+from controller.learning.harm import GateContext, largest_passing
 from controller.settings import Settings, Thresholds
 from controller.snapshot import (active_population, option_index, segment_of, segment_position,
                                  segment_start_minute)
 from controller.stats.draws import derive_seed, rng
-from controller.stats.ratios import mantel_haenszel
+from controller.stats.ratios import mantel_haenszel, norm_ppf
 from controller.stats.sequential import PageCusum
 from controller.types import (P1_ROLLBACK, Config, DecayMonitorState, Draws, Finding, FrozenDict,
                               PatchRequest, WorkflowSnapshot)
@@ -56,7 +63,13 @@ def _thresholds(settings: Settings | Thresholds | None) -> Thresholds:
 
 def segment_ratio(ws: WorkflowSnapshot, dim: str, arm: str, control: str, cells: Sequence[int],
                   seg: int) -> tuple[float, float] | None:
-    """(log RR, SE) of arm vs control in one segment over the scope's cells, or None."""
+    """(log RR, SE) of arm vs control in one segment over the scope's cells, or None.
+
+    Stratified by (cohort, prompt). Shares are set per cohort, so that is the stratification that
+    removes confounding; within a cohort every cell has the same shares. Stratifying by cell, as
+    this did first, threw away calls: at dev volume a segment has a few calls per cell, so most
+    cells lacked one of the two sides and were dropped, which doubled the segment's SE and the
+    alarm's delay (found end to end in step I4, ADR 0031)."""
     e = ws.engage
     if len(e) == 0:
         return None
@@ -65,7 +78,11 @@ def segment_ratio(ws: WorkflowSnapshot, dim: str, arm: str, control: str, cells:
     m = (e.seg == seg) & np.isin(e.cell, np.asarray(list(cells), dtype=np.int64))
     if not m.any():
         return None
-    keys = np.stack([e.cell[m], e.prompt[m]], axis=1)
+    cmap = _cohort_map(ws, e.cell[m])
+    groups = {k: i for i, k in enumerate(sorted(set(cmap.values())))}
+    coh_code = np.fromiter((groups[cmap[int(c)]] for c in e.cell[m]), dtype=np.int64,
+                           count=int(m.sum()))
+    keys = np.stack([coh_code, e.prompt[m]], axis=1)
     strata, inv = np.unique(keys, axis=0, return_inverse=True)
     inv = inv.ravel()
     ns = len(strata)
@@ -78,6 +95,13 @@ def segment_ratio(ws: WorkflowSnapshot, dim: str, arm: str, control: str, cells:
     c_e, c_n = side(opts.get(control, -1))
     r = mantel_haenszel(a_e, a_n, c_e, c_n)
     return None if r is None else (r.log_rr, r.se)
+
+
+def _cohort_map(ws: WorkflowSnapshot, cells: np.ndarray) -> dict[int, str]:
+    """cell -> first-match cohort under the live config, for the cells in `cells`."""
+    from controller.snapshot import cohort_of_cells
+    uniq = [int(c) for c in np.unique(cells)]
+    return dict(zip(uniq, cohort_of_cells(ws.live, ws.cells, uniq)))
 
 
 class PageDecayMonitor:
@@ -210,6 +234,10 @@ class PageDecayMonitor:
         for (scope, dim, arm), st in sorted(self._s.items()):
             if not st.alarm or (scope, dim, arm) not in controls:
                 continue
+            if st.cusum < t.w4_cusum_frac * t.decay_cusum_h:
+                continue    # the evidence faded (W4's h/2): an alarm freezes increases for good,
+                            # but a rollback needs the arm to be below its reference still, or a
+                            # latched false alarm gets a rollback test at every step from then on
             control = controls[(scope, dim, arm)]
             plan = self._rollback_one(ws, cache, pop, coh, lead, scope, dim, arm, control,
                                       t_apply, getattr(ew, "seed", 0))
@@ -225,8 +253,7 @@ class PageDecayMonitor:
                 cur[control] = cur.get(control, 0.0) + moved
         if not evidence:
             return []
-        new = build_config(live, {k: {d: _round_shares(v) for d, v in m.items()}
-                                  for k, m in props.items()})
+        new = self._gate_limited(ws, ew, t_apply, props, pop)
         out = []
         for k in _cohorts(live):
             for dim in ENGAGEMENT_DIMS:
@@ -243,6 +270,43 @@ class PageDecayMonitor:
                         decision_id=decision_id))
         return out
 
+    def _gate_limited(self, ws: WorkflowSnapshot, ew: Draws | EffectCache, t_apply: int,
+                      props: dict[str, dict[str, dict[str, float]]], pop) -> Config:
+        """The rollback config with each cohort's cut limited by its own cohort line and every
+        cut by one common factor for the population line, at the rollback tail, on the draws
+        predicted to the apply time. This is the gate the composed change will meet (0.1)."""
+        t = self.t
+        live = ws.live
+        cache = ew if isinstance(ew, EffectCache) else EffectCache(
+            ew, apply_time_shifts(ws, int(ew.params.shape[0]), int(ew.seed), t_apply, t))
+        ctx = GateContext(cache, pop, cells=ws.cells, settings=t)
+
+        def at(lams: dict[str, float]) -> Config:
+            out: dict[str, dict[str, dict[str, float]]] = {}
+            for k, m in props.items():
+                lam = lams.get(k, 0.0)
+                out[k] = {}
+                for d, tgt in m.items():
+                    cur = dict(live.dist(k, d))
+                    keys = set(cur) | set(tgt)
+                    out[k][d] = _round_shares({o: cur.get(o, 0.0) + lam * (tgt.get(o, 0.0)
+                                                                           - cur.get(o, 0.0))
+                                               for o in keys})
+            return build_config(live, out)
+
+        def fails(cfg: Config) -> tuple[str, ...]:
+            return ctx.evaluate(live, cfg, ws.policy, t.alpha_h_rollback, t.alpha_d, None,
+                                None).report.failed
+
+        lams = {}
+        for k in props:
+            line = f"cohort:{k}"
+            lams[k] = largest_passing(lambda x, k=k, line=line: line not in fails(at({k: x})),
+                                      t.bisection_iters)
+        common = largest_passing(lambda c: not fails(at({k: c * v for k, v in lams.items()})),
+                                 t.bisection_iters)
+        return at({k: common * v for k, v in lams.items()})
+
     def _rollback_one(self, ws, cache, pop, coh, lead, scope, dim, arm, control, t_apply,
                       seed) -> tuple[float, dict[str, object]] | None:
         t = self.t
@@ -254,7 +318,10 @@ class PageDecayMonitor:
         window = ws.spec.dialling_window
         delta = segment_position(t_apply, window) - segment_position(ws.now, window)
         g = rng(derive_seed(seed, "decay_trend", scope, dim, arm))
-        slope = b + se_b * g.standard_normal(theta_now.shape[0])
+        z = norm_ppf(t.apply_time_trend_p)
+        falling = pts >= 3 and b + z * se_b < 0
+        slope = np.minimum(0.0, b + se_b * g.standard_normal(theta_now.shape[0])) if falling \
+            else np.zeros(theta_now.shape[0])
         theta_ta = theta_now + slope * max(delta, 0.0)
         in_scope = np.array([(scope == POPULATION) or (k == scope) for k in coh])
         share = np.array([live.dist(k, dim).get(arm, 0.0) for k in coh])
@@ -328,7 +395,6 @@ def apply_time_shifts(ws: WorkflowSnapshot, n_draws: int, seed: int, t_apply: in
     otherwise 0. Rising trends are never extrapolated: the prediction can only make the gate
     stricter. Same seed, same shifts."""
     t = _thresholds(settings)
-    from controller.stats.ratios import norm_ppf
     window = ws.spec.dialling_window
     delta = max(0.0, segment_position(t_apply, window) - segment_position(ws.now, window))
     out: dict[tuple[str, str], np.ndarray] = {}

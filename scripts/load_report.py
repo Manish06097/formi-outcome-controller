@@ -79,6 +79,10 @@ def main() -> None:
         versions = conn.execute("SELECT count(*) FROM config_version WHERE version > 1"
                                 ).fetchone()[0]
         db_size = conn.execute("SELECT pg_database_size(current_database())").fetchone()[0]
+        schema_size = conn.execute(
+            """SELECT coalesce(sum(pg_total_relation_size(c.oid)), 0) FROM pg_class c
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = %s AND c.relkind IN ('r', 'p', 'm')""", (schema,)).fetchone()[0]
         tables = conn.execute(
             """SELECT relname, pg_total_relation_size(c.oid) FROM pg_class c
                JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -146,7 +150,7 @@ def main() -> None:
                  f"({hist[2] / max(startup_s, 1):,.0f} events/s end to end; transform "
                  f"transactions alone {hist[2] / max(hist[3] / 1000, 1e-9):,.0f} events/s).")
     L.append("")
-    L.append("| Sim day | Steps | Events | Wall s | Events/s (end to end) | Advance s | Ingest s | Ops s | Controller RSS MB | DB GB |")
+    L.append("| Sim day | Steps | Events | Wall s | Events/s (end to end) | Advance s | Ingest s | Ops s | Controller RSS MB | Database GB (all schemas) |")
     L.append("|---|---|---|---|---|---|---|---|---|---|")
     for d in sorted(days):
         x, ph = days[d], phases[d]
@@ -174,12 +178,32 @@ def main() -> None:
     L.append(f"| Postgres container (docker stats) | {pk.get('postgres', 0):.0f} | 3 GB |")
     L.append(f"| simulator process (ps RSS) | {pk.get('simulator', 0):.0f} | host |")
     L.append("")
-    L.append(f"Database size at the end: {db_size / 2**30:.2f} GB (call_fact partitions "
-             f"{part / 2**30:.2f} GB). Largest tables:")
+    L.append(f"This run's schema at the end: {schema_size / 2**30:.2f} GB including indexes "
+             f"(call_fact partitions {part / 2**30:.2f} GB); the whole database, which also "
+             f"holds earlier runs' schemas, is {db_size / 2**30:.2f} GB. Largest tables:")
     L.append("")
     for name, size in tables:
         L.append(f"- `{name}`: {size / 2**20:,.0f} MB")
     L.append("")
+    if run_days and hist:
+        adv = sum(phases[d].get("advance", 0) for d in run_days) / 1000 / len(run_days)
+        ing_s = sum(phases[d].get("ingest", 0) for d in run_days) / 1000 / len(run_days)
+        L.append("## Against the DESIGN.md 8.7 estimates")
+        L.append("")
+        L.append("| Phase per sim day | Estimate (8.7) | Measured here |")
+        L.append("|---|---|---|")
+        L.append(f"| Simulator advance | about 5 s (laptop), 15 s (grading box) | {adv:.1f} s |")
+        L.append(f"| Fetch + COPY + SQL transform and rollups | 19 to 33 s | {ing_s:.1f} s |")
+        L.append("| Snapshots, detect, decide, fits, governance | 15 to 45 s | not built yet "
+                 "(M3 to M6 add them) |")
+        L.append(f"| History bootstrap (one time) | 2 to 3 min | {startup_s / 60:.1f} min |")
+        L.append("")
+        L.append("Ingest is the measured bottleneck of the platform: about 26k to 37k events/s "
+                 "per transform transaction, slower than the 40k to 80k estimated, mostly the "
+                 "lead lookups and lead-state updates against a growing `lead_dim`. At the "
+                 "measured rate a day leaves about 85 s of the 120 s target for the decision "
+                 "stages, and the SRE bar of 600 s has a wide margin even at a 3x slower box.")
+        L.append("")
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     Path(a.out).write_text("\n".join(L) + "\n")
     print("\n".join(L))

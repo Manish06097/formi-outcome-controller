@@ -179,3 +179,17 @@ def test_normalise_sim_url():
     assert normalise_sim_url("http://sim:80") == "http://sim"
     assert normalise_sim_url("http://host.docker.internal:8700") == \
         "http://host.docker.internal:8700"
+
+
+def test_proposal_state_check_matches_types(db):
+    """The proposal.state CHECK and types.PROPOSAL_STATES are the same set."""
+    from controller.types import IN_FLIGHT_STATES, PROPOSAL_STATES
+    s = db.create_run_schema(_fp(), "http://127.0.0.1:8700")
+    db._created.append(s)
+    db.open(s)
+    with db.tx() as conn:
+        for i, state in enumerate(sorted(PROPOSAL_STATES)):
+            _proposal(conn, f"s{i}", state, wf=100 + i)
+        idx = conn.execute("SELECT pg_get_indexdef('one_in_flight'::regclass)").fetchone()[0]
+    for state in IN_FLIGHT_STATES:
+        assert f"'{state}'" in idx

@@ -16,9 +16,8 @@ EXIT_FATAL = 3
 
 
 def main(argv: list[str] | None = None) -> int:
-    import os
     try:  # a missing dependency is a deployment error: restarting cannot fix it
-        from controller.loop.orchestrator import LoopOptions, Orchestrator
+        from controller.loop.orchestrator import Orchestrator
         from controller.settings import load_settings
     except ImportError as e:
         logging.basicConfig(level=logging.INFO)
@@ -26,7 +25,6 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_FATAL
     try:
         settings = load_settings()
-        options = LoopOptions.from_env(os.environ)
     except ValueError as e:
         logging.basicConfig(level=logging.INFO)
         logging.critical("invalid settings: %s", e)
@@ -35,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
                         stream=sys.stderr)
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    return Orchestrator(settings, options=options).run()
+    return Orchestrator(settings).run()
 
 
 if __name__ == "__main__":

@@ -19,6 +19,13 @@ from controller.reliability.faults import maybe_crash
 from controller.types import AGENT_DIMS, Config, Decision, Tx, WorkflowSpec, thaw
 
 _CLOCK = "(SELECT sim_minute FROM clock WHERE id = 1)"
+
+
+def config_version_subject(workflow_id: str, version: int) -> str:
+    """`audit_log.subject_id` of a config version's audit rows (`subject_type =
+    'config_version'`): the anchor `audit/explain.why_changed` starts a chain from (9.4)."""
+    return f"{workflow_id}@v{version}"
+
 _WF = "(SELECT wf FROM workflow WHERE workflow_id = %s)"
 
 

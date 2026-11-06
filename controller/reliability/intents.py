@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
 from controller.audit.writer import record, set_outcome, write_decision
+from controller.obs.alerts import raise_alert
 from controller.reliability.faults import maybe_crash
 from controller.simclient.client import SimClient
 from controller.simclient.errors import ApiError, NotFound, SimTransportError
@@ -82,6 +83,9 @@ class KindHandler:
     """(tx, intent): reconciliation found the call never took effect"""
     lost: Hook | None = None
     """(tx, intent, response): the effect happened but its result is lost"""
+    required: tuple[str, ...] = ()
+    """Request fields the lookup needs after a crash; `execute` refuses a request without them
+    before writing anything (ADR 0028: credit-spending kinds carry credits_before and cost)."""
 
 
 class IntentRegistry:
@@ -123,6 +127,10 @@ class IntentExecutor:
         raises the simulator's ApiError after recording it. On a transport failure the intent
         is reconciled at once; if the call did not take effect, `IntentAborted` is raised."""
         h = self._handler(kind)
+        missing = [f for f in h.required if payload.get(f) is None]
+        if missing:
+            raise ValueError(f"{kind} request {key} lacks {missing}: the reconciler cannot "
+                             "resolve it after a crash without them")
         maybe_crash(kind, "before_t1")
         with self.db.tx() as tx:
             prior = repos.intent_by_key(tx, key)
@@ -243,9 +251,9 @@ class Reconciler:
                     h.lost(tx, intent, look.response)
             else:
                 repos.finish_intent(tx, intent.intent_id, "unknown", look.response)
-                repos.raise_alert(tx, "INTENT_UNKNOWN", "page",
-                                  f"{intent.kind} {intent.idem_key}: the simulator contradicts "
-                                  f"our record ({dict(look.response)})")
+                raise_alert(tx, "INTENT_UNKNOWN", None, intent.idem_key,
+                            f"{intent.kind} {intent.idem_key}: the simulator contradicts "
+                            f"our record ({dict(look.response)})")
             if intent.decision_id is not None:
                 set_outcome(tx, intent.decision_id,
                             {"status": look.outcome, "via": "reconcile"})
@@ -338,6 +346,10 @@ def _apply_lookup(c: SimClient, i: Intent) -> Lookup:
     return Lookup("not_run", {"approval_status": a.status, "apply_by": a.apply_by})
 
 
+CREDIT_FIELDS = ("credits_before", "cost")
+"""Fields every credit-spending request (validation, suggest_fixes) must carry."""
+
+
 def _credits_lookup(c: SimClient, i: Intent) -> Lookup:
     """Validation and suggest-fixes have no idempotency key or listing: the request records the
     balance before the call and its cost; a balance that fell by the cost means the call ran
@@ -371,8 +383,10 @@ def default_registry() -> IntentRegistry:
     reg.register(KindHandler("submit_approval", _submit_call, _submit_lookup))
     reg.register(KindHandler("auto_apply", _auto_call, _auto_lookup))
     reg.register(KindHandler("apply", _apply_call, _apply_lookup))
-    reg.register(KindHandler("validation", _validation_call, _credits_lookup))
-    reg.register(KindHandler("suggest_fixes", _suggest_call, _credits_lookup))
+    reg.register(KindHandler("validation", _validation_call, _credits_lookup,
+                             required=CREDIT_FIELDS))
+    reg.register(KindHandler("suggest_fixes", _suggest_call, _credits_lookup,
+                             required=CREDIT_FIELDS))
     return reg
 
 

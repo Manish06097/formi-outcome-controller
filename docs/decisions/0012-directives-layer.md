@@ -42,6 +42,6 @@ Status: accepted (2026-11-06), milestone M3 (track T2; the loader is M0's, ADR 0
 
 ## Consequences
 - Ramps on memo-less tenants wait for the routine slot (the harm gate limits each step anyway).
-- `EffectivePolicy` lacks `pre_open_submits` and a few other fields, so the registry returns an
-  `ExtendedPolicy` subclass (contract change requested in the T2 report).
+- `EffectivePolicy` lacked `pre_open_submits` and a few other fields, so the registry returned an
+  `ExtendedPolicy` subclass. Resolved in step I1: the fields are on `EffectivePolicy` (ADR 0028).
 - The Northwind harm line is 1%, which halves the first exploration share (5.4).

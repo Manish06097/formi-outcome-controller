@@ -379,6 +379,35 @@ def _env_num(env: Mapping[str, str], name: str, default: float, cast: type = flo
     return default if v in (None, "") else cast(v)
 
 
+def _positive_or_none(env: Mapping[str, str], name: str) -> int | None:
+    v = env.get(name)
+    if v in (None, ""):
+        return None
+    n = int(v)
+    return n if n > 0 else None
+
+
+SyntheticMarker = tuple[str, str, int, int]
+"""(kind, workflow_id, from_minute, to_minute); kind is pending | approved."""
+
+
+def parse_synthetic_markers(raw: str | None) -> tuple[SyntheticMarker, ...]:
+    """`CTL_SYNTHETIC_MARKERS=pending:<wf>:<from>:<to>,approved:<wf>:<from>:<apply_by>`.
+    Raises ValueError on a malformed entry (a configuration error, exit 3)."""
+    out: list[SyntheticMarker] = []
+    for part in (raw or "").split(","):
+        if not part.strip():
+            continue
+        bits = part.strip().split(":")
+        if len(bits) != 4:
+            raise ValueError(f"CTL_SYNTHETIC_MARKERS entry {part!r} must be kind:wf:from:to")
+        kind, wf, a, b = bits
+        if kind not in ("pending", "approved"):
+            raise ValueError(f"CTL_SYNTHETIC_MARKERS kind {kind!r}")
+        out.append((kind, wf, int(a), int(b)))
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class EnvSettings:
     """Where to connect and what to run (DESIGN.md 11.3, 8.4, 10.2)."""
@@ -423,6 +452,14 @@ class EnvSettings:
     """CTL_FAULT=<kind>:<n>:<phase> crash injection (10.2)."""
     max_restarts: int = 20
     """CTL_MAX_RESTARTS (run.sh restart loop)."""
+    stop_after_steps: int | None = None
+    """CTL_STOP_AFTER_STEPS=n: exit 1 after n steps of this process (tests of resume)."""
+    synthetic_markers: tuple[SyntheticMarker, ...] = ()
+    """CTL_SYNTHETIC_MARKERS (test only): markers the step rule treats like a pending or
+    approved proposal of the store (DESIGN.md 15.1 M2)."""
+    prefetch_chunks: int = 1
+    """CTL_PREFETCH_CHUNKS=k: chunks the loader thread stages ahead of the transform (0 = none
+    ahead; staging still runs on the loader thread)."""
     no_docker: bool = False
     code_version: str = "dev"
     """CTL_CODE_VERSION (git sha baked into the image); stored on every decision row."""
@@ -473,6 +510,10 @@ class EnvSettings:
             engagement_model=model or d.engagement_model,
             fault=_env_str(env, "CTL_FAULT"),
             max_restarts=int(_env_num(env, "CTL_MAX_RESTARTS", d.max_restarts, int)),
+            stop_after_steps=_positive_or_none(env, "CTL_STOP_AFTER_STEPS"),
+            synthetic_markers=parse_synthetic_markers(env.get("CTL_SYNTHETIC_MARKERS")),
+            prefetch_chunks=max(0, int(_env_num(env, "CTL_PREFETCH_CHUNKS", d.prefetch_chunks,
+                                                int))),
             no_docker=_env_bool(env, "CTL_NO_DOCKER", d.no_docker),
             code_version=_env_str(env, "CTL_CODE_VERSION", default=d.code_version) or "dev",
             log_level=_env_str(env, "CTL_LOG_LEVEL", default=d.log_level) or d.log_level,

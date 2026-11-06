@@ -24,15 +24,15 @@ sequence makes that safe); 3 a fatal configuration error (run.sh does not restar
 from __future__ import annotations
 
 import logging
-import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from controller.audit.writer import record, write_decision
+from controller.audit.writer import config_version_subject, record, write_decision
 from controller.ingest.loader import reset_stage
 from controller.ingest.pipeline import IngestError, IngestPipeline
 from controller.loop.stepper import StopPlan, basic_policy, plan_state, plan_stop
+from controller.obs.alerts import raise_alert
 from controller.obs.metrics import Heartbeat, PhaseTimer, rss_mb
 from controller.reliability import faults
 from controller.reliability.intents import (IntentAborted, IntentExecutor, IntentRegistry,
@@ -60,11 +60,12 @@ class FatalConfig(RuntimeError):
     """A configuration error a restart cannot fix (exit 3)."""
 
 
-# =============================================================================== options and hooks
+# =============================================================================== markers and hooks
 
 @dataclass(frozen=True)
 class Marker:
-    """A synthetic governance marker for tests of the step rule (DESIGN.md 15.1 M2)."""
+    """A synthetic governance marker for tests of the step rule (DESIGN.md 15.1 M2), parsed from
+    `EnvSettings.synthetic_markers` (CTL_SYNTHETIC_MARKERS)."""
 
     kind: str
     """pending | approved"""
@@ -72,35 +73,6 @@ class Marker:
     from_minute: int
     to_minute: int
     """pending: active while from <= now < to. approved: apply_by = to."""
-
-
-@dataclass(frozen=True)
-class LoopOptions:
-    """Loop settings that are not in `EnvSettings` (local extension; contract change requested).
-
-    CTL_STOP_AFTER_STEPS=n: exit 1 after n steps of this process (tests of resume).
-    CTL_SYNTHETIC_MARKERS=pending:<wf>:<from>:<to>,approved:<wf>:<from>:<apply_by>: test-only
-        markers that the step rule treats like a pending or approved proposal.
-    CTL_PREFETCH_CHUNKS=k: chunks the loader thread stages ahead of the transform (default 1).
-    """
-
-    stop_after_steps: int | None = None
-    markers: tuple[Marker, ...] = ()
-    prefetch: int = 1
-
-    @classmethod
-    def from_env(cls, env: Mapping[str, str]) -> "LoopOptions":
-        stop = env.get("CTL_STOP_AFTER_STEPS")
-        markers = []
-        for part in (env.get("CTL_SYNTHETIC_MARKERS") or "").split(","):
-            if not part.strip():
-                continue
-            kind, wf, a, b = part.strip().split(":")
-            if kind not in ("pending", "approved"):
-                raise ValueError(f"CTL_SYNTHETIC_MARKERS kind {kind!r}")
-            markers.append(Marker(kind, wf, int(a), int(b)))
-        return cls(stop_after_steps=int(stop) if stop else None, markers=tuple(markers),
-                   prefetch=int(env.get("CTL_PREFETCH_CHUNKS") or 1))
 
 
 @dataclass
@@ -198,11 +170,10 @@ class Runtime:
 class Orchestrator:
     """`Orchestrator` of DESIGN.md 11.2."""
 
-    def __init__(self, settings: Settings, hooks: LoopHooks | None = None,
-                 options: LoopOptions | None = None):
+    def __init__(self, settings: Settings, hooks: LoopHooks | None = None):
         self.settings = settings
         self.hooks = hooks or LoopHooks()
-        self.options = options or LoopOptions.from_env(os.environ)
+        self.markers = tuple(Marker(*m) for m in settings.env.synthetic_markers)
         self.client = SimClient.from_settings(settings)
         self.db = Database.from_settings(settings)
         self.lock = AdvisoryLock(settings.env.dsn, settings.env.sim_url)
@@ -233,16 +204,15 @@ class Orchestrator:
             mirror = ConfigMirror(self.client, catalog, epoch)
             mirror.bootstrap(tx)
             if res.rejected:
-                repos.raise_alert(tx, "NEW_WORLD", "digest",
-                                  f"started fresh schema {res.schema}; rejected: " + "; ".join(
-                                      f"{r.schema}: {', '.join(r.failures)}"
-                                      for r in res.rejected))
+                raise_alert(tx, "NEW_WORLD", None, res.schema,
+                            f"started fresh schema {res.schema}; rejected: " + "; ".join(
+                                f"{r.schema}: {', '.join(r.failures)}" for r in res.rejected))
             self._step_no = repos.get_clock(tx).last_step_no
         registry = default_registry()
         ingest = IngestPipeline(self.db, self.client, int(epoch.epoch0.timestamp()),
                                 ident.state.tick_minutes, parser=env.ingest,
                                 loader_source=SimClient.from_settings(self.settings),
-                                prefetch=self.options.prefetch)
+                                prefetch=env.prefetch_chunks)
         executor = IntentExecutor(self.db, self.client, registry)
         self.rt = rt = Runtime(self.settings, self.db, self.client, ident, res.schema, catalog,
                                epoch, mirror, ingest, executor, registry, ident.state,
@@ -298,8 +268,8 @@ class Orchestrator:
         with self.db.tx() as tx:
             clock = repos.get_clock(tx)
             if clock.sim_minute != st.sim_minute:
-                repos.raise_alert(tx, "CLOCK_MISMATCH", "page",
-                                  f"our clock {clock.sim_minute}, simulator {st.sim_minute}")
+                raise_alert(tx, "CLOCK_MISMATCH", None, "clock",
+                            f"our clock {clock.sim_minute}, simulator {st.sim_minute}")
                 repos.set_clock(tx, st.sim_minute)
             self._step_no = repos.get_clock(tx).last_step_no
 
@@ -342,9 +312,9 @@ class Orchestrator:
                 if report.finished:
                     self._finish()
                     return EXIT_DONE
-                if self.options.stop_after_steps and steps >= self.options.stop_after_steps:
-                    log.warning("CTL_STOP_AFTER_STEPS=%d reached: exiting 1",
-                                self.options.stop_after_steps)
+                stop_after = self.settings.env.stop_after_steps
+                if stop_after and steps >= stop_after:
+                    log.warning("CTL_STOP_AFTER_STEPS=%d reached: exiting 1", stop_after)
                     return EXIT_RESTART
         except (FatalConfig, MigrationError, BadMinutes) as e:
             log.critical("fatal configuration error: %s", e)
@@ -410,7 +380,7 @@ class Orchestrator:
             pending = facts.pending.get(wf)
             approved = list(facts.approved_apply_by.get(wf, ()))
             has_pending = pending is not None
-            for m in self.options.markers:
+            for m in self.markers:
                 if m.workflow_id != wid:
                     continue
                 if m.kind == "pending" and m.from_minute <= now < m.to_minute:
@@ -434,8 +404,8 @@ class Orchestrator:
         if plan.overnight_jump:
             with self.db.tx() as tx:
                 if repos.local_approved_count(tx):
-                    repos.raise_alert(tx, "APPLY_AT_RISK", "page",
-                                      "overnight jump planned with a local APPROVED proposal")
+                    raise_alert(tx, "APPLY_AT_RISK", None, "overnight_jump",
+                                "overnight jump planned with a local APPROVED proposal")
         return plan
 
     # ------------------------------------------------------------------ ADVANCE
@@ -509,9 +479,9 @@ class Orchestrator:
         with self.db.tx() as tx:
             cur = repos.ingest_cursor(tx)
             if cur.max_event_id != state.last_event_id:
-                repos.raise_alert(tx, "INGEST_STALLED", "page",
-                                  f"ingested up to event {cur.max_event_id}, simulator at "
-                                  f"{state.last_event_id}")
+                raise_alert(tx, "INGEST_STALLED", None, "ingest",
+                            f"ingested up to event {cur.max_event_id}, simulator at "
+                            f"{state.last_event_id}")
         if cur.max_event_id != state.last_event_id:
             raise IngestError(f"ingest lag after catch-up: {cur.max_event_id} vs "
                               f"{state.last_event_id}")
@@ -526,9 +496,11 @@ class Orchestrator:
             if not events:
                 return []
             changes = rt.mirror.refresh(tx, events)
+            mark_refreshed(tx, events)
             for ch in changes:
                 record(tx, wf=ch.workflow_id, actor="controller", action="config_refreshed",
-                       subject=("config_version", f"{ch.workflow_id}:{ch.version}"),
+                       subject=("config_version",
+                                config_version_subject(ch.workflow_id, ch.version)),
                        summary=f"{ch.workflow_id} v{ch.version} by {ch.actor} "
                                f"({ch.body_source} body): {', '.join(ch.changed_dims)}",
                        details={"changed_paths": [list(p) for p in ch.changed_paths],
@@ -574,20 +546,27 @@ class Orchestrator:
 
 
 def unrefreshed_config_events(tx: Tx) -> list[ConfigEvent]:
-    """config_changed events whose version has no `config_refreshed` audit row yet."""
+    """config_changed events REFRESH has not handled yet (`refreshed_minute IS NULL`)."""
     rows = tx.execute(
         """SELECT e.event_id, w.workflow_id, e.version, e.actor, e.changed_dims, e.proposal_id,
                   e.approval_id, e.minute
            FROM config_event e JOIN workflow w USING (wf)
-           WHERE NOT EXISTS (SELECT 1 FROM audit_log a WHERE a.action = 'config_refreshed'
-                             AND a.subject_type = 'config_version'
-                             AND a.subject_id = w.workflow_id || ':' || e.version)
+           WHERE e.refreshed_minute IS NULL
            ORDER BY e.event_id""").fetchall()
     return [ConfigEvent(event_id=r[0], workflow_id=r[1], version=r[2], actor=r[3],
                         changed_dims=tuple(r[4] or ()), proposal_id=r[5], approval_id=r[6],
                         minute=r[7]) for r in rows]
 
 
-__all__ = ["Orchestrator", "LoopHooks", "LoopOptions", "Runtime", "StageCounts", "Marker",
+def mark_refreshed(tx: Tx, events: list[ConfigEvent]) -> None:
+    """Stamp handled events with the clock minute, in REFRESH's transaction (migration 0011).
+    The clock is the same after a crash and resume (resume refreshes before the next advance),
+    so the column is identical to a clean run's."""
+    tx.execute("""UPDATE config_event SET refreshed_minute = (SELECT sim_minute FROM clock
+                                                              WHERE id = 1)
+                  WHERE event_id = ANY(%s)""", ([e.event_id for e in events],))
+
+
+__all__ = ["Orchestrator", "LoopHooks", "Runtime", "StageCounts", "Marker",
            "FatalConfig", "EXIT_DONE", "EXIT_RESTART", "EXIT_FATAL", "ReconcileReport",
            "IngestReport"]

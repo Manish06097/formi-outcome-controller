@@ -32,6 +32,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable
 
+from controller.audit.writer import config_version_subject
 from controller.types import label
 
 DAY = 1440
@@ -76,11 +77,6 @@ def parse_when(text: str | int) -> int:
 
 def when(minute: int | None) -> str | None:
     return None if minute is None else label(minute)
-
-
-def config_version_subject(workflow_id: str, version: int) -> str:
-    """`audit_log.subject_id` of a config version's audit row (see module docstring)."""
-    return f"{workflow_id}@v{version}"
 
 
 def now_minute(conn: Any) -> int | None:

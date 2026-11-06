@@ -114,3 +114,18 @@ def test_register_lists_every_field():
     assert len(reg) == len(dataclasses.fields(Thresholds))
     assert {r["name"] for r in reg if not r["tunable"]} >= {"grader_engagement_line",
                                                             "grader_did_line", "max_cohorts"}
+
+
+def test_loop_knobs_live_in_env_settings():
+    """ADR 0028: the loop's test and tuning knobs are EnvSettings fields (one parser)."""
+    e = EnvSettings.from_env({"CTL_STOP_AFTER_STEPS": "5", "CTL_PREFETCH_CHUNKS": "0",
+                              "CTL_SYNTHETIC_MARKERS": "pending:wf_a:600:900, approved:wf_b:0:90"})
+    assert e.stop_after_steps == 5 and e.prefetch_chunks == 0
+    assert e.synthetic_markers == (("pending", "wf_a", 600, 900), ("approved", "wf_b", 0, 90))
+    d = EnvSettings.from_env({})
+    assert (d.stop_after_steps, d.prefetch_chunks, d.synthetic_markers) == (None, 1, ())
+    for bad in ("held:wf:0:1", "pending:wf:0", "pending:wf:x:1"):
+        with pytest.raises(ValueError):
+            EnvSettings.from_env({"CTL_SYNTHETIC_MARKERS": bad})
+    # not decision inputs: the hash ignores them
+    assert Settings(env=e).settings_hash() == Settings(env=d).settings_hash()

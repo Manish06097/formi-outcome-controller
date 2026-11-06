@@ -6,7 +6,8 @@ from __future__ import annotations
 import pytest
 
 from controller.simclient import SimClient
-from tests.e2e.platform.helpers import SHORT, done_advances, query, registry, run_controller
+from tests.e2e.platform.helpers import (REPO, SHORT, done_advances, query, registry,
+                                        run_controller)
 
 pytestmark = [pytest.mark.e2e, pytest.mark.pg]
 
@@ -45,7 +46,11 @@ def test_controller_restart_resumes_simulator_restart_starts_fresh(sim_factory, 
     assert new != schema and new.rsplit("_", 1)[1] == "2"
     st = SimClient(sim2.url).state()
     assert query(db_dsn, new, "SELECT sum(events) FROM ingested_chunk") == [(st.last_event_id,)]
-    alerts = query(db_dsn, new, "SELECT code, message FROM alert")
+    alerts = query(db_dsn, new, "SELECT code, message, severity, runbook FROM alert")
     assert alerts and alerts[0][0] == "NEW_WORLD" and schema in alerts[0][1]
+    # the page follows the alert catalogue and its runbook link resolves (ADR 0028)
+    runbook = (REPO / "docs" / "RUNBOOK.md").read_text()
+    assert alerts[0][2] == "page" and alerts[0][3] == "docs/RUNBOOK.md#NEW_WORLD"
+    assert f'<a id="{alerts[0][3].split("#")[1]}"></a>' in runbook
     # the old world's data is kept for audit
     assert len(done_advances(db_dsn, schema)) == 10

@@ -29,12 +29,13 @@ import threading
 from dataclasses import dataclass
 from typing import Callable
 
+from controller.types import FaultKind
+
 log = logging.getLogger(__name__)
 
 EXIT_CODE = 137
-KNOWN_KINDS = frozenset({"advance", "submit_approval", "auto_apply", "apply", "validation",
-                         "suggest_fixes", "chunk_transform", "chunk_copy", "audit_write",
-                         "bootstrap"})
+KNOWN_KINDS: frozenset[str] = frozenset(FaultKind.__args__)  # type: ignore[attr-defined]
+"""Every crash point kind; `types.FaultKind` is the one list."""
 
 
 @dataclass(frozen=True)

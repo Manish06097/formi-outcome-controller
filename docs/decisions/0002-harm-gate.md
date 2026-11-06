@@ -64,6 +64,6 @@ What the gate implies, computed (and checked by `tests/unit/test_harm_gate.py`):
   posterior noise), inside the 2.5% design tail. Lowering alpha_H trades that for slower ramps.
 - P0 prompt fixes are the one exemption (7.1): an unsafe prompt is a compliance failure, so its
   gate is the safety verdict plus the guardrail check.
-- The gate needs the active-lead population and cell features in the snapshot. Those are a
-  local extension of `WorkflowSnapshot` (`snapshot.LearningSnapshot`), requested as a contract
-  change.
+- The gate needs the active-lead population and cell features in the snapshot. They started as
+  a local extension (`snapshot.LearningSnapshot`) and are `WorkflowSnapshot` fields since step I1
+  (ADR 0028).

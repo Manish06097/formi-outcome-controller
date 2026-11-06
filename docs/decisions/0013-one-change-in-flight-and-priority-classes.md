@@ -44,5 +44,5 @@ Status: accepted (2026-11-06), milestone M3 (track T2)
 - A drain behind a pending P0a waits up to `lat_hi + 2 x tick`; above 2h it pages (13.4).
 - The e2e tests show the operational part auto-applied at the slot and the approval's
   `base_version` equal to that new version, with zero `apply_conflict`.
-- `Proposal` has no `p0_rank` field; the builder writes it into the request evidence and
-  `lifecycle.p0_rank_of` reads it back (contract change requested).
+- `Proposal.p0_rank` is a field and a column (migration 0009, ADR 0028); before step I1 it
+  travelled in the request evidence and `lifecycle.p0_rank_of` read it back.

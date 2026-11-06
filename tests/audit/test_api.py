@@ -164,7 +164,11 @@ def test_post_hold_then_release(client, world):
     holds = client.get("/supervisor/northwind_life").json()["workflows"][1]["holds"]
     assert [h["hold_id"] for h in holds] == [hold["hold_id"]]
     r = client.post(f"/supervisor/holds/{hold['hold_id']}/release", json={"released_by": "Asha"})
-    assert r.status_code == 200
+    assert r.status_code == 200 and r.json()["released_by"] == "Asha"
+    with psycopg.connect(world["dsn"]) as c:     # ADR 0028: a column, the reason untouched
+        row = c.execute(sql.SQL("SELECT reason, released_by FROM {}.hold WHERE hold_id = %s")
+                        .format(sql.Identifier(world["schema"])), (hold["hold_id"],)).fetchone()
+    assert row == ("board review", "Asha")
     assert client.post(f"/supervisor/holds/{hold['hold_id']}/release",
                        json={"released_by": "Asha"}).status_code == 404
     assert client.get("/supervisor/northwind_life").json()["workflows"][1]["holds"] == []

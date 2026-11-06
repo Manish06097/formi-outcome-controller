@@ -216,14 +216,13 @@ def create_app(dsn: str | None = None, schema: str | None = None,
         with api.tx(write=True) as conn:
             now = explain.now_minute(conn) or 0
             r = conn.execute(
-                "UPDATE hold SET released_minute = %s, "
-                "reason = coalesce(reason, '') || %s "
+                "UPDATE hold SET released_minute = %s, released_by = %s "
                 "WHERE hold_id = %s AND released_minute IS NULL RETURNING hold_id",
-                (now, f" [released by {body.released_by} at {explain.label(now)}]",
-                 hold_id)).fetchone()
+                (now, body.released_by, hold_id)).fetchone()
             if r is None:
                 raise HTTPException(404, f"no open hold {hold_id}")
-            return {"hold_id": hold_id, "released": explain.label(now)}
+            return {"hold_id": hold_id, "released": explain.label(now),
+                    "released_by": body.released_by}
 
     @app.get("/explain/change")
     def explain_change(workflow: str, at: str) -> dict[str, Any]:

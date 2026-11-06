@@ -4,7 +4,7 @@ overnight jump happens before approver close + tick, and with a local APPROVED m
 no overnight jump at all and a stop lands on apply_by - tick.
 
 The markers (CTL_SYNTHETIC_MARKERS) are test-only: the step rule treats them exactly like a
-pending or approved proposal of the store (orchestrator.LoopOptions).
+pending or approved proposal of the store (settings.EnvSettings.synthetic_markers).
 """
 from __future__ import annotations
 

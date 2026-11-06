@@ -82,8 +82,8 @@ IntentKind = Literal["advance", "submit_approval", "auto_apply", "apply", "valid
                      "suggest_fixes"]
 IntentStatus = Literal["started", "done", "failed", "aborted", "unknown"]
 FaultKind = Literal["advance", "submit_approval", "auto_apply", "apply", "validation",
-                    "suggest_fixes", "chunk_transform", "audit_write"]
-FaultPhase = Literal["before_t1", "after_t1", "after_http", "in_t2"]
+                    "suggest_fixes", "chunk_transform", "chunk_copy", "bootstrap", "audit_write"]
+FaultPhase = Literal["before_t1", "after_t1", "after_http", "in_t2", "after_t2", "mid"]
 DidStatus = Literal["unknown", "probing", "healthy", "unhealthy", "degraded", "suspect"]
 ArmState = Literal["live", "frozen", "removed", "futile", "winner", "control"]
 WinnerState = Literal["declared", "promoted", "rolled_back"]
@@ -1712,6 +1712,8 @@ class Hold:
     from_minute: Minute
     until_minute: Minute | None
     released_minute: Minute | None = None
+    released_by: str | None = None
+    """`hold.released_by` (migration 0012): who released it through the API."""
 
     def active(self, now: Minute) -> bool:
         if self.released_minute is not None and self.released_minute <= now:

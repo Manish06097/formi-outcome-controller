@@ -2,8 +2,9 @@
 
 Owner: track T1 (milestones M1, M2). Implements DESIGN.md 3.2 for the tables the platform owns:
 the workflow catalog, the clock, the ingest cursor, config versions and their cohort codes,
-intents, the bootstrap marker, loop steps, alerts and the heartbeat. Other tracks own the SQL of
-their own tables; the read helpers here that touch them (`plan_facts`) are read-only.
+intents, the bootstrap marker, loop steps and the heartbeat (alerts are written by
+`obs/alerts.py`). Other tracks own the SQL of their own tables; the read helpers here that touch
+them (`plan_facts`) are read-only.
 
 Every function takes an open connection (usually the one of a `Database.tx()` block) and never
 commits: the caller's transaction decides atomicity. Minutes are simulated minutes.
@@ -379,27 +380,6 @@ def insert_loop_step(tx: Tx, r: StepReport, orphan_calls: int, rss_mb: int | Non
         (r.step_no, r.from_minute, r.to_minute, Jsonb(thaw(r.phase_ms)), r.chunks, r.events,
          orphan_calls, r.decisions, r.proposals_submitted, r.applies, r.credits_remaining,
          rss_mb, db_bytes))
-
-
-def raise_alert(tx: Tx, code: str, severity: str, message: str, wf: int | None = None,
-                sim_minute: int | None = None) -> int:
-    """Open an alert unless one with the same code and workflow is already open. Every alert
-    carries its runbook anchor `docs/RUNBOOK.md#<code>` (DESIGN.md 9.2, 9.5)."""
-    r = tx.execute("""SELECT alert_id FROM alert WHERE code = %s AND wf IS NOT DISTINCT FROM %s
-                      AND closed_wall IS NULL""", (code, wf)).fetchone()
-    if r:
-        return int(r[0])
-    r = tx.execute(
-        """INSERT INTO alert (severity, code, wf, sim_minute, message, runbook)
-           VALUES (%s, %s, %s, coalesce(%s, (SELECT sim_minute FROM clock WHERE id = 1)), %s, %s)
-           RETURNING alert_id""",
-        (severity, code, wf, sim_minute, message, f"docs/RUNBOOK.md#{code.lower()}")).fetchone()
-    return int(r[0])
-
-
-def close_alerts(tx: Tx, code: str, wf: int | None = None) -> None:
-    tx.execute("""UPDATE alert SET closed_wall = now() WHERE code = %s
-                  AND wf IS NOT DISTINCT FROM %s AND closed_wall IS NULL""", (code, wf))
 
 
 def beat(conn: Tx, pid: int, step_no: int | None) -> None:

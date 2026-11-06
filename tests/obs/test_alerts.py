@@ -6,6 +6,7 @@ import re
 from dataclasses import replace
 from pathlib import Path
 
+import psycopg
 import pytest
 
 from controller.obs import alerts
@@ -148,6 +149,13 @@ def test_event_alerts_dedupe_and_digests_are_recorded_closed(conn):
     assert d is not None
     open_codes = [x["code"] for x in alerts.open_alerts(conn)]
     assert open_codes.count("GOV_INVARIANT") == 2 and "SUPERVISOR_EDIT" not in open_codes
+    # ADR 0028: the subject is its own column and the message is the text as given
+    row = [x for x in alerts.open_alerts(conn) if x["alert_id"] == a][0]
+    assert (row["dedupe_key"], row["message"]) == ("p-17", "403 on auto-apply")
+    with pytest.raises(psycopg.errors.UniqueViolation):     # the index, not the writer, decides
+        with conn.transaction():
+            conn.execute("INSERT INTO alert (severity, code, wf, message, runbook, dedupe_key) "
+                         "VALUES ('page', 'GOV_INVARIANT', 1, 'dup', 'r', 'p-17')")
     # condition sync never closes event alerts
     alerts.sync(conn, [])
     assert [x["code"] for x in alerts.open_alerts(conn)].count("GOV_INVARIANT") == 2

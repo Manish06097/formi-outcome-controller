@@ -35,8 +35,9 @@ Status: accepted (2026-11-06), milestone M2
    tracks attach proposal, incident and credit transitions. The advance's `done` hook commits
    the simulator's clock with the intent, so clock and intent can never disagree after a crash.
 4. **Ingest needs no intent**: a chunk's facts, rollups and `ingested_chunk` row commit together
-   (ADR 0016), and REFRESH works from `config_event` rows that have no `config_refreshed` audit
-   row yet, so events ingested by a process that died before its REFRESH are still handled.
+   (ADR 0016), and REFRESH works from `config_event` rows whose `refreshed_minute` is NULL
+   (stamped in REFRESH's own transaction; before step I1 it was a `config_refreshed` audit row,
+   ADR 0028), so events ingested by a process that died before its REFRESH are still handled.
 5. **Fault injection at every boundary**: `CTL_FAULT=<kind>:<n>:<phase>` exits with 137 (as
    SIGKILL) the n-th time a point is reached; a fault fires once per run (an audit row records it,
    a restarted process stays disarmed). Points: every intent kind at before_t1, after_t1,

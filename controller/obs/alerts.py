@@ -16,7 +16,9 @@ Never an alert on a single call, a routine submission or an auto-applied schedul
 (9.2): every condition below is over populations, proposals, incidents or the loop itself.
 
 Alerts are de-duplicated by (code, workflow, subject): the subject is the thing the alert is
-about (a proposal id, an incident id, "ingest"), stored as the message prefix `[subject] `.
+about (a proposal id, an incident id, "ingest"), stored in `alert.dedupe_key`; the unique index
+`alert_open_key` (migration 0012, ADR 0028) allows one open row per key. This module is the only
+alert writer: the loop, ingest and the reconciler raise their alerts through `raise_alert` too.
 """
 from __future__ import annotations
 
@@ -70,6 +72,11 @@ CODES: dict[str, AlertCode] = {c.code: c for c in (
     AlertCode("CRASH_LOOP", "page", "condition", "more than 3 restarts in 10 minutes"),
     AlertCode("SIM_UNREACHABLE", "page", "condition",
               "idempotent GETs to the simulator have been retrying for 5 minutes"),
+    AlertCode("CLOCK_MISMATCH", "page", "event",
+              "after reconciliation our clock differs from the simulator's; we follow the "
+              "simulator"),
+    AlertCode("INTENT_UNKNOWN", "page", "event",
+              "reconciliation could not tell whether a side effect happened"),
     # ------------------------------------------------------------------ morning digest (right column)
     AlertCode("APPROVAL_REJECTED", "digest", "event",
               "an approver rejected a request (re-queued with fresh data automatically)"),
@@ -261,19 +268,16 @@ def evaluate(inputs: AlertInputs, thresholds: Any) -> list[Firing]:
 
 # =============================================================================== store
 
-def _message(subject: str, text: str) -> str:
-    return f"[{subject}] {text}"
-
-
-def _subject(message: str) -> str:
-    if message.startswith("[") and "] " in message:
-        return message[1:message.index("] ")]
-    return ""
+_INSERT = ("INSERT INTO alert (severity, code, wf, sim_minute, message, runbook, dedupe_key, "
+           "closed_wall) VALUES (%s, %s, %s, coalesce(%s, (SELECT sim_minute FROM clock WHERE "
+           "id = 1)), %s, %s, %s, CASE WHEN %s THEN now() END) "
+           "ON CONFLICT (code, coalesce(wf, -1), dedupe_key) WHERE closed_wall IS NULL "
+           "DO NOTHING RETURNING alert_id")
 
 
 def open_alerts(conn: Any) -> list[dict[str, Any]]:
-    cur = conn.execute("SELECT alert_id, severity, code, wf, sim_minute, message, runbook "
-                       "FROM alert WHERE closed_wall IS NULL ORDER BY alert_id")
+    cur = conn.execute("SELECT alert_id, severity, code, wf, sim_minute, message, runbook, "
+                       "dedupe_key FROM alert WHERE closed_wall IS NULL ORDER BY alert_id")
     cols = [c.name for c in cur.description]
     return [dict(zip(cols, r)) for r in cur.fetchall()]
 
@@ -281,21 +285,13 @@ def open_alerts(conn: Any) -> list[dict[str, Any]]:
 def raise_alert(tx: Any, code: str, wf: int | None, subject: str, text: str,
                 sim_minute: int | None = None) -> int | None:
     """Record an event alert. Pages stay open until closed; digests are recorded closed.
-    Returns the new alert_id, or None if the same (code, wf, subject) is already open."""
+    `sim_minute` defaults to the controller's clock. Returns the new alert_id, or None if the
+    same (code, wf, subject) is already open (the unique index decides, so two writers in one
+    race still open one row)."""
     c = CODES[code]
-    msg = _message(subject, text)
-    if c.severity == "page":
-        prefix = _message(subject, "")
-        dup = tx.execute("SELECT alert_id FROM alert WHERE closed_wall IS NULL AND code = %s "
-                         "AND wf IS NOT DISTINCT FROM %s AND left(message, %s) = %s",
-                         (code, wf, len(prefix), prefix)).fetchone()
-        if dup:
-            return None
-    row = tx.execute(
-        "INSERT INTO alert (severity, code, wf, sim_minute, message, runbook, closed_wall) "
-        "VALUES (%s, %s, %s, %s, %s, %s, CASE WHEN %s THEN now() END) RETURNING alert_id",
-        (c.severity, code, wf, sim_minute, msg, c.runbook, c.severity == "digest")).fetchone()
-    return int(row[0])
+    row = tx.execute(_INSERT, (c.severity, code, wf, sim_minute, text, c.runbook, subject,
+                               c.severity == "digest")).fetchone()
+    return None if row is None else int(row[0])
 
 
 def close_alert(tx: Any, alert_id: int) -> bool:
@@ -313,7 +309,7 @@ def sync(tx: Any, firings: Iterable[Firing], sim_minute: int | None = None) -> d
     for a in open_alerts(tx):
         if a["code"] not in CONDITION_CODES:
             continue
-        key = (a["code"], a["wf"], _subject(a["message"]))
+        key = (a["code"], a["wf"], a["dedupe_key"])
         if key in want and key not in have:
             have[key] = a["alert_id"]
         else:
@@ -324,10 +320,8 @@ def sync(tx: Any, firings: Iterable[Firing], sim_minute: int | None = None) -> d
         if key in have:
             continue
         c = CODES[f.code]
-        tx.execute("INSERT INTO alert (severity, code, wf, sim_minute, message, runbook) "
-                   "VALUES (%s, %s, %s, %s, %s, %s)",
-                   (c.severity, f.code, f.wf, sim_minute, _message(f.subject, f.message),
-                    c.runbook))
+        tx.execute(_INSERT, (c.severity, f.code, f.wf, sim_minute, f.message, c.runbook,
+                             f.subject, False))
         opened.append(key)
     return {"opened": opened, "closed": closed}
 

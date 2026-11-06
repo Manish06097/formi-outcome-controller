@@ -274,7 +274,8 @@ def _default_does_not_reach(conn: Any, wf: int, version: int | None) -> list[dic
 
 def _holds(conn: Any, wf: int, now: int) -> list[dict[str, Any]]:
     rows = fetch_all(conn.execute(
-        "SELECT hold_id, set_by, reason, from_minute, until_minute, released_minute FROM hold "
+        "SELECT hold_id, set_by, reason, from_minute, until_minute, released_minute, released_by "
+        "FROM hold "
         "WHERE wf = %s AND (released_minute IS NULL OR released_minute > %s) "
         "AND (until_minute IS NULL OR until_minute > %s) ORDER BY hold_id", (wf, now, now)))
     for r in rows:

@@ -187,6 +187,35 @@ retrying with backoff; nothing is written while the simulator is unreachable.
 **Do:** restart the simulator only if it is truly dead, knowing a restarted simulator is a new
 world (`NEW_WORLD`). A slow simulator under load recovers on its own.
 
+<a id="CLOCK_MISMATCH"></a>
+### CLOCK_MISMATCH
+
+**Means:** after reconciling every open intent at start, our `clock.sim_minute` still differs from
+`/sim/state`. The advance protocol commits the clock with the advance result, so this means the
+store contradicts the contract. The controller adopted the simulator's minute (an advance is
+relative and cannot be undone) and carried on.
+
+**Look first:** the newest `intent` rows of kind `advance` and their status; `audit_log` rows with
+`action = 'intent_reconciled'`; `loop_step` around the last minute we recorded.
+
+**Do:** check whether something other than this controller advanced the simulator (a second
+process, a manual `POST /sim/advance`). If not, treat it as a bug in the advance protocol and keep
+the store for the post-mortem.
+
+<a id="INTENT_UNKNOWN"></a>
+### INTENT_UNKNOWN
+
+**Means:** reconciliation could not tell whether a side effect happened: the simulator's answer
+matched neither "it ran" nor "it never ran" (for example a credit balance that moved by a
+different amount than the call costs). The intent is marked `unknown` and is never retried.
+
+**Look first:** the intent row (`SELECT * FROM intent WHERE idem_key = '<subject>'`), its
+`request` and `response`, and the simulator's current state for that kind (approvals listing,
+config history, `/sim/state` credits).
+
+**Do:** decide by hand whether the effect happened, then mark the owning proposal or validation
+run accordingly. Look for a second writer to the simulator.
+
 ---
 
 ## Digest (handled automatically)

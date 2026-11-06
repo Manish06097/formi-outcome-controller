@@ -184,6 +184,15 @@ def test_routine_requests_only_at_slot_minutes(world):
             assert all(b - a >= 2 * 1440 for a, b in zip(mins, mins[1:])), (wf, mins)
 
 
+def test_requests_count_the_leads_they_affect(world):
+    """6.6: `affected_leads` counts active leads in the changed cells plus their share of the
+    next batch; every change of the probe learner reaches leads, so none may claim zero."""
+    rows = query(world["dsn"], world["schema"],
+                 """SELECT proposal_id, affected_leads FROM proposal
+                    WHERE state NOT IN ('discarded') AND affected_leads <= 0""")
+    assert rows == [], rows
+
+
 def test_no_lost_slot_and_no_governance_page(world):
     release = dict(world["store"]["release"])
     assert release.get("no_safe_window", 0) == 0, release

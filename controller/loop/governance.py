@@ -51,6 +51,7 @@ from controller.types import (DEFAULT_COHORT, IN_FLIGHT_STATES, CohortDef, Confi
                               ConfigChange, Decision, DidState, EffectivePolicy, FrozenDict,
                               Hold, PatchRequest, Proposal, Tx, WorkflowSnapshot, canonical_json,
                               freeze, thaw)
+from controller.world.configs import load_cells
 from controller.world.directives import load_directives
 from controller.world.registry import WorkflowRegistry
 
@@ -177,9 +178,30 @@ class GovernanceHooks(LoopHooks):
                      or r.applied_minute > self.now - SCHEDULE_REVERT_LOOKBACK_MIN)]
 
     def _build_context(self, wf: str) -> BuildContext:
+        """What the request builder needs for the affected-leads count (6.6): the cells, the
+        active leads in each, and each cell's share of new leads (first attempts per cell over
+        the history days, else over our own days). Posterior replays are wired with the
+        learners that own them."""
         spec = self.rt.catalog.spec(wf)
+        code = self.rt.catalog.code(wf)
+        with self.scope.tx() as tx:
+            cells = tuple(load_cells(tx))
+            active = {int(c): int(n) for c, n in tx.execute(
+                """SELECT cell, count(*) FROM lead_dim WHERE wf = %s AND state = 0
+                   AND cell IS NOT NULL GROUP BY cell""", (code,))}
+            first = tx.execute("""SELECT cell, sum(dials) FILTER (WHERE sim_day < 0),
+                                         sum(dials) FROM r_pickup
+                                  WHERE wf = %s AND attempt_bucket = 1 GROUP BY cell""",
+                               (code,)).fetchall()
+        hist = {int(c): float(h or 0) for c, h, _ in first}
+        if sum(hist.values()) <= 0:
+            hist = {int(c): float(a or 0) for c, _, a in first}
+        total = sum(hist.values())
+        share = {c: v / total for c, v in hist.items()} if total > 0 else {}
         return BuildContext(primary_kpi=spec.objective.primary, batch_size=spec.daily_batch.size,
-                            mid_flight=spec.mid_flight)
+                            mid_flight=spec.mid_flight, cells=cells,
+                            active_by_cell=FrozenDict(active),
+                            hist_share_by_cell=FrozenDict(share))
 
     def _decision(self, wf: str | None, module: str, kind: str, rule: str,
                   inputs: Mapping[str, Any], outcome: Mapping[str, Any] | None = None) -> Decision:

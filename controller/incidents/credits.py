@@ -4,7 +4,7 @@ Owner: track T4 (milestone M6). Implements DESIGN.md 7.2 and ADR 0021.
 
     C0 = credits_remaining at start (API);  K = largest prompt catalog among the workflows (API)
     W  = 13 K (+ K if the client gate is tight)          worst incident (FULL verdicts on the new
-                                                         prompt and every candidate, plus one
+         (+ 3 for the suggest-fixes call, 17.1)          prompt and every candidate, plus one
                                                          evidence run per candidate if tight)
     R  = min(0.8 C0, max(0.3 C0, 2 W))   incident reserve, shared across tenants
     S  = min(0.25 C0, C0 - R)            D0 screen pool, split across tenants by workflow count
@@ -33,9 +33,11 @@ INCIDENT_PURPOSES = frozenset({"verdict_full", "verdict_cusum", "verdict_lkg", "
 """Purposes that may spend the incident reserve R (only after a detector fired, 7.2)."""
 
 
-def worst_incident(k: int, tight: bool, t: Thresholds) -> float:
-    """W = 13 + 13 (K - 1) (+ K if tight) = 13 K (+ K)."""
-    return t.credit_full_verdict * k + (k if tight else 0)
+def worst_incident(k: int, tight: bool, t: Thresholds, llm_suggest: bool = False) -> float:
+    """W = 13 + 13 (K - 1) (+ K if tight) = 13 K (+ K), plus the one suggest-fixes call of
+    DESIGN.md 17.1 (3 credits) when that call is enabled."""
+    return (t.credit_full_verdict * k + (k if tight else 0)
+            + (t.cost_suggest_fixes * t.llm_suggest_per_incident if llm_suggest else 0))
 
 
 def worst_incident_low(k: int, tight: bool, t: Thresholds) -> float:
@@ -61,10 +63,12 @@ class PoolPlan:
 
 
 def plan_pools(c0: float, k: int, tight: bool, workflows_by_tenant: Mapping[str, int],
-               t: Thresholds | None = None) -> PoolPlan:
-    """The ordered pools of 7.2. S is split across tenants by workflow count (C15 envelope)."""
+               t: Thresholds | None = None, llm_suggest: bool = True) -> PoolPlan:
+    """The ordered pools of 7.2. S is split across tenants by workflow count (C15 envelope).
+    `llm_suggest` (settings `CTL_LLM_SUGGEST`, on by default per 17.1) adds the per-incident
+    suggest-fixes call to W, so the reserve covers every credit one worst incident spends."""
     t = t or Thresholds()
-    w = worst_incident(k, tight, t)
+    w = worst_incident(k, tight, t, llm_suggest)
     r = min(t.credit_reserve_max_frac * c0, max(t.credit_reserve_min_frac * c0,
                                                 t.credit_reserve_worst_mult * w))
     s = max(0.0, min(t.credit_screen_frac * c0, c0 - r))

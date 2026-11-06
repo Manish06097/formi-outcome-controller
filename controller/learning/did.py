@@ -458,16 +458,19 @@ class DidHealthModel:
         for n in probes:
             out[n] = cur.get(n, 0.0) if n in probing and cur.get(n, 0.0) > 0 else s
             out[n] = min(out[n], s)
-        for n in suspect:
-            out[n] = cur[n]
-        rest = 1.0 - sum(out.values())
         if healthy:
+            for n in suspect:          # a suspect DID keeps its share until alarm or clear
+                out[n] = cur[n]
+            rest = 1.0 - sum(out.values())
             weights = self._healthy_weights(healthy, states)
             for n in healthy:
                 out[n] = out.get(n, 0.0) + rest * weights[n]
             parts["split"] = "proportional" if len(set(weights.values())) > 1 else "equal"
         else:
+            # no healthy DID: the established DIDs (suspect, degraded, ...) keep their relative
+            # mix, scaled to make room for the probes; nothing moves onto unknown DIDs beyond s
             parts["no_healthy_did"] = True
+            rest = 1.0 - sum(out.values())
             keep = {n: w for n, w in cur.items() if n not in out and w > 0
                     and states.get(n, DidState("", n, "unknown")).status not in ("unknown",)}
             tot = sum(keep.values())

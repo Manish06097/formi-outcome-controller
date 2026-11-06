@@ -16,7 +16,8 @@ T = Thresholds()
                                            (200, 130, 50, 20, "normal"),
                                            (400, 130, 100, 170, "normal")])
 def test_pool_table_of_7_2(c0, r, s, u, mode):
-    plan = plan_pools(c0, k=5, tight=False, workflows_by_tenant={"a": 2, "b": 1})
+    plan = plan_pools(c0, k=5, tight=False, workflows_by_tenant={"a": 2, "b": 1},
+                      llm_suggest=False)
     assert plan.w == 65
     assert (plan.r, plan.s, plan.u) == pytest.approx((r, s, u))
     assert plan.start_mode == mode
@@ -24,17 +25,25 @@ def test_pool_table_of_7_2(c0, r, s, u, mode):
     assert plan.s_by_tenant["a"] == pytest.approx(2 * s / 3)
 
 
+def test_section_17_suggest_call_is_part_of_the_worst_incident():
+    plan = plan_pools(200, 5, False, {"a": 1})          # CTL_LLM_SUGGEST on (the default)
+    assert plan.w == 68
+    assert (plan.r, plan.s, plan.u) == pytest.approx((136, 50, 14))
+    assert plan_pools(84, 5, False, {"a": 1}).start_mode == "low"     # 0.8 x 84 < 68
+    assert plan_pools(85, 5, False, {"a": 1}).start_mode == "normal"
+
+
 def test_worst_incident_with_a_tight_gate_and_low_mode_cost():
     assert worst_incident(5, tight=True, t=T) == 70
     assert worst_incident_low(5, tight=False, t=T) == 15
     assert worst_incident_low(5, tight=True, t=T) == 20
     # LOW from the start whenever 0.8 C0 < W: C0 < 82 at K = 5
-    assert plan_pools(81, 5, False, {"a": 1}).start_mode == "low"
-    assert plan_pools(82, 5, False, {"a": 1}).start_mode == "normal"
+    assert plan_pools(81, 5, False, {"a": 1}, llm_suggest=False).start_mode == "low"
+    assert plan_pools(82, 5, False, {"a": 1}, llm_suggest=False).start_mode == "normal"
 
 
 def test_pool_rules():
-    b = OrderedCreditBudget(plan_pools(200, 5, False, {"t1": 2, "t2": 1}))
+    b = OrderedCreditBudget(plan_pools(200, 5, False, {"t1": 2, "t2": 1}, llm_suggest=False))
     assert not b.authorize("t1", "R", "d0_screen", 3)          # R pays incidents only
     assert b.authorize("t1", "S", "d0_screen", 3)
     assert b.left("S", "t1") == pytest.approx(50 * 2 / 3 - 3)
@@ -45,19 +54,19 @@ def test_pool_rules():
 
 
 def test_low_mode_when_the_reserve_cannot_cover_one_worst_incident():
-    b = OrderedCreditBudget(plan_pools(100, 5, False, {"t": 1}))
+    b = OrderedCreditBudget(plan_pools(100, 5, False, {"t": 1}, llm_suggest=False))
     assert b.mode() == "normal"                                  # R + U = 80 >= 65
     assert b.authorize_incident("t", "verdict_full", 13) == "R"
     assert b.left("R") == 67 and b.mode() == "normal"
     assert b.authorize_incident("t", "fix_candidate", 3) == "R"
     assert b.mode() == "low"                                     # 64 < 65
-    b2 = OrderedCreditBudget(plan_pools(200, 5, False, {"t": 1}))
+    b2 = OrderedCreditBudget(plan_pools(200, 5, False, {"t": 1}, llm_suggest=False))
     b2.sync(60)                                                  # the API's balance governs too
     assert b2.mode() == "low"
 
 
 def test_top_up_release_and_402():
-    b = OrderedCreditBudget(plan_pools(400, 5, False, {"t": 1}))
+    b = OrderedCreditBudget(plan_pools(400, 5, False, {"t": 1}, llm_suggest=False))
     for _ in range(6):
         assert b.authorize_incident("t", "fix_candidate", 13) == "R"
     assert b.left("R") == 52
@@ -72,7 +81,7 @@ def test_top_up_release_and_402():
 
 
 def test_envelopes_round_trip():
-    plan = plan_pools(200, 5, False, {"t": 1})
+    plan = plan_pools(200, 5, False, {"t": 1}, llm_suggest=False)
     b = OrderedCreditBudget(plan)
     b.authorize_incident("t", "verdict_full", 3)
     again = OrderedCreditBudget.from_envelopes(plan, b.envelopes())
@@ -84,7 +93,7 @@ def test_record_writes_ledger_and_envelope(pg_dsn):
     import psycopg
 
     from controller.store.db import apply_migrations
-    plan = plan_pools(200, 5, False, {"t": 1})
+    plan = plan_pools(200, 5, False, {"t": 1}, llm_suggest=False)
     b = OrderedCreditBudget(plan)
     with psycopg.connect(pg_dsn, autocommit=True) as conn:
         conn.execute("DROP SCHEMA IF EXISTS t4_credits CASCADE")

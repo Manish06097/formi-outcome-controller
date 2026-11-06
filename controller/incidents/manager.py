@@ -43,9 +43,9 @@ from controller.incidents.safety import (Candidate, CreditsUnavailable, SafetyVe
                                          rank_candidates)
 from controller.learning.did import DidHealthModel, did_names
 from controller.settings import Thresholds
-from controller.types import (P0_INCIDENT, P0A_PROMPT_SAFETY, DidState, Finding, FrozenDict,
-                              Incident, PatchRequest, Suggestion, Verdict, WorkflowSnapshot,
-                              freeze, label, thaw)
+from controller.types import (P0_INCIDENT, P0A_PROMPT_SAFETY, DidState, Finding,
+                              FlagMonitorState, FrozenDict, Incident, PatchRequest, Suggestion,
+                              Verdict, WorkflowSnapshot, freeze, label, thaw)
 
 OWNER = "incidents.manager"
 OPEN_STATES = frozenset({"open", "fixing", "verifying", "blocked", "draining"})
@@ -89,6 +89,9 @@ class IncidentManagerImpl:
     decisions: list[dict] = field(default_factory=list)
     """Decision rows to write (the caller flushes them, before acting, 8.2)."""
     alerts: list[dict] = field(default_factory=list)
+    flag_states: dict[str, FlagMonitorState] = field(default_factory=dict)
+    """wf -> the latest flag CUSUM state (the orchestrator keeps it current); read by the
+    engagement-drift response of 7.5."""
 
     # ------------------------------------------------------------------ helpers
     def open_incidents(self, wf: str, kind: str | None = None) -> list[Incident]:
@@ -133,6 +136,8 @@ class IncidentManagerImpl:
                 self._on_did_finding(ws, f)
             elif f.detector in ("prompt", "flag", "screen"):
                 self._on_prompt_finding(ws, f)
+            elif f.detector == "drift" and f.kind.endswith("_down"):
+                self._on_drift(ws, f)
         for inc in sorted(self.open_incidents(ws.spec.workflow_id, "prompt_safety"),
                           key=lambda i: i.incident_id):
             if inc.state in ("open", "blocked"):
@@ -141,6 +146,42 @@ class IncidentManagerImpl:
                     out.append(req)
         out.extend(self._drain_patches(ws))
         return out
+
+    # ------------------------------------------------------------------ KPI drift (7.5)
+    def _on_drift(self, ws: WorkflowSnapshot, f: Finding) -> None:
+        """A drift alarm is a digest item and never changes config by itself. Pickup drift with
+        no DID comparator (a sole live DID) marks that DID suspect, so the next plan probes
+        unknown DIDs (the no-healthy-DID rule of 5.9) and creates the comparator the fast and
+        slow paths need. Engagement drift pays for a FULL verdict on the incumbent prompt only if
+        the flag CUSUM is above h/2."""
+        wf = ws.spec.workflow_id
+        self._alert(ws, "KPI_DRIFT", f"{f.kind}: CUSUM {f.stat:.2f} >= {f.threshold:.2f}")
+        self._decide(ws, "kpi_drift", "7.5", {"kind": f.kind, "evidence": thaw(f.evidence)},
+                     {"digest": True})
+        if f.kind == "pickup_down":
+            live = [d for d, w in ws.live.dist("default", "caller_id").items() if w > 0]
+            if len(live) == 1:
+                did = live[0]
+                cur = self.did_overrides.get((wf, did)) or ws.did_state.get(did) or \
+                    DidState(wf, did, "healthy")
+                if cur.status == "healthy":
+                    self.did_overrides[(wf, did)] = replace(
+                        cur, status="suspect", since_minute=ws.now,
+                        evidence=freeze({**thaw(cur.evidence), "suspect_by": "drift"}))
+        elif f.kind == "engagement_down":
+            st = self.flag_states.get(wf)
+            if st is None or st.stat < self.t.flag_engage_drift_frac * st.h:
+                return
+            prompt = ws.live.prompt_version
+            try:
+                v = self.runner.run(wf, prompt, "full", False, purpose="verdict_incumbent",
+                                    pool_with_prior=True)
+            except CreditsUnavailable as e:
+                self._alert(ws, "CREDITS_LOW", f"incumbent verdict on {prompt}: {e}")
+                return
+            if v.verdict == "UNSAFE":
+                self._on_prompt_finding(ws, Finding(wf, "screen", "unsafe", prompt,
+                                                    float(v.pooled_failures), 0.0, ws.now))
 
     # ------------------------------------------------------------------ prompt incidents
     def _baseline_p0(self, ws: WorkflowSnapshot) -> float:

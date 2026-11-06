@@ -13,7 +13,7 @@ from controller.incidents.manager import IncidentManagerImpl, predicted_mttr
 from controller.incidents.safety import SafetyVerdictRunner
 from controller.learning.did import DidHealthModel
 from controller.settings import Thresholds
-from controller.types import DidState, Finding, FrozenDict, WorkflowSpec
+from controller.types import DidState, Finding, FlagMonitorState, FrozenDict, WorkflowSpec
 from tests.support import synth
 from tests.support.fake_sim import FakeSim
 
@@ -262,3 +262,37 @@ def test_suspect_and_clear_toggle_the_did_state():
                                             "D2": m.did_overrides[("wf_a", "D2")]}))
     m.on_findings(ws2, [Finding("wf_a", "did", "clear", "D2", -1.0, -2.5, 600, FrozenDict({}))])
     assert m.did_overrides[("wf_a", "D2")].status == "healthy"
+
+
+# ------------------------------------------------------------------------------- KPI drift (7.5)
+
+def test_pickup_drift_on_a_sole_did_marks_it_suspect_and_starts_probes():
+    m, sim = manager(SAFE_Q)
+    ws = did_ws({"D1": 1.0}, 2 * 1440, [])
+    ws = replace(ws, did_state=FrozenDict({"D1": DidState("wf_a", "D1", "healthy"),
+                                           "D2": DidState("wf_a", "D2", "unknown"),
+                                           "D3": DidState("wf_a", "D3", "unknown")}))
+    f = Finding("wf_a", "drift", "pickup_down", "workflow", 6.3, 6.0, 2 * 1440 - 600,
+                FrozenDict({"z": -2.0}))
+    assert m.on_findings(ws, [f]) == []                       # never a config change by itself
+    assert m.did_overrides[("wf_a", "D1")].status == "suspect"
+    assert any(a["code"] == "KPI_DRIFT" for a in m.alerts)
+    plan = m.did_model.plan_caller_ids(m.states_for(ws))
+    v = dict(plan[0].value)
+    assert v["D2"] == pytest.approx(0.028) and v["D3"] == pytest.approx(0.028)
+    assert plan[0].evidence["alert"] == "NO_HEALTHY_DID"
+    assert sim.calls == []                                    # the DID path needs no credits
+
+
+def test_engagement_drift_pays_for_an_incumbent_verdict_only_when_flags_are_up():
+    m, sim = manager({**SAFE_Q, "P1": 0.0545})
+    ws = ws_at(history_flags(), prompt="P1")
+    f = Finding("wf_a", "drift", "engagement_down", "workflow", 6.5, 6.0, NOW, FrozenDict({}))
+    low = FlagMonitorState("wf_a", "P1", 0.0147, 0.0294, 10.5, 1.0, 3, 900, 0, False, 0)
+    m.flag_states["wf_a"] = low
+    m.on_findings(ws, [f])
+    assert sim.calls == []
+    m.flag_states["wf_a"] = replace(low, stat=6.0)
+    m.on_findings(ws, [f])
+    assert sim.calls and sim.calls[0][2] == "P1"
+    assert m.open_incidents("wf_a", "prompt_safety")

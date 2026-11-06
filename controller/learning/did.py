@@ -8,8 +8,12 @@ pooled other live DIDs, stratified by (cohort, hour) from `r_did`, is a concurre
 comparison: `r_d` is the Mantel-Haenszel risk ratio (Greenland-Robins variance of log r).
 
 States: unknown -> probing -> healthy | unhealthy; healthy -> degraded (slow path here, fast path
-by the detector and incident manager); degraded and unhealthy are re-admitted as a probe after
-3 days. `suspect` is set by the fast detector and left alone here.
+by the detector and incident manager); a DID degraded by the slow path (or from history) is
+re-admitted as a probe after 3 days, because load decay may explain it; a DID degraded by the
+fast path (a sudden drop below 0.75 that load imbalance cannot produce, 7.3) or below the slow
+path's load floor (UCB under 0.5), and a probe the SPRT judged unhealthy (a probe carries almost
+no load), are not re-admitted (ADR 0030).
+`suspect` is set by the fast detector and left alone here.
 
 - Probing: Wald's SPRT of r = 0.70 against r = 1.0 per probed DID, on its dials in tick order,
   each tick-and-stratum batch using the comparator pickup of the same (day, hour, cohort);
@@ -37,13 +41,31 @@ import numpy as np
 from controller.settings import Thresholds
 from controller.stats.sequential import BernoulliRatioSprt
 from controller.world.clock import freeze_start
-from controller.types import (DEFAULT_COHORT, P0_INCIDENT, P0B_DID_DRAIN, P3_ROUTINE, DidArrays,
+from controller.types import (DEFAULT_COHORT, P0_INCIDENT, P0B_DID_DRAIN, P3_ROUTINE, Config,
+                              DidArrays,
                               DidPosterior, DidState, Finding, FrozenDict, PatchRequest,
-                              WorkflowSnapshot, freeze, thaw)
+                              WorkflowSnapshot, freeze, sha256_hex, thaw)
 
 OWNER = "learning.did"
 LIVE_STATES = ("healthy", "suspect", "degraded", "unhealthy", "probing", "unknown")
 BAD_STATES = frozenset({"degraded", "unhealthy"})
+READMIT_PATHS = frozenset({"slow", "history"})
+"""The only DIDs re-admitted as a probe after 3 days (ADR 0030): degraded by the slow path or
+from history, a shortfall a heavy load can explain, and load decays (tau 2 days). Never
+re-admitted: a sudden drop (fast path), a shortfall below the load floor, and a probe the SPRT
+judged unhealthy (a probe carries almost no load, so load cannot explain it). Re-probing those
+only re-measures a bad DID on real calls: I2's harmful public_02 change was such a probe, and
+custom (h) re-probed a DID at r = 0.3 every 3 days."""
+PRIOR_KEYS = ("prior_r_hat", "prior_r_lcb", "prior_r_ucb")
+"""Evidence keys of a re-admitted DID: the estimate it was degraded or judged unhealthy with."""
+
+
+def _prior_of(st: DidState) -> dict:
+    """The last estimate of a DID being re-admitted (empty if it never had a finite one)."""
+    if st.r_hat is None or st.r_ucb is None or not math.isfinite(st.r_ucb) or st.r_hat <= 0:
+        return {}
+    return {"prior_r_hat": float(st.r_hat), "prior_r_ucb": float(st.r_ucb),
+            "prior_r_lcb": float(st.r_lcb) if st.r_lcb is not None else None}
 
 # =============================================================================== MH ratio
 
@@ -238,6 +260,9 @@ class DidHealthModel:
     end_minute: int | None = None
     p_hist: float | None = None
     _cache: dict = field(default_factory=dict, repr=False)
+    blocked: list[dict] = field(default_factory=list, repr=False)
+    """Changes the harm gate cut to nothing at the last `plan_caller_ids` (the caller records
+    each as a decision not to act)."""
 
     # ------------------------------------------------------------------ helpers
     def _sprt(self, st: DidState) -> BernoulliRatioSprt:
@@ -291,7 +316,9 @@ class DidHealthModel:
             out[name] = DidState(ws.spec.workflow_id, name, status, r_hat=est.r,
                                  r_lcb=est.bound(self.t.did_slow_conf, False), r_ucb=ucb,
                                  n_dials=est.dials, since_minute=ws.now,
-                                 evidence=freeze({"source": "history", "path": "history"}))
+                                 evidence=freeze({"source": "history",
+                                                  "path": "floor" if ucb < self.t.did_slow_floor_r
+                                                  else "history"}))
         return out
 
     # ------------------------------------------------------------------ update and classify
@@ -312,14 +339,20 @@ class DidHealthModel:
         for code, name in enumerate(names):
             st = prev[name]
             share = shares.get(name, 0.0)
-            if st.status in BAD_STATES and st.since_minute is not None and share <= 0 \
+            if st.status == "degraded" and st.since_minute is not None and share <= 0 \
+                    and st.evidence.get("path") in READMIT_PATHS \
                     and ws.now - st.since_minute >= self.t.did_readmit_days * 1440:
+                # the last estimate travels with the re-admitted DID: the probe's harm gate
+                # judges it from what we measured, not from the untested-DID prior
                 st = DidState(st.wf, name, "unknown", since_minute=ws.now,
-                              evidence=freeze({"readmitted_from": st.status}))
+                              evidence=freeze({"readmitted_from": st.status,
+                                               **_prior_of(st)}))
                 findings.append(self._finding(ws, name, "readmit", 0.0, 0.0, {}))
             if st.status == "unknown" and share > 0:
                 st = DidState(st.wf, name, "probing", since_minute=ws.now,
-                              evidence=freeze({"last_tick": now_tick - 1, "probe_share": share}))
+                              evidence=freeze({"last_tick": now_tick - 1, "probe_share": share,
+                                               **{k: v for k, v in st.evidence.items()
+                                                  if k in PRIOR_KEYS}}))
                 findings.append(self._finding(ws, name, "probing_started", share, 0.0, {}))
             if st.status == "probing":
                 st, f = self._advance_sprt(ws, code, st, names, prev)
@@ -412,23 +445,38 @@ class DidHealthModel:
     def _slow_path(self, ws: WorkflowSnapshot, code: int, st: DidState,
                    prev: Mapping[str, DidState], names: Sequence[str]
                    ) -> tuple[DidState, list[Finding]]:
+        """Compared with established DIDs only (healthy or suspect, ADR 0030): a probe carries
+        almost no load, so against probes an incumbent always reads degraded. Two rules: the
+        floor (UCB below `did_slow_floor_r`, a shortfall load cannot explain: degraded, never
+        re-admitted) always; the 5.9 rule (UCB below 0.85) only with `did_slow_path_degrades`,
+        because a DID still carrying the load of its old share reads 0.6 to 0.8 for days."""
         da, tick = ws.did, ws.policy.tick
+        comps = [c for c, n in enumerate(names) if c != code
+                 and prev[n].status in ("healthy", "suspect")]
+        if not comps:
+            return st, []
         worst = None
         for h in self.t.did_slow_windows_h:
             mask = trailing_window(da, ws.now, tick, h)
-            est = ratio_vs_others(da, mask, code)
+            est = ratio_vs_others(da, mask, code, comps)
             ucb = est.bound(self.t.did_slow_conf, upper=True)
             if worst is None or ucb < worst[1]:
                 worst = (h, ucb, est)
-            if est.dials > 0 and est.comp_dials > 0 and ucb < self.t.sprt_indifference_r:
+            if est.dials < self.t.did_slow_min_dials or \
+                    est.comp_dials < self.t.did_slow_min_dials:
+                continue
+            floor = ucb < self.t.did_slow_floor_r
+            if floor or (self.t.did_slow_path_degrades and ucb < self.t.sprt_indifference_r):
                 ev = thaw(st.evidence)
-                ev.update({"path": "slow", "window_h": h, "r_hat": est.r, "ucb": ucb,
-                           "dials": est.dials})
+                ev.update({"path": "floor" if floor else "slow", "window_h": h, "r_hat": est.r,
+                           "ucb": ucb, "dials": est.dials})
                 new = replace(st, status="degraded", r_hat=est.r, r_ucb=ucb,
                               r_lcb=est.bound(self.t.did_slow_conf, False), since_minute=ws.now,
                               evidence=freeze(ev))
-                return new, [self._finding(ws, names[code], "slow_degraded", ucb,
-                                           self.t.sprt_indifference_r,
+                return new, [self._finding(ws, names[code],
+                                           "floor_degraded" if floor else "slow_degraded", ucb,
+                                           self.t.did_slow_floor_r if floor
+                                           else self.t.sprt_indifference_r,
                                            {"window_h": h, "r_hat": est.r, "dials": est.dials})]
         if worst is not None and worst[2].dials > 0:
             est = worst[2]
@@ -438,15 +486,18 @@ class DidHealthModel:
 
     # ------------------------------------------------------------------ planning
     def target(self, ws: WorkflowSnapshot, cur: Mapping[str, float],
-               states: Mapping[str, DidState], allow_new_probes: bool
-               ) -> tuple[dict[str, float], dict]:
-        """Target caller_id distribution for one cohort scope and what each part is for."""
+               states: Mapping[str, DidState], allow_new_probes: bool,
+               max_new: int | None = None) -> tuple[dict[str, float], dict]:
+        """Target caller_id distribution for one cohort scope and what each part is for.
+        `max_new` caps the DIDs that start probing in this change."""
         names = did_names(ws)
         s = probe_share(ws.spec.dials_per_day, self.t)
         healthy = [n for n in names if states[n].status == "healthy"]
         probing = [n for n in names if states[n].status == "probing"]
         suspect = [n for n in names if states[n].status == "suspect" and cur.get(n, 0) > 0]
         slots = max(0, self.t.did_max_probes_per_change - len(probing))
+        if max_new is not None:
+            slots = min(slots, max_new)
         candidates = [n for n in names if states[n].status == "unknown"]
         new_probes = candidates[:slots] if allow_new_probes else []
         probes = probing + new_probes
@@ -462,7 +513,7 @@ class DidHealthModel:
             for n in suspect:          # a suspect DID keeps its share until alarm or clear
                 out[n] = cur[n]
             rest = 1.0 - sum(out.values())
-            weights = self._healthy_weights(healthy, states)
+            weights = self._healthy_weights(ws, healthy, states)
             for n in healthy:
                 out[n] = out.get(n, 0.0) + rest * weights[n]
             parts["split"] = "proportional" if len(set(weights.values())) > 1 else "equal"
@@ -480,17 +531,65 @@ class DidHealthModel:
                 out[n] = rest * w / tot
         return {n: w for n, w in out.items() if w > 1e-12}, parts
 
-    def _healthy_weights(self, healthy: Sequence[str],
+    def _healthy_weights(self, ws: WorkflowSnapshot, healthy: Sequence[str],
                          states: Mapping[str, DidState]) -> dict[str, float]:
-        """Equal split unless some healthy DID is significantly better than another (its LCB
-        above the other's UCB); then proportional to r_hat."""
+        """Equal split unless one healthy DID is significantly better than another (its LCB above
+        the other's UCB) while carrying about as much traffic; then proportional to r_hat. A
+        better DID that carried less is what load produces (A-7: a fresh DID reads about 1.6
+        against a sole incumbent): equal shares remove that gap, while proportional shares would
+        move 80% onto the fresh DID and overload it."""
         rs = {n: states[n] for n in healthy}
-        differ = any(a.r_lcb is not None and b.r_ucb is not None and a.r_lcb > b.r_ucb
-                     for a in rs.values() for b in rs.values() if a is not b)
+        dials = self._recent_dials(ws)
+
+        def real(a: str, b: str) -> bool:
+            sa, sb = rs[a], rs[b]
+            return sa.r_lcb is not None and sb.r_ucb is not None and sa.r_lcb > sb.r_ucb \
+                and dials.get(a, 0.0) >= self.t.did_equal_load_ratio * dials.get(b, 0.0)
+        differ = any(real(a, b) for a in healthy for b in healthy if a != b)
         if differ and all(s.r_hat for s in rs.values()):
             tot = sum(float(s.r_hat) for s in rs.values())  # type: ignore[arg-type]
             return {n: float(rs[n].r_hat) / tot for n in healthy}  # type: ignore[arg-type]
         return {n: 1.0 / len(healthy) for n in healthy}
+
+    def _recent_dials(self, ws: WorkflowSnapshot) -> dict[str, float]:
+        """Dials per DID over the longest slow-path window (the load each one has carried)."""
+        da, names = ws.did, did_names(ws)
+        if len(da) == 0:
+            return {}
+        mask = trailing_window(da, ws.now, ws.policy.tick, max(self.t.did_slow_windows_h))
+        totals = np.bincount(da.did[mask], weights=da.dials[mask], minlength=len(names))
+        return {n: float(totals[i]) for i, n in enumerate(names)}
+
+    def gate(self, ws: WorkflowSnapshot, cur: Mapping[str, float], target: Mapping[str, float],
+             states: Mapping[str, DidState]) -> tuple[dict[str, float], dict]:
+        """The caller-ID harm gate on one scope's change (DESIGN.md 0.1, 5.9): the largest step
+        `lam` along the straight line from `cur` to `target` with P(dd < -2%) <= alpha_D under
+        `did_posterior`, found by bisection. Probe sizes therefore come out of the gate itself:
+        one untested DID can take the full probe share (s (1 - r_flag) is inside the line), two
+        together less, and a re-admitted DID is judged by the estimate it was dropped with."""
+        post = did_posterior(ws, states, seed=gate_seed(ws), t=self.t)
+        names = tuple(sorted(set(cur) | set(target)))
+
+        def at(lam: float) -> dict[str, float]:
+            return {d: cur.get(d, 0.0) + lam * (target.get(d, 0.0) - cur.get(d, 0.0))
+                    for d in names}
+
+        def report(lam: float) -> tuple[float, float]:
+            dd = did_dd(cur, at(lam), post)
+            return float(dd.mean()), float(np.mean(dd < -self.t.grader_did_line))
+
+        def passes(lam: float) -> bool:
+            return report(lam)[1] <= self.t.alpha_d + self.t.rounding
+
+        lam = 1.0 if passes(1.0) else largest_passing_lam(passes, self.t.bisection_iters)
+        dd_mean, p = report(lam)
+        full_mean, full_p = report(1.0)
+        ev = {"lam": round(lam, 6), "dd_mean": round(dd_mean, 6), "p_dd_below_line": round(p, 6),
+              "alpha_d": self.t.alpha_d, "line": self.t.grader_did_line,
+              "full_dd_mean": round(full_mean, 6), "full_p_dd_below_line": round(full_p, 6),
+              "passes_full": lam >= 1.0}
+        out = {d: w for d, w in at(lam).items() if w > 1e-12}
+        return out, ev
 
     def chain_permitted(self, ws: WorkflowSnapshot) -> bool:
         p = ws.policy
@@ -502,6 +601,7 @@ class DidHealthModel:
         states = dict(self.classify(ws))
         allow_probes = not self.in_freeze(ws.now, ws.end_minute)
         out: list[PatchRequest] = []
+        self.blocked = []
         scopes = [DEFAULT_COHORT] + sorted(k for k in ws.live.allocations
                                            if k != DEFAULT_COHORT
                                            and ws.live.has_override(k, "caller_id"))
@@ -511,10 +611,34 @@ class DidHealthModel:
                        and s.evidence.get("path") == "fast" for n, s in states.items())
             # an incident drain carries no new probes (it must stay risk-reducing)
             target, parts = self.target(ws, cur, states, allow_probes and not fast)
+            if len(parts["new_probes"]) > 1:
+                target, parts = self._probe_count(ws, cur, states, target, parts)
             req = self._patch(ws, scope, cur, target, parts, states)
             if req is not None:
                 out.append(req)
         return out
+
+    def _probe_count(self, ws: WorkflowSnapshot, cur: Mapping[str, float],
+                     states: Mapping[str, DidState], target: dict, parts: dict
+                     ) -> tuple[dict, dict]:
+        """How many DIDs start probing in one change (ADR 0030). The grader judges each change
+        on its own, so two untested DIDs started together must share one change's harm budget
+        (the gate gives each about 1.6%), while one per change gets the full probe share and
+        the next one follows at the next planning point. The option with the larger share per
+        new probe wins: it classifies the first DID soonest, and the first healthy DID carries
+        most of the spread's value (one DID to two is worth far more than three to four)."""
+        many, _ = self.gate(ws, cur, target, states)
+        one_t, one_p = self.target(ws, cur, states, True, max_new=1)
+        one, _ = self.gate(ws, cur, one_t, states)
+        s_many = min(many.get(d, 0.0) for d in parts["new_probes"])
+        s_one = one.get(one_p["new_probes"][0], 0.0)
+        if s_one > s_many + 1e-9:
+            one_p = {**one_p, "probe_count": {"chosen": 1, "share_one": round(s_one, 6),
+                                              "share_each_if_all": round(s_many, 6)}}
+            return one_t, one_p
+        return target, {**parts, "probe_count": {"chosen": len(parts["new_probes"]),
+                                                 "share_one": round(s_one, 6),
+                                                 "share_each_if_all": round(s_many, 6)}}
 
     def _patch(self, ws: WorkflowSnapshot, scope: str, cur: Mapping[str, float],
                target: Mapping[str, float], parts: Mapping, states: Mapping[str, DidState]
@@ -528,10 +652,35 @@ class DidHealthModel:
               "tv": round(tv(cur, target), 6)}
         value = dict(target)
         cls, rank = P3_ROUTINE, None
+        gated, gev = self.gate(ws, cur, target, states)
+        ev["harm_gate"] = gev
+        if not fast:
+            # exposure-increasing work (probes, spread) is cut back to what the gate passes;
+            # a drain only removes share from a degraded DID and is risk-reducing (6.5), so
+            # its gate result is recorded but never blocks it
+            if tv(cur, gated) < self.t.did_probe_min / 2:
+                if gev["lam"] < 1.0:
+                    self.blocked.append({"wf": ws.spec.workflow_id, "scope": scope,
+                                         "current": dict(cur), "target": dict(target), **gev})
+                return None
+            entering = [d for d, w in gated.items() if w > 0 and cur.get(d, 0.0) <= 0]
+            leaving = [d for d, w in cur.items() if w > 0 and gated.get(d, 0.0) <= 0]
+            if not entering and not leaving and (tv(cur, gated) < self.t.did_rebalance_min_tv
+                                                 or gev["dd_mean"] <= 0.0):
+                # a small re-weighting is not worth a config version, and one that does not
+                # raise expected health is churn (it once moved 8% onto a DID at r = 0.34)
+                return None
+            value = gated
+            ev["target"] = {k: round(v, 9) for k, v in gated.items()}
+            ev["tv"] = round(tv(cur, gated), 6)
         if fast:
             cls, rank = P0_INCIDENT, P0B_DID_DRAIN
             if self.chain_permitted(ws):
-                m = ws.policy.max_shift - self.t.max_shift_margin
+                # one more margin under our own cap (max_shift - margin): rounding the
+                # weights to the wire format and the simulator's normalisation move TV by
+                # up to about 1e-9, which once pushed a step over the cap and sent it to
+                # an approval (a 75-minute stall in the drain, ADR 0030)
+                m = ws.policy.max_shift - 2 * self.t.max_shift_margin
                 steps = drain_chain(cur, target, fast, m)
                 if steps:
                     value = steps[0]
@@ -544,6 +693,122 @@ class DidHealthModel:
                             path=("alloc", scope, "caller_id"),
                             value=FrozenDict({k: round(v, 9) for k, v in value.items()}),
                             cls=cls, p0_rank=rank, evidence=freeze(ev))
+
+
+# =============================================================================== verification
+
+
+@dataclass(frozen=True)
+class PickupComparison:
+    """Workflow pickup over some ticks against the 24h before a reference tick, at the same hours
+    of day (7.3). `ucb` is the upper 95% bound of `ratio` from the binomial noise of the
+    connects after: at 2 dialling hours one workflow's pickup moves about 7% to 10% by chance, so
+    a point-estimate line would page on noise."""
+
+    ratio: float
+    ucb: float
+    dials: int
+    connected: int
+
+
+def pickup_vs_before(ws: WorkflowSnapshot, sel: np.ndarray, before_tick: int
+                     ) -> PickupComparison | None:
+    """`sel` is a row mask of `ws.did`; None when either side has no dials."""
+    da, tick = ws.did, ws.policy.tick
+    pre = (da.tick_no < before_tick) & (da.tick_no >= before_tick - 1440 // tick)
+    n_pre = float(da.dials[pre].sum())
+    n, o = float(da.dials[sel].sum()), float(da.connected[sel].sum())
+    if n_pre <= 0 or n <= 0:
+        return None
+    pooled = float(da.connected[pre].sum()) / n_pre
+    rate = {}
+    for h in np.unique(da.hour[pre]).tolist():
+        m = pre & (da.hour == h)
+        if da.dials[m].sum() > 0:
+            rate[h] = float(da.connected[m].sum() / da.dials[m].sum())
+    exp = sum(float(d) * rate.get(int(h), pooled)
+              for h, d in zip(da.hour[sel].tolist(), da.dials[sel].tolist()))
+    if exp <= 0:
+        return None
+    ratio = o / exp
+    p = min(max(o / n, 1e-6), 1 - 1e-6)
+    se = math.sqrt((1.0 - p) / (n * p))
+    return PickupComparison(ratio, ratio * math.exp(1.959964 * se), int(n), int(o))
+
+
+def caller_change_check(ws: WorkflowSnapshot, applied_minute: int, proposed: Config,
+                        t: Thresholds) -> tuple[bool, dict] | None:
+    """The 7.3 check on any applied caller-ID change (probe, spread, chain step), over the first
+    `drain_verify_after_h` dialling hours after it: a DID the change left at 0 (and still at 0 in
+    the live config) has no dials, locked `next_campaign_only` campaigns excepted, and workflow
+    pickup is not credibly below `drain_verify_ratio` of the 24h before. None = not yet."""
+    da, tick = ws.did, ws.policy.tick
+    t0 = applied_minute // tick
+    after = (da.tick_no >= t0) & (da.tick_no < ws.now // tick) & (da.dials > 0)
+    ticks = np.unique(da.tick_no[after])
+    need = int(round(t.drain_verify_after_h * 60 / tick))
+    if len(ticks) < need:
+        return None
+    sel = after & np.isin(da.tick_no, ticks[:need])
+
+    def shares(cfg: Config) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for k in {DEFAULT_COHORT, *cfg.allocations}:
+            for d, w in cfg.dist(k, "caller_id").items():
+                out[d] = max(out.get(d, 0.0), float(w))
+        return out
+    a, b = shares(proposed), shares(ws.live)
+    names = did_names(ws)
+    dropped = [c for c, n in enumerate(names) if a.get(n, 0.0) <= 0 and b.get(n, 0.0) <= 0]
+    still = int(da.dials[sel & np.isin(da.did, dropped)].sum())
+    locked_ok = ws.spec.mid_flight == "next_campaign_only"
+    cmp = pickup_vs_before(ws, sel, t0)
+    ev = {"did_dials_after": still, "locked_campaigns_allowed": locked_ok,
+          "hours": need * tick / 60.0}
+    if cmp is None:
+        return still == 0 or locked_ok, {**ev, "note": "no pre-change data"}
+    ev.update({"ratio": cmp.ratio, "ucb": cmp.ucb, "dials": cmp.dials})
+    return cmp.ucb >= t.drain_verify_ratio and (still == 0 or locked_ok), ev
+
+
+# =============================================================================== DID harm gate
+
+
+def gate_seed(ws: WorkflowSnapshot) -> int:
+    """Deterministic seed of one gate evaluation (8.6): the same workflow and minute draw the
+    same posterior, so a restarted run and a decision replay reach the same verdict."""
+    return int(sha256_hex([ws.spec.workflow_id, int(ws.now), "did_gate"])[:12], 16)
+
+
+def did_dd(cur: Mapping[str, float], new: Mapping[str, float], post: DidPosterior) -> np.ndarray:
+    """Draws of dd = H_new / H_cur - 1 for one scope's caller_id distribution, H = sum_d p_d r_d
+    (the grader's expected DID health of world.py:641-652, with our r draws in place of the
+    hidden health). A DID the posterior does not know counts as 1.0."""
+    r = np.asarray(post.draws, dtype=float)
+    col = {d: i for i, d in enumerate(post.dids)}
+    ones = np.ones(r.shape[0])
+
+    def health(dist: Mapping[str, float]) -> np.ndarray:
+        tot = np.zeros(r.shape[0])
+        for d, p in dist.items():
+            if p > 0:
+                tot += p * (r[:, col[d]] if d in col else ones)
+        return tot
+
+    h_cur = health(cur)
+    return health(new) / np.where(h_cur > 0, h_cur, 1.0) - 1.0
+
+
+def largest_passing_lam(passes, iters: int) -> float:
+    """Largest lam in [0, 1] with passes(lam), by bisection (0 if even tiny steps fail)."""
+    lo, hi = 0.0, 1.0
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        if passes(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
 
 
 # =============================================================================== DID posterior
@@ -562,7 +827,12 @@ def did_posterior(ws: WorkflowSnapshot, states: Mapping[str, DidState], seed: in
     cols = []
     for name in names:
         st = states.get(name) or DidState(ws.spec.workflow_id, name, "unknown")
-        if st.status in ("unknown", "probing"):
+        prior = st.evidence.get("prior_r_hat") if st.status in ("unknown", "probing") else None
+        if prior is not None and st.evidence.get("prior_r_ucb") is not None:
+            # re-admitted: what we measured before it was dropped, not the untested prior
+            se = max(math.log(float(st.evidence["prior_r_ucb"]) / float(prior)) / zc, 1e-6)
+            col = float(prior) * np.exp(rng.normal(0.0, se, n))
+        elif st.status in ("unknown", "probing"):
             flagged = rng.random(n) < t.did_prior_p_flagged
             col = np.where(flagged, t.did_r_flag, rng.uniform(t.did_r_flag, t.did_r_unknown_max, n))
         elif st.r_hat is None or st.r_ucb is None or not math.isfinite(st.r_ucb):
@@ -579,4 +849,6 @@ def did_posterior(ws: WorkflowSnapshot, states: Mapping[str, DidState], seed: in
 
 __all__ = ["DidHealthModel", "RatioEstimate", "mh_ratio", "ratio_vs_others", "trailing_window",
            "probe_share", "probe_gate_share", "flag_day_share", "drain_step", "drain_chain", "tv",
-           "did_posterior", "did_names", "completed_dialling_ticks"]
+           "did_posterior", "did_names", "completed_dialling_ticks", "did_dd", "gate_seed",
+           "largest_passing_lam", "PRIOR_KEYS", "PickupComparison", "pickup_vs_before",
+           "caller_change_check"]

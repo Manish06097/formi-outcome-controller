@@ -119,6 +119,75 @@ a prompt by re-running validation until one passes.
 **Do:** probes keep running. If every option is degraded, the client must provision a new caller
 ID; the controller cannot create one.
 
+<a id="DID_DEGRADED"></a>
+### DID_DEGRADED
+
+**Means:** the fast DID detector (DESIGN.md 7.3) found a caller ID whose pickup, against the other
+live caller IDs in the same cohort and hour, fell to a ratio of 0.75 or less with z of -4 or less
+over a 2, 4 or 8 dialling-hour window. A `did_degraded` incident is open and a P0b drain is
+running: one `max_shift` auto-apply per tick where caller ID auto-applies, otherwise one P0
+approval at the next expiry-safe minute.
+
+**Look first:** `SELECT * FROM incident WHERE kind = 'did_degraded' ORDER BY opened_minute;`
+(evidence holds the alarm window, the share at the alarm and every drain step), then
+`SELECT * FROM did_state WHERE wf = <wf>;` and the proposals of class 0 for the workflow.
+
+**Do:** nothing while the drain runs. If the caller ID is known to be fine (a carrier glitch that
+cleared), it is re-admitted as a probe after 3 days on its own; ask the client before forcing it.
+
+<a id="DID_DRAIN_UNVERIFIED"></a>
+### DID_DRAIN_UNVERIFIED
+
+**Means:** two dialling hours after the last drain step, the drained caller ID still has dials on
+the new version, or workflow pickup is below 0.9 of the pre-incident 24 hours at the same hours.
+The incident went back to `draining` and the DID detector re-checks the remaining caller IDs.
+
+**Look first:** the incident's `verification` evidence (ratio, dials after the drain, whether
+locked `next_campaign_only` campaigns explain the dials), then the KPI drift monitor of the
+workflow (`drift_monitor`).
+
+**Do:** if every caller ID is degrading together, expect a `KPI_DRIFT` item and probes of the
+unknown caller IDs; if none is healthy, `NO_HEALTHY_DID` follows.
+
+<a id="DID_CHANGE_UNVERIFIED"></a>
+### DID_CHANGE_UNVERIFIED
+
+**Means:** two dialling hours after a caller-ID change (a probe, a spread or a drain step), a DID the
+change left at 0 still has dials, or workflow pickup is credibly below 0.9 of the 24 hours before at
+the same hours. Nothing is rolled back: the DID detectors run every step and act on what they find.
+
+**Look first:** the proposal's `verify` column (the reasons carry the ratio and the dials), the
+workflow's `did_state` rows and `drift_monitor`.
+
+**Do:** if a DID is the cause, expect `DID_DEGRADED` or `KPI_DRIFT` to follow. If neither does, the
+fall was probably not caused by caller ID; compare with the workflow's hour mix.
+
+<a id="SCHEDULE_UNVERIFIED"></a>
+### SCHEDULE_UNVERIFIED
+
+**Means:** after an hour table went live, more than 10% of its (cohort, hour) cells with at least 30
+dials fell below the 95% predictive band of the curves it was built from, with the workflow's level
+already allowed for. So the hour pattern the table relies on did not hold. A P1 proposal restores the
+previous table, and no further table is proposed for this workflow in this run.
+
+**Look first:** the proposal's `verify` column and the `5.8/schedule_restore` decision row (it lists
+the cells below their band).
+
+**Do:** nothing while the P1 is in flight. Ask whether the client changed its dialling or lead mix.
+
+<a id="UNKNOWN_WORKFLOW"></a>
+### UNKNOWN_WORKFLOW
+
+**Means:** `GET /workflows` lists a workflow id that was not there when this run started. The
+controller keeps running the workflows it knows and does not touch the new one, because it has no
+catalog entry, history or baseline for it.
+
+**Look first:** `GET /workflows` on the simulator or platform, and the audit row
+`workflow_ignored`.
+
+**Do:** tell the operator. The new workflow is picked up by the next run. A controller restart sees a
+different scenario fingerprint and starts a new run schema, so do not restart just to pick it up.
+
 <a id="NO_SAFE_WINDOW"></a>
 ### NO_SAFE_WINDOW
 

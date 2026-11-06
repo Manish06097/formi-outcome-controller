@@ -30,7 +30,8 @@ from typing import Callable, Mapping, Sequence
 
 import numpy as np
 
-from controller.learning.did import did_names, ratio_vs_others, trailing_window
+from controller.learning.did import (completed_dialling_ticks, did_names,
+                                     ratio_vs_others, trailing_window)
 from controller.settings import Thresholds
 from controller.stats.sequential import BernoulliCusum, DriftPageCusum, flag_cusum_h
 from controller.types import (ConfigChange, DetectorState, DidState, DriftMonitorState, Finding,
@@ -84,11 +85,29 @@ def poisson_lower(k: int, conf: float) -> float:
 # =============================================================================== DID detector (7.3)
 
 
+COMPARATOR_STATES = frozenset({"healthy", "suspect"})
+"""Who a DID is compared with (ADR 0030): established DIDs carrying real load. A probe at a 2%
+share has almost no load, so against it any incumbent looks degraded (a one-DID KYC-like
+incumbent reads r of about 0.6 against fresh probes); unknown, probing, degraded and
+unhealthy DIDs are never comparators."""
+
+
+def comparator_codes(ws: WorkflowSnapshot, code: int) -> list[int]:
+    names = did_names(ws)
+    return [c for c, n in enumerate(names) if c != code
+            and (ws.did_state.get(n) is None or ws.did_state[n].status in COMPARATOR_STATES)]
+
+
 @dataclass
 class DidDetector:
     t: Thresholds = field(default_factory=Thresholds)
 
     def detect(self, ws: WorkflowSnapshot) -> list[Finding]:
+        """Alarm, suspect or clear per live DID. Two conditions beyond 7.3's (ADR 0030): the
+        comparator must carry as many dials as the DID needs (a 5-dial comparator once gave
+        z = -4.6 at r = 0.39), and the DID must have been healthy before the window (ratio
+        above 0.85 over the reference window): a DID already short there is the persistent
+        shortfall the slow path weighs (5.9), not a sudden flag."""
         t, tick, da = self.t, ws.policy.tick, ws.did
         names = did_names(ws)
         if len(da) == 0:
@@ -105,25 +124,52 @@ class DidDetector:
             st: DidState | None = ws.did_state.get(name)
             if st is not None and st.status in ("degraded", "unhealthy"):
                 continue
+            comps = comparator_codes(ws, code)
+            if not comps:
+                continue
             alarm = None
             for h in t.did_fast_windows_h:
-                est = ratio_vs_others(da, masks[h], code)
-                if est.dials >= t.did_fast_min_dials and est.z <= t.did_fast_z \
-                        and est.r <= t.did_fast_r:
+                est = ratio_vs_others(da, masks[h], code, comps)
+                if est.dials >= t.did_fast_min_dials and est.comp_dials >= t.did_fast_min_dials \
+                        and est.z <= t.did_fast_z and est.r <= t.did_fast_r \
+                        and self._was_fine(ws, code, comps, h):
                     alarm = (h, est)
                     break
             if alarm is not None:
                 h, est = alarm
                 out.append(self._f(ws, name, "alarm", est.z, t.did_fast_z, h, est))
                 continue
-            est = ratio_vs_others(da, masks[t.did_suspect_window_h], code)
-            if est.dials >= t.did_suspect_min_dials and est.z <= t.did_suspect_z:
+            est = ratio_vs_others(da, masks[t.did_suspect_window_h], code, comps)
+            if est.dials >= t.did_suspect_min_dials \
+                    and est.comp_dials >= t.did_suspect_min_dials and est.z <= t.did_suspect_z \
+                    and self._was_fine(ws, code, comps, t.did_suspect_window_h):
                 out.append(self._f(ws, name, "suspect", est.z, t.did_suspect_z,
                                    t.did_suspect_window_h, est))
             elif st is not None and st.status == "suspect":
                 out.append(self._f(ws, name, "clear", est.z, t.did_suspect_z,
                                    t.did_suspect_window_h, est))
         return out
+
+    def _was_fine(self, ws: WorkflowSnapshot, code: int, comps: list[int], h: float) -> bool:
+        """True only if the DID was credibly above the alarm ratio over the `did_fast_ref_h`
+        dialling hours before the `h`-hour window: the lower 95% bound of its ratio there is
+        above `did_fast_r`, with at least `did_fast_min_dials` dials on both sides. A flag is
+        a drop from there. A DID already short (an incumbent whose locked campaigns still
+        carry its old share), or one with too little comparator evidence before (the probes
+        beside it were just classified; one KYC-like reference read 0.91 on 100 comparator
+        dials while the DID was 0.69 under load), is not a sudden flag: the slow path weighs
+        it, and the drift detector sees a real drop."""
+        t, da, tick = self.t, ws.did, ws.policy.tick
+        ticks = completed_dialling_ticks(da, ws.now, tick)
+        n_win = max(1, int(round(h * 60 / tick)))
+        n_ref = max(1, int(round(t.did_fast_ref_h * 60 / tick)))
+        ref_ticks = ticks[-(n_win + n_ref):-n_win] if len(ticks) > n_win else ticks[:0]
+        if len(ref_ticks) == 0:
+            return False
+        est = ratio_vs_others(da, np.isin(da.tick_no, ref_ticks), code, comps)
+        if est.dials < t.did_fast_min_dials or est.comp_dials < t.did_fast_min_dials:
+            return False
+        return est.bound(t.did_slow_conf, upper=False) > t.did_fast_r
 
     def _f(self, ws: WorkflowSnapshot, name: str, kind: str, z: float, thr: float, h: float,
            est) -> Finding:
@@ -326,55 +372,75 @@ class DriftDetector:
     engage_expect: EngageExpect | None = None
 
     # ------------------------------------------------------------------ baselines
-    def _pickup_baseline(self, ws: WorkflowSnapshot) -> tuple[np.ndarray, str, int, int]:
-        """p_hist[cell, hour, bucket] (shrunk to the pooled (hour, bucket) rate as in 5.8), the
-        baseline kind, its dial count and the first block it may be applied to."""
+    def _window_days(self, ws: WorkflowSnapshot, day: int) -> list[int]:
+        """The trailing baseline of a block on `day`: the last `drift_baseline_days` days with
+        dials before it (history days for D0, our own days later)."""
         pk = ws.pickup
-        hist = pk.sim_day < 0
-        kind, first_block = "history", 0
-        if not np.any(hist & (pk.dials > 0)):
-            days = np.unique(pk.sim_day[pk.dials > 0])
-            nd = self.t.drift_no_history_days
-            if len(days) < nd:
-                return np.zeros(0), "own", 0, 1 << 30
-            hist = np.isin(pk.sim_day, days[:nd])
-            kind, first_block = "own", int(days[nd - 1] + 1) * 24
+        days = np.unique(pk.sim_day[(pk.dials > 0) & (pk.sim_day < day)])
+        return [int(d) for d in days[-self.t.drift_baseline_days:]]
+
+    def _pickup_baseline(self, ws: WorkflowSnapshot, day: int) -> dict | None:
+        """Baseline of the blocks of `day`: p[cell, hour, bucket] over the trailing window
+        (shrunk to the window's pooled (hour, bucket) rate as in 5.8), the pickup q_d of every
+        DID over the same window (for the DID factor), its dial count and kind. None while the
+        window has fewer than `drift_armed_dials` dials (not armed)."""
+        pk, da, tick = ws.pickup, ws.did, ws.policy.tick
+        days = self._window_days(ws, day)
+        if not days:
+            return None
+        win = np.isin(pk.sim_day, days)
+        n_dials = int(pk.dials[win].sum())
+        if n_dials < self.t.drift_armed_dials:
+            return None
         n_cells = int(max(pk.cell.max(initial=0) + 1, 1))
-        shape = (n_cells, 24, 3)
-        n = np.zeros(shape)
-        y = np.zeros(shape)
-        np.add.at(n, (pk.cell[hist], pk.hour[hist], pk.attempt_bucket[hist] - 1), pk.dials[hist])
-        np.add.at(y, (pk.cell[hist], pk.hour[hist], pk.attempt_bucket[hist] - 1),
-                  pk.connected[hist])
+        n = np.zeros((n_cells, 24, 3))
+        y = np.zeros((n_cells, 24, 3))
+        idx = (pk.cell[win], pk.hour[win], pk.attempt_bucket[win] - 1)
+        np.add.at(n, idx, pk.dials[win])
+        np.add.at(y, idx, pk.connected[win])
         hb_n, hb_y = n.sum(0), y.sum(0)
-        overall = hb_y.sum() / hb_n.sum() if hb_n.sum() > 0 else 0.0
+        overall = float(hb_y.sum() / hb_n.sum())
         pooled = np.where(hb_n > 0, hb_y / np.maximum(hb_n, 1), overall)
         m = self.t.hour_curve_prior
         p = (y + m * pooled[None]) / (n + m)
-        return p, kind, int(hb_n.sum()), first_block
+        q: dict[int, float] = {}
+        q_all = overall
+        mix = overall
+        if len(da):
+            # each DID valued at its pickup on the window's LAST day: a DID whose load is
+            # still building after a spread is tracked within a day, while a drift common to
+            # every DID cancels in the ratio of mixes and stays visible through p
+            dday = (da.tick_no * tick) // 1440
+            dwin = np.isin(dday, days) & (da.dials > 0)
+            last = dwin & (dday == days[-1])
+            if da.dials[last].sum() > 0:
+                q_all = float(da.connected[last].sum() / da.dials[last].sum())
+            for d in np.unique(da.did[last]).tolist():
+                sel = last & (da.did == d)
+                q[int(d)] = float((da.connected[sel].sum() + m * q_all)
+                                  / (da.dials[sel].sum() + m))
+            nd = np.bincount(da.did[dwin], weights=da.dials[dwin])
+            tot = nd.sum()
+            if tot > 0:
+                mix = float(sum(nd[d] * q.get(d, q_all) for d in range(len(nd))) / tot)
+        return {"p": p, "q": q, "q_mix": mix, "overall": q_all, "dials": n_dials,
+                "kind": "history" if max(days) < 0 else "own", "days": days}
 
-    def _did_factor(self, ws: WorkflowSnapshot, block: int) -> float:
-        """DID factor of a block relative to the history DID mix: sum_d share_bd r_d over
-        sum_d histshare_d r_d, with r_d from our DID states (1.0 where unknown)."""
+    def _did_factor(self, ws: WorkflowSnapshot, block: int, base: Mapping) -> float:
+        """The block's DID mix against the baseline window's, both valued at each DID's pickup
+        on the window's last day: sum_d n_bd q_d / n_b over sum_d n_wd q_d / n_w. Our own
+        spreads and drains therefore do not read as drift; a DID new since then counts at that
+        day's average (its effect shows as drift up, which is view-only)."""
         da = ws.did
-        if len(da) == 0:
+        if len(da) == 0 or not base["q"]:
             return 1.0
-        names = did_names(ws)
-        tick = ws.policy.tick
-        hour_of = (da.tick_no * tick) // 60
-        r = np.ones(max(len(names), int(da.did.max(initial=0)) + 1))
-        for i, nm in enumerate(names):
-            st = ws.did_state.get(nm)
-            if st is not None and st.r_hat is not None and st.status not in ("unknown",
-                                                                             "probing"):
-                r[i] = float(st.r_hat)
-        def mix(mask: np.ndarray) -> float:
-            d = np.bincount(da.did[mask], weights=da.dials[mask], minlength=len(r))
-            s = d.sum()
-            return float((d / s) @ r) if s > 0 else 1.0
-        base = mix(da.tick_no < 0) if np.any(da.tick_no < 0) else 1.0
-        cur = mix(hour_of == block)
-        return cur / base if base > 0 else 1.0
+        sel = ((da.tick_no * ws.policy.tick) // 60 == block) & (da.dials > 0)
+        n = da.dials[sel]
+        if n.sum() <= 0:
+            return 1.0
+        cur = float(sum(int(k) * base["q"].get(int(d), base["overall"])
+                        for d, k in zip(da.did[sel].tolist(), n.tolist())) / n.sum())
+        return cur / base["q_mix"] if base["q_mix"] > 0 else 1.0
 
     # ------------------------------------------------------------------ update
     def update(self, ws: WorkflowSnapshot, states: Mapping[str, DriftMonitorState]
@@ -383,12 +449,10 @@ class DriftDetector:
         findings: list[Finding] = []
         lo, hi = ws.spec.dialling_window
         last_closed = ws.now // 60 - 1
-        p_hist, kind, base_dials, first_block = self._pickup_baseline(ws)
         st = states.get("pickup_rate") or DriftMonitorState(ws.spec.workflow_id, "pickup_rate",
-                                                            0.0, -1 << 30, kind, False)
-        if p_hist.size and base_dials >= self.t.drift_armed_dials:
-            st, f = self._run_pickup(ws, st, p_hist, kind, first_block, last_closed, lo, hi)
-            findings += f
+                                                            0.0, -1 << 30, "history", False)
+        st, f = self._run_pickup(ws, st, last_closed, lo, hi)
+        findings += f
         out_states["pickup_rate"] = st
         est = states.get("engagement_rate") or DriftMonitorState(
             ws.spec.workflow_id, "engagement_rate", 0.0, -1 << 30, "history", False)
@@ -405,26 +469,34 @@ class DriftDetector:
     def _cusum(self, st: DriftMonitorState) -> DriftPageCusum:
         return DriftPageCusum(self.t.drift_k, self.t.drift_h, st.cusum, st.up_cusum, st.alarm)
 
-    def _run_pickup(self, ws, st, p_hist, kind, first_block, last_closed, lo, hi):
+    def _run_pickup(self, ws, st, last_closed, lo, hi):
+        """Per closed dialling hour: O = connects, E = sum over its dials of the trailing
+        baseline p(cell, hour, attempt bucket) times the block's DID factor. Blocks before the
+        baseline is armed are passed over (and never revisited)."""
         pk = ws.pickup
         abs_hour = pk.sim_day.astype(np.int64) * 24 + pk.hour
-        base_rate = float(np.average(p_hist.mean(axis=(0, 2)))) if p_hist.size else 0.25
         cus, f = self._cusum(st), []
-        last = st.last_block
-        for b in self._blocks(st, first_block, last_closed, lo, hi):
+        last, kind = st.last_block, st.baseline_kind
+        bases: dict[int, dict | None] = {}
+        for b in self._blocks(st, -(1 << 29), last_closed, lo, hi):
             m = abs_hour == b
             dials = pk.dials[m]
-            if dials.sum() == 0:
+            day = b // 24
+            if day not in bases:
+                bases[day] = self._pickup_baseline(ws, day)
+            base = bases[day]
+            if dials.sum() == 0 or base is None:
                 last = b
                 continue
+            p_hist = base["p"]
             cells = np.minimum(pk.cell[m], p_hist.shape[0] - 1)
             e = float(np.sum(dials * p_hist[cells, pk.hour[m], pk.attempt_bucket[m] - 1]))
-            e *= self._did_factor(ws, b)
+            e *= self._did_factor(ws, b, base)
             o = float(pk.connected[m].sum())
-            rbar = e / dials.sum() if dials.sum() > 0 else base_rate
+            rbar = e / dials.sum()
             z = (o - e) / math.sqrt(max(e * (1 - rbar), 1e-9))
             cus, f = self._step(ws, cus, z, b, o, e, "pickup", f)
-            last = b
+            last, kind = b, base["kind"]
         return (replace(st, cusum=cus.down, up_cusum=cus.up, alarm=cus.alarm, last_block=last,
                         baseline_kind=kind), f)
 

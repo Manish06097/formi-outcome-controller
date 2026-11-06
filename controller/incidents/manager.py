@@ -41,7 +41,7 @@ from controller.incidents.credits import OrderedCreditBudget
 from controller.incidents.safety import (Candidate, CreditsUnavailable, SafetyVerdictRunner,
                                          last_known_good, live_engagement_from_flags,
                                          rank_candidates)
-from controller.learning.did import DidHealthModel, did_names
+from controller.learning.did import DidHealthModel, did_names, pickup_vs_before
 from controller.settings import Thresholds
 from controller.types import (P0_INCIDENT, P0A_PROMPT_SAFETY, DidState, Finding,
                               FlagMonitorState, FrozenDict, Incident, PatchRequest, Suggestion,
@@ -75,8 +75,10 @@ def predicted_mttr(edit_minute: int, stop_minute: int, latency_min: int, tick: i
 class IncidentManagerImpl:
     """The concrete `IncidentManager` (types.IncidentManager protocol)."""
 
-    runner: SafetyVerdictRunner
-    credits: OrderedCreditBudget
+    runner: SafetyVerdictRunner | None
+    """None until the prompt-safety path is wired (milestone M6); DID and drift findings never
+    touch it."""
+    credits: OrderedCreditBudget | None
     did_model: DidHealthModel
     llm: SuggestClient | None = None
     llm_enabled: bool = True
@@ -132,20 +134,34 @@ class IncidentManagerImpl:
         moving (a drain chain emits one step per stop)."""
         out: list[PatchRequest] = []
         for f in sorted(findings, key=lambda x: (x.detector, x.kind, x.scope)):
-            if f.detector == "did":
-                self._on_did_finding(ws, f)
-            elif f.detector in ("prompt", "flag", "screen"):
+            if f.detector in ("prompt", "flag", "screen"):
                 self._on_prompt_finding(ws, f)
-            elif f.detector == "drift" and f.kind.endswith("_down"):
-                self._on_drift(ws, f)
+        self.on_detections(ws, findings)
         for inc in sorted(self.open_incidents(ws.spec.workflow_id, "prompt_safety"),
                           key=lambda i: i.incident_id):
             if inc.state in ("open", "blocked"):
                 req = self._select_fix(ws, inc)
                 if req is not None:
                     out.append(req)
-        out.extend(self._drain_patches(ws))
+        out.extend(self.drain_patches(ws))
         return out
+
+    def on_detections(self, ws: WorkflowSnapshot, findings: list[Finding]) -> None:
+        """The DID and KPI drift part of `on_findings` (7.3, 7.5): suspect, clear and alarm
+        states, DID incidents, drift digest items. Creates no patch, so the loop can run it in
+        DETECT and ask for the drain step in DECIDE (`drain_patches`)."""
+        for f in sorted(findings, key=lambda x: (x.detector, x.kind, x.scope)):
+            if f.detector == "did":
+                self._on_did_finding(ws, f)
+            elif f.detector == "drift" and f.kind.endswith("_down"):
+                self._on_drift(ws, f)
+
+    # ------------------------------------------------------------------ persistence
+    def restore(self, incidents: Mapping[str, Incident]) -> None:
+        """Rebuild the incident set from the `incident` table (on every start)."""
+        self.incidents = dict(incidents)
+        self.did_overrides = {}
+        self.decisions, self.alerts = [], []
 
     # ------------------------------------------------------------------ KPI drift (7.5)
     def _on_drift(self, ws: WorkflowSnapshot, f: Finding) -> None:
@@ -159,8 +175,15 @@ class IncidentManagerImpl:
         self._decide(ws, "kpi_drift", "7.5", {"kind": f.kind, "evidence": thaw(f.evidence)},
                      {"digest": True})
         if f.kind == "pickup_down":
-            live = [d for d, w in ws.live.dist("default", "caller_id").items() if w > 0]
-            if len(live) == 1:
+            # "no comparator" (7.5): one established DID carries the traffic. Probes at a 2%
+            # share are no comparator for it (ADR 0030); a degraded DID still dialling is one
+            # (the DID detector found it against the others, which explains the drift).
+            def status(d: str) -> str:
+                return (self.did_overrides.get((wf, d)) or ws.did_state.get(d)
+                        or DidState(wf, d, "healthy")).status
+            live = [d for d, w in ws.live.dist("default", "caller_id").items() if w > 0
+                    and status(d) not in ("unknown", "probing")]
+            if len(live) == 1 and status(live[0]) == "healthy":
                 did = live[0]
                 cur = self.did_overrides.get((wf, did)) or ws.did_state.get(did) or \
                     DidState(wf, did, "healthy")
@@ -383,8 +406,13 @@ class IncidentManagerImpl:
         elif f.kind == "alarm":
             if any(i.evidence.get("did") == did for i in self.open_incidents(wf, "did_degraded")):
                 return
+            r = float(f.evidence["r"])
+            se = float(f.evidence.get("se_log", math.inf))
+            zc = 1.959964
             self.did_overrides[(wf, did)] = replace(
-                cur, status="degraded", since_minute=ws.now, r_hat=float(f.evidence["r"]),
+                cur, status="degraded", since_minute=ws.now, r_hat=r,
+                r_lcb=r * math.exp(-zc * se) if math.isfinite(se) else 0.0,
+                r_ucb=r * math.exp(zc * se) if math.isfinite(se) else None,
                 evidence=freeze({**thaw(cur.evidence), "path": "fast",
                                  "alarm": thaw(f.evidence)}))
             share = max((float(ws.live.dist(k, "caller_id").get(did, 0.0))
@@ -395,11 +423,16 @@ class IncidentManagerImpl:
                                             "first_evidence_minute": f.first_evidence_minute,
                                             "alarm": thaw(f.evidence), "steps": []}))
             self._put(inc)
+            self._alert(ws, "DID_DEGRADED",
+                        f"{did}: pickup ratio {r:.2f} vs the other caller IDs (z {f.stat:.1f}, "
+                        f"{f.evidence['window_h']}h window); draining its {share:.1%} share")
             self._decide(ws, "incident_open", "7.3/alarm", {"did": did, "z": f.stat,
                                                             "window_h": f.evidence["window_h"]},
                          {"incident_id": inc.incident_id, "share": share})
 
-    def _drain_patches(self, ws: WorkflowSnapshot) -> list[PatchRequest]:
+    def drain_patches(self, ws: WorkflowSnapshot) -> list[PatchRequest]:
+        """The next P0b drain step of every draining DID incident of this workflow (7.3).
+        Idempotent at a given minute (a restart may ask twice): a step is logged once."""
         wf = ws.spec.workflow_id
         draining = [i for i in self.open_incidents(wf, "did_degraded") if i.state == "draining"]
         if not draining:
@@ -414,8 +447,13 @@ class IncidentManagerImpl:
                 self._put(replace(self._ev(inc, drained_minute=ws.now), state="verifying"))
                 continue
             steps = list(inc.evidence.get("steps", ()))
-            steps.append({"minute": ws.now, "share_before": left})
-            self._ev(inc, steps=steps)
+            if not steps or steps[-1].get("minute") != ws.now:
+                steps.append({"minute": ws.now, "share_before": left,
+                              "planned": bool(reqs)})
+                self._ev(inc, steps=steps)
+        draining = [i for i in draining if self.incidents[i.incident_id].state == "draining"]
+        if not draining:
+            return []
         return [replace(r, evidence=freeze({**thaw(r.evidence),
                                             "incident_ids": sorted(i.incident_id
                                                                    for i in draining)}))
@@ -579,7 +617,7 @@ def _poisson_upper(k: int, conf: float) -> float:
 def drain_check(ws: WorkflowSnapshot, inc: Incident, t: Thresholds) -> tuple[bool, dict] | None:
     """7.3 verification, 2 dialling hours after the last step: the drained DID has no new dials
     (campaigns locked under `next_campaign_only` excepted), and workflow pickup over those hours
-    is >= 0.9 of the pre-incident 24h at the same hours of day. None = not yet."""
+    is not credibly below 0.9 of the pre-incident 24h at the same hours of day. None = not yet."""
     da, tick = ws.did, ws.policy.tick
     names = did_names(ws)
     did = inc.evidence["did"]
@@ -594,25 +632,14 @@ def drain_check(ws: WorkflowSnapshot, inc: Incident, t: Thresholds) -> tuple[boo
     hours_done = need * tick / 60.0
     did_dials = int(da.dials[sel & (da.did == code)].sum())
     locked_ok = ws.spec.mid_flight == "next_campaign_only"
-    hod = da.hour[sel]
-    o = float(da.connected[sel].sum())
-    n = float(da.dials[sel].sum())
-    t_open = inc.opened_minute // tick
-    pre = (da.tick_no < t_open) & (da.tick_no >= t_open - 1440 // tick)
-    rate = {}
-    for h in np.unique(da.hour[pre]).tolist():
-        m = pre & (da.hour == h)
-        if da.dials[m].sum() > 0:
-            rate[h] = da.connected[m].sum() / da.dials[m].sum()
-    pooled = da.connected[pre].sum() / da.dials[pre].sum() if da.dials[pre].sum() > 0 else None
-    if pooled is None or n == 0:
+    cmp = pickup_vs_before(ws, sel, inc.opened_minute // tick)
+    if cmp is None:
         return True, {"note": "no pre-incident data", "did_dials_after": did_dials}
-    exp = sum(float(d) * rate.get(int(h), pooled) for h, d in zip(hod.tolist(),
-                                                                  da.dials[sel].tolist()))
-    ratio = (o / n) / (exp / n) if exp > 0 else 1.0
-    ok = ratio >= t.drain_verify_ratio and (did_dials == 0 or locked_ok)
-    return ok, {"ratio": ratio, "did_dials_after": did_dials, "hours": hours_done,
-                "locked_campaigns_allowed": locked_ok}
+    # the upper bound, not the point estimate: at 2 dialling hours the workflow's pickup moves
+    # 7% to 10% by chance, and a good drain would page (ADR 0030)
+    ok = cmp.ucb >= t.drain_verify_ratio and (did_dials == 0 or locked_ok)
+    return ok, {"ratio": cmp.ratio, "ucb": cmp.ucb, "did_dials_after": did_dials,
+                "hours": hours_done, "locked_campaigns_allowed": locked_ok}
 
 
 __all__ = ["IncidentManagerImpl", "predicted_mttr", "prompt_fix_check", "drain_check",

@@ -12,6 +12,7 @@ the overlay, the policy replica, the timing search and the lifecycle, and return
 """
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Sequence
@@ -30,6 +31,10 @@ from controller.world.clock import (ceil_to_tick, in_approver_hours, next_open,
                                     worst_decide_minute)
 
 # ---------------------------------------------------------------- pure rules
+CHAIN_SLACK = 1e-9
+"""TV a chain step stays under `max_shift - margin`: far above float noise (1e-16), far below
+anything that changes the drain."""
+
 def drain_chain_steps(share: float, max_shift: float) -> int:
     """k = ceil(share / max_shift): one max_shift step per tick drains `share` (6.2, 7.3)."""
     if max_shift <= 0:
@@ -45,7 +50,9 @@ def chain_lambda(comp: Composition, pol: EffectivePolicy, t: Thresholds) -> floa
     worst = max(comp.tv_by_cohort_dim.values(), default=0.0)
     if worst <= cap or cap <= 0:
         return 1.0 if worst <= cap else 0.0
-    return cap / worst
+    # a hair under the cap: at exactly cap / worst the interpolated, normalised step lands on
+    # the cap with float noise and fails the check about one time in six (ADR 0030)
+    return (cap - CHAIN_SLACK) / worst
 
 
 def interpolate(live: Config, target: Config, lam: float) -> Config:
@@ -191,6 +198,8 @@ class ReleaseDecision:
     proposal_id: str | None = None
     planned_minute: int | None = None
     """for the step rule: the minute this work is planned to be submitted"""
+    auto_refused: tuple[str, ...] = ()
+    """why the composition could not auto-apply, when it went to approval instead (audit)"""
 
 
 @dataclass
@@ -212,6 +221,8 @@ class ReleaseTrain:
 
     def __init__(self, deps: ReleaseDeps):
         self.d = deps
+        self._chain_refused: tuple[str, ...] = ()
+        """Why the last `_chain_step` could not chain (audit, on the routing decision)."""
 
     def ledger(self, wf: str, now: int | None = None) -> VelocityLedger:
         """The rolling velocity ledger (6.5 rule 4), derived from the applied auto-apply
@@ -304,10 +315,13 @@ class ReleaseTrain:
         """A risk-reducing P0/P1 change larger than max_shift is applied as a chain: one
         straight-line step of at most max_shift per tick (6.5 'Chaining, bounded'). Steps carry
         no patches, so the patches stay open until the step that reaches the target."""
+        self._chain_refused = ()
         if comp.cls > P1_ROLLBACK or not is_risk_reducing(comp.risk):
+            self._chain_refused = (f"no chain: class {comp.cls}, risk {dict(comp.risk)}",)
             return None
         lam = chain_lambda(comp, pol, self.d.t)
         if not 0.0 < lam < 1.0:
+            self._chain_refused = (f"no chain: lambda {lam}",)
             return None
         cfg = interpolate(comp.live, comp.proposed.as_stored(), lam)
         stored = cfg.as_stored()
@@ -320,6 +334,7 @@ class ReleaseTrain:
                            cls=comp.cls, p0_rank=comp.p0_rank)
         r = self._auto_report(step, now, pol, None)
         if not r.permitted:
+            self._chain_refused = tuple(f"chain step: {x}" for x in r.reasons)
             return None
         pkg = self._package(comp)
         p = self.d.lifecycle.auto_apply(step, now, rationale=f"chain step ({lam:.3f} of the "
@@ -356,6 +371,9 @@ class ReleaseTrain:
                 d = self._operational_first(comp, now, pol)
                 if d is not None:
                     return d
+            return dataclasses.replace(self._submit_approval(comp, now, pol),
+                                       auto_refused=tuple(r.reasons)
+                                       + self._chain_refused)
         return self._submit_approval(comp, now, pol)
 
     def _operational_first(self, comp: Composition, now: int, pol: EffectivePolicy

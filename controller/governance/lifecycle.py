@@ -1010,14 +1010,15 @@ class ProposalLifecycle:
             r = check(p, now)
             if r.status == "pending":
                 continue
-            if r.page:
-                self.d.on_alert(r.page, p.wf, f"{p.proposal_id}: {'; '.join(r.reasons)}")
             event = "verified" if r.status == "verified" else "verify_failed"
-            q = self.d.store.apply(p.proposal_id, event, now, "; ".join(r.reasons) or kind,
-                                   verify=freeze({"kind": kind, "status": r.status,
-                                                  "reasons": list(r.reasons)}))
-            if event == "verify_failed":
-                self.d.on_rollback(q, r)
+            with self.d.store.atomic():      # the verdict, its page and the rollback patch: one fact
+                if r.page:
+                    self.d.on_alert(r.page, p.wf, f"{p.proposal_id}: {'; '.join(r.reasons)}")
+                q = self.d.store.apply(p.proposal_id, event, now, "; ".join(r.reasons) or kind,
+                                       verify=freeze({"kind": kind, "status": r.status,
+                                                      "reasons": list(r.reasons)}))
+                if event == "verify_failed":
+                    self.d.on_rollback(q, r)
             out.append(q)
         return out
 

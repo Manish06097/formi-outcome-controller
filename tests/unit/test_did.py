@@ -143,9 +143,41 @@ def test_bootstrap_from_history():
     assert DidHealthModel().bootstrap(sole)["D1"].status == "healthy"
 
 
+def _mildly_bad_rows():
+    rng = np.random.default_rng(4)
+    rows = []
+    for d in range(3):
+        rows += synth.simulate_did_day(rng, day=d, tick=TICK, window=(9, 21), dials_per_hour=400,
+                                       shares={0: 1 / 3, 1: 1 / 3, 2: 1 / 3}, p=0.25,
+                                       r={2: 0.75})
+    return rows
+
+
+def test_slow_path_shortfall_gets_a_proportional_share_by_default():
+    """ADR 0030: with `did_slow_path_degrades` off (the default) a DID at r = 0.75 stays
+    healthy, its estimate is updated, and the spread gives it a share proportional to r_d,
+    so its load falls instead of everything moving onto the others."""
+    spec = synth.make_spec()
+    live = synth.config({"D1": 1 / 3, "D2": 1 / 3, "D3": 1 / 3})
+    da = synth.did_arrays(_mildly_bad_rows())
+    states = {n: DidState("wf_a", n, "healthy") for n in ("D1", "D2", "D3")}
+    model = DidHealthModel()
+    for now in range(10 * 60, 2 * 1440 + 20 * 60, 60):
+        states = dict(model.step(synth.snapshot(spec, live=live, did=da, did_state=states,
+                                                now=now))[0])
+    assert all(st.status == "healthy" for st in states.values())
+    assert states["D3"].r_hat == pytest.approx(0.75, abs=0.08)
+    ws = synth.snapshot(spec, live=live, did=da, did_state=states, now=2 * 1440 + 20 * 60)
+    v = dict(DidHealthModel().plan_caller_ids(ws)[0].value)
+    assert v["D3"] < 1 / 3 - 0.02 and v["D1"] > 1 / 3 and v["D2"] > 1 / 3
+    assert v["D3"] / v["D1"] == pytest.approx(states["D3"].r_hat / states["D1"].r_hat, rel=0.02)
+
+
 def test_slow_path_degrades_a_mildly_bad_did():
-    """r = 0.75 at a one-third share, cancel-like volume: degraded within about 12-24 dialling
-    hours by the UCB < 0.85 rule (5.9)."""
+    """With `did_slow_path_degrades` on (the 5.9 rule as designed): r = 0.75 at a one-third
+    share, cancel-like volume, degraded within about 12-24 dialling hours by the UCB < 0.85
+    rule."""
+    import dataclasses
     rng = np.random.default_rng(4)
     rows = []
     for d in range(3):
@@ -156,7 +188,7 @@ def test_slow_path_degrades_a_mildly_bad_did():
     live = synth.config({"D1": 1 / 3, "D2": 1 / 3, "D3": 1 / 3})
     da = synth.did_arrays(rows)
     states = {n: DidState("wf_a", n, "healthy") for n in ("D1", "D2", "D3")}
-    model = DidHealthModel()
+    model = DidHealthModel(t=dataclasses.replace(Thresholds(), did_slow_path_degrades=True))
     hit = None
     for now in range(10 * 60, 3 * 1440, 60):
         ws = synth.snapshot(spec, live=live, did=da, did_state=states, now=now)
@@ -200,14 +232,75 @@ def plan(states: dict[str, str], live: dict[str, float], *, dids=("D1", "D2", "D
     return DidHealthModel(end_minute=end).plan_caller_ids(ws)
 
 
-def test_probes_two_unknown_dids_at_the_gate_share():
+TWO_PROBE_GATE_SHARE = 0.02 / 1.2766
+"""Hand-computed gate share of two untested DIDs probed together (DESIGN.md 0.1, 5.9): with
+x_i = 1 - r_i, x_i = 0.65 with P(flagged) = 0.2, else uniform on [-0.1, 0.65], the change is
+dd = -s (x_1 + x_2). P(x_1 + x_2 > q) = 0.05 needs both flagged (0.04, sum 1.3) plus the
+one-flagged case 0.32 x (1.3 - q) / 0.75 = 0.01, so q = 1.2766 and s = 0.02 / q = 1.567%."""
+
+
+def test_one_unknown_did_is_probed_at_the_full_probe_share():
+    """One untested DID: s (1 - r_flag) = 0.028 x 0.65 = 0.0182 is inside the 2% line even if
+    it is flagged, so the gate passes the whole volume-rule share."""
+    reqs = plan({"D1": "healthy", "D2": "healthy", "D3": "unknown"}, {"D1": 0.5, "D2": 0.5},
+                dids=("D1", "D2", "D3"))
+    v = dict(reqs[0].value)
+    assert v["D3"] == pytest.approx(0.028)
+    assert reqs[0].evidence["harm_gate"]["passes_full"] is True
+
+
+def test_two_unknown_dids_start_one_per_change_at_the_full_share():
+    """Two untested DIDs together would have to share one change's harm budget (the gate
+    gives each about 1.6%); one per change gets the full 2.8% and classifies sooner, so one
+    starts now and the other at the next planning point (ADR 0030)."""
     reqs = plan({"D1": "healthy", "D2": "healthy", "D3": "unknown", "D4": "unknown"},
                 {"D1": 0.5, "D2": 0.5})
     assert len(reqs) == 1
     v = dict(reqs[0].value)
-    assert v["D3"] == pytest.approx(0.028) and v["D4"] == pytest.approx(0.028)
-    assert v["D1"] == pytest.approx(v["D2"]) == pytest.approx((1 - 0.056) / 2)
+    assert v["D3"] == pytest.approx(0.028) and "D4" not in v
+    assert v["D1"] == pytest.approx(v["D2"]) == pytest.approx((1 - 0.028) / 2)
+    count = reqs[0].evidence["parts"]["probe_count"]
+    assert count["chosen"] == 1
+    assert count["share_each_if_all"] == pytest.approx(TWO_PROBE_GATE_SHARE, abs=0.0008)
     assert reqs[0].cls == 3 and reqs[0].path == ("alloc", "default", "caller_id")
+    # next planning point: D3 probing at its share, D4 starts at the full share too
+    nxt = plan({"D1": "healthy", "D2": "healthy", "D3": "probing", "D4": "unknown"}, v)
+    w = dict(nxt[0].value)
+    assert w["D4"] == pytest.approx(0.028) and w["D3"] == pytest.approx(0.028)
+
+
+def test_two_unknown_dids_together_get_the_gate_share():
+    """The gate itself, on a change that starts both: about 1.57% each (hand derivation
+    above), with P(dd < -2%) at most alpha_D."""
+    spec = synth.make_spec(dids=("D1", "D2", "D3", "D4"))
+    st = {"D1": DidState("wf_a", "D1", "healthy"), "D2": DidState("wf_a", "D2", "healthy"),
+          "D3": DidState("wf_a", "D3", "unknown"), "D4": DidState("wf_a", "D4", "unknown")}
+    ws = synth.snapshot(spec, live=synth.config({"D1": 0.5, "D2": 0.5}), did_state=st)
+    m = DidHealthModel()
+    target, _ = m.target(ws, {"D1": 0.5, "D2": 0.5}, st, True)
+    gated, ev = m.gate(ws, {"D1": 0.5, "D2": 0.5}, target, st)
+    assert gated["D3"] == pytest.approx(gated["D4"])
+    assert gated["D3"] == pytest.approx(TWO_PROBE_GATE_SHARE, abs=0.0008)
+    assert ev["passes_full"] is False and ev["p_dd_below_line"] <= 0.05
+
+
+def test_a_readmitted_did_is_gated_on_its_last_estimate():
+    """A DID dropped at r = 0.30 and re-admitted is not an untested DID: its probe is sized
+    from that estimate, so the change stays inside the 2% line."""
+    import math
+    from controller.types import freeze
+    prior = {"prior_r_hat": 0.30, "prior_r_ucb": 0.36, "prior_r_lcb": 0.25}
+    st = {"D1": DidState("wf_a", "D1", "healthy"), "D2": DidState("wf_a", "D2", "healthy"),
+          "D3": DidState("wf_a", "D3", "unknown", evidence=freeze(
+              {"readmitted_from": "degraded", **prior}))}
+    spec = synth.make_spec(dids=("D1", "D2", "D3"))
+    ws = synth.snapshot(spec, live=synth.config({"D1": 0.5, "D2": 0.5}), did_state=st)
+    reqs = DidHealthModel().plan_caller_ids(ws)
+    s = dict(reqs[0].value)["D3"]
+    se = math.log(0.36 / 0.30) / 1.959964
+    r05 = 0.30 * math.exp(-1.645 * se)            # 5% quantile of the lognormal estimate
+    assert s == pytest.approx(0.02 / (1 - r05), abs=0.001)
+    assert s * (1 - 0.30) < 0.02
 
 
 def test_at_most_two_probes_at_a_time():
@@ -228,9 +321,9 @@ def test_no_healthy_did_keeps_the_allocation_and_probes():
     reqs = plan({"D1": "degraded", "D2": "unknown", "D3": "unknown", "D4": "unknown"},
                 {"D1": 1.0})
     v = dict(reqs[0].value)
-    assert v["D2"] == pytest.approx(0.028) and v["D3"] == pytest.approx(0.028)
-    assert "D4" not in v
-    assert v["D1"] == pytest.approx(1 - 0.056)
+    assert v["D2"] == pytest.approx(0.028)          # one new probe per change (ADR 0030)
+    assert "D3" not in v and "D4" not in v
+    assert v["D1"] == pytest.approx(1 - 0.028)
     assert reqs[0].evidence["alert"] == "NO_HEALTHY_DID"
 
 
@@ -262,7 +355,7 @@ def test_fast_drain_is_a_p0b_chain_step_where_auto_applies():
     r = reqs[0]
     assert r.cls == 0 and r.p0_rank == 1
     v = dict(r.value)
-    assert v["D2"] == pytest.approx(0.186, abs=2e-6)  # one max_shift step (less the 1e-6 margin)
+    assert v["D2"] == pytest.approx(0.186, abs=3e-6)  # one max_shift step, 2e-6 under (ADR 0030)
     assert "D4" not in v                                         # a drain carries no new probe
     assert r.evidence["chain"]["k"] == 2
     assert r.evidence["chain"]["final"] == pytest.approx({"D1": 0.5, "D3": 0.5})
@@ -293,3 +386,96 @@ def test_did_posterior_prior_for_unknown_dids():
     assert flagged == pytest.approx(T.did_prior_p_flagged, abs=0.01)
     assert post.draws[:, 1].max() <= T.did_r_unknown_max
     assert np.median(post.draws[:, 0]) == pytest.approx(1.0, abs=0.01)
+
+
+def test_only_load_explained_degradation_is_readmitted():
+    """After 3 days at share 0 a slow-path degraded DID is probed again (load decays); a
+    fast-path one (a sudden drop below 0.75, 7.3) and a probe the SPRT judged unhealthy (a
+    probe carries no load to decay; custom (h) re-probed a DID at r = 0.3 every 3 days) stay
+    out (ADR 0030)."""
+    from controller.types import freeze
+    spec = synth.make_spec(dids=("D1", "D2", "D3", "D4", "D5"))
+    st = {"D1": DidState("wf_a", "D1", "healthy"), "D2": DidState("wf_a", "D2", "healthy"),
+          "D3": DidState("wf_a", "D3", "degraded", r_hat=0.4, r_ucb=0.5, since_minute=0,
+                         evidence=freeze({"path": "fast"})),
+          "D4": DidState("wf_a", "D4", "degraded", r_hat=0.8, r_ucb=0.84, since_minute=0,
+                         evidence=freeze({"path": "slow"})),
+          "D5": DidState("wf_a", "D5", "unhealthy", r_hat=0.3, r_ucb=0.6, since_minute=0,
+                         evidence=freeze({"sprt_decision": "accept_h0"}))}
+    ws = synth.snapshot(spec, live=synth.config({"D1": 0.5, "D2": 0.5}), did_state=st,
+                        now=4 * 1440)
+    states, _ = DidHealthModel().step(ws)
+    assert states["D3"].status == "degraded"
+    assert states["D4"].status == "unknown"
+    assert states["D4"].evidence["prior_r_hat"] == pytest.approx(0.8)
+    assert states["D5"].status == "unhealthy"
+
+
+def test_every_drain_step_stays_under_the_cap_after_wire_rounding():
+    """Regression (ADR 0030, custom (d)): a step of exactly max_shift - margin, rounded to 9
+    decimals and normalised like the simulator, landed a hair over our cap, so one step of
+    the max_shift 0.05 chain went to an approval and the drain stalled 75 minutes. Every step
+    of the chain must now pass our own check on the stored form."""
+    from controller.types import _sim_normalise
+    live = {"D1": 1 / 3, "D2": 1 / 3, "D3": 1 / 3}
+    cap = 0.05 - T.max_shift_margin
+    for _ in range(8):
+        reqs = plan({"D1": "healthy", "D2": "degraded", "D3": "healthy"}, live,
+                    dids=("D1", "D2", "D3"), fast=("D2",), max_shift=0.05)
+        if not reqs:
+            break
+        new = _sim_normalise(dict(reqs[0].value))
+        assert 0 < tv(live, new) <= cap
+        live = new
+    assert "D2" not in live
+
+
+def test_floor_degrades_a_did_load_cannot_explain_and_never_readmits_it():
+    """A healthy DID reading r = 0.3 against established peers (a flag on an incumbent before
+    any comparator existed, so the fast detector never saw it fine) is below the load floor:
+    degraded by the slow path even with the 0.85 rule off, and not re-admitted after 3 days."""
+    rng = np.random.default_rng(7)
+    rows = []
+    for d in range(2):
+        rows += synth.simulate_did_day(rng, day=d, tick=TICK, window=(9, 21), dials_per_hour=400,
+                                       shares={0: 1 / 3, 1: 1 / 3, 2: 1 / 3}, p=0.25,
+                                       r={2: 0.3})
+    spec = synth.make_spec()
+    live = synth.config({"D1": 1 / 3, "D2": 1 / 3, "D3": 1 / 3})
+    da = synth.did_arrays(rows)
+    states = {n: DidState("wf_a", n, "healthy") for n in ("D1", "D2", "D3")}
+    model = DidHealthModel()
+    hit = None
+    for now in range(10 * 60, 2 * 1440, 60):
+        new, f = model.step(synth.snapshot(spec, live=live, did=da, did_state=states, now=now))
+        states = dict(new)
+        if states["D3"].status == "degraded":
+            hit = now
+            assert any(x.kind == "floor_degraded" and x.scope == "D3" for x in f)
+            break
+    assert hit is not None and hit <= 21 * 60
+    assert states["D3"].evidence["path"] == "floor"
+    assert states["D1"].status == states["D2"].status == "healthy"
+    later = synth.snapshot(spec, live=synth.config({"D1": 0.5, "D2": 0.5}), did=da,
+                           did_state=states, now=hit + 4 * 1440)
+    assert DidHealthModel().step(later)[0]["D3"].status == "degraded"
+
+
+def test_a_reweighting_that_lowers_expected_health_is_not_proposed():
+    """Proportional shares from noisy estimates once moved 8% onto a DID at r = 0.34 (graded
+    didD -0.009): a change that only re-weights DIDs already dialling must raise the posterior
+    mean of DID health (what the grader judges at apply time), or it is churn. Here the
+    proportional target moves 8.6% onto D1 at r = 0.8: inside the 2% harm line, so the gate
+    alone would pass it."""
+    spec = synth.make_spec(dids=("D1", "D2", "D3"))
+
+    def st(r):
+        return {n: DidState("wf_a", n, "healthy", r_hat=v, r_lcb=v * 0.97, r_ucb=v * 1.03)
+                for n, v in r.items()}
+    live = synth.config({"D1": 0.2, "D2": 0.4, "D3": 0.4})
+    down = synth.snapshot(spec, live=live, did_state=st({"D1": 0.8, "D2": 1.0, "D3": 1.0}))
+    assert DidHealthModel().plan_caller_ids(down) == []
+    up = synth.snapshot(spec, live=live, did_state=st({"D1": 1.4, "D2": 1.0, "D3": 1.0}))
+    reqs = DidHealthModel().plan_caller_ids(up)
+    assert len(reqs) == 1 and dict(reqs[0].value)["D1"] > 0.2
+    assert reqs[0].evidence["harm_gate"]["dd_mean"] > 0

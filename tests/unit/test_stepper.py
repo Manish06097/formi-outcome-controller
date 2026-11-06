@@ -198,3 +198,14 @@ def test_step_is_always_a_positive_multiple_of_tick():
         nxt = next_stop(now, c)
         assert nxt > now and (nxt - now) % TICK == 0
         now = nxt
+
+
+
+def test_a_suspect_did_steps_by_tick_only_while_its_workflow_dials():
+    """ADR 0030: a suspect DID gets new evidence only from dials, so at night it neither cuts
+    the step to one tick nor blocks the overnight jump; in the dialling window it does."""
+    c = ctx(st(A, suspect_did=True))
+    night = plan_stop(at(1, 21, 15), c)
+    assert night.step > TICK and night.overnight_jump
+    day = plan_stop(at(1, 11), c)
+    assert day.step == TICK and day.bound.startswith("incident_or_suspect")

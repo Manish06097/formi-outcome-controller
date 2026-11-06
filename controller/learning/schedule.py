@@ -32,6 +32,7 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from controller.settings import Thresholds
+from controller.snapshot import segment_of, segment_start_minute
 from controller.types import (DEFAULT_COHORT, P3_ROUTINE, Cohort, Finding, FrozenDict,
                               HourCurveSet, PatchRequest, WorkflowSnapshot, freeze)
 
@@ -180,9 +181,13 @@ def verify_schedule(ws: WorkflowSnapshot, curves: HourCurveSet, since_day: int,
     (`since_day` onward, the 2 segments after it): fails if more than 10% fall below their band.
     `did_factor` is the current DID factor the band is multiplied by. Returns one Finding
     ("schedule", "verified" | "verify_failed")."""
-    t = t or Thresholds()
+    return [_band_check(ws, curves, ws.pickup.sim_day >= since_day, did_factor,
+                        t or Thresholds())]
+
+
+def _band_check(ws: WorkflowSnapshot, curves: HourCurveSet, sel: np.ndarray, did_factor: float,
+                t: Thresholds) -> Finding:
     pk = ws.pickup
-    sel = pk.sim_day >= since_day
     cells: dict[tuple[Cohort, int], list[int]] = {}
     for cell, h, d, c in zip(pk.cell[sel].tolist(), pk.hour[sel].tolist(), pk.dials[sel].tolist(),
                              pk.connected[sel].tolist()):
@@ -204,11 +209,37 @@ def verify_schedule(ws: WorkflowSnapshot, curves: HourCurveSet, since_day: int,
             detail.append({"cohort": k, "hour": h, "dials": d, "connected": c, "lower": lo})
     frac = below / tested if tested else 0.0
     kind = "verify_failed" if tested and frac > t.schedule_verify_fail_frac else "verified"
-    return [Finding(wf=ws.spec.workflow_id, detector="schedule", kind=kind, scope="workflow",
-                    stat=frac, threshold=t.schedule_verify_fail_frac,
-                    first_evidence_minute=ws.now,
-                    evidence=freeze({"cells_tested": tested, "below": detail}))]
+    return Finding(wf=ws.spec.workflow_id, detector="schedule", kind=kind, scope="workflow",
+                   stat=frac, threshold=t.schedule_verify_fail_frac,
+                   first_evidence_minute=ws.now,
+                   evidence=freeze({"cells_tested": tested, "below": detail,
+                                    "did_factor": round(did_factor, 4)}))
+
+
+def schedule_change_check(ws: WorkflowSnapshot, curves: HourCurveSet, applied_minute: int,
+                          t: Thresholds) -> Finding | None:
+    """5.8 verification of one applied table over the 2 whole segments after it (None = not
+    yet). The band is the shape check: the level (caller-ID load, a flagged DID) is what the
+    DID factor carries, so the factor is the window's observed connects over what the curves
+    expect for its dials, and only an hour pattern the curves got wrong falls below the band. A
+    workflow-level pickup fall stays with the drift detector (7.5, ADR 0030)."""
+    window = ws.spec.dialling_window
+    seg = segment_of(applied_minute, window)
+    end = segment_start_minute(seg + 3, window)
+    if ws.now < end:
+        return None
+    start = segment_start_minute(seg + 1, window)
+    pk = ws.pickup
+    abs_min = pk.sim_day.astype(np.int64) * 1440 + pk.hour.astype(np.int64) * 60
+    sel = (abs_min >= start) & (abs_min < end) & (pk.dials > 0)
+    expected = 0.0
+    for cell, h, d in zip(pk.cell[sel].tolist(), pk.hour[sel].tolist(), pk.dials[sel].tolist()):
+        curve = curves.curves.get(ws.cohorts.cohort_of(int(cell))) or curves.pooled
+        expected += float(d) * float(curve.get(int(h), 0.0))
+    observed = float(pk.connected[sel].sum())
+    factor = observed / expected if expected > 0 else 1.0
+    return _band_check(ws, curves, sel, factor, t)
 
 
 __all__ = ["HourCurvesModel", "hour_weights_from_curve", "normalised_l1", "verify_schedule",
-           "predictive_lower", "window_hours"]
+           "schedule_change_check", "predictive_lower", "window_hours"]

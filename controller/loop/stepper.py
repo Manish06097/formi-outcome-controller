@@ -7,7 +7,8 @@ The rule, in order:
 2. While a workflow has a pending approval whose decision could become visible before the next
    stop, the step is at most `S_watch_max - tick` (90 at W = 120, tick 15), so an approval decided
    at any minute is seen and applied before `apply_by` (F12). A pending P0 past its minimum
-   latency, an open incident, a suspect DID or prompt, or a running drain chain cut it to one tick.
+   latency, an open incident, a suspect prompt, a running drain chain, or a suspect DID while
+   its workflow dials cut it to one tick.
 3. The step never crosses a boundary: dialling open and close, approver open, approver close +
    tick (the last minute a decision can become visible), the daily batch, planned submit slots,
    notice expiries, `apply_by - tick` of anything approved, and the scenario end.
@@ -58,7 +59,10 @@ def plan_stop(now: int, ctx: PlannerContext) -> StopPlan:
             if (wf.pending_class == P0_INCIDENT and wf.pending_created is not None
                     and now >= wf.pending_created + g.latency_minutes[0]):
                 step, bound = tick, f"incident_pending:{wf.workflow_id}"
-        if wf.open_incident or wf.suspect_did or wf.suspect_prompt or wf.drain_chain_pending:
+        # a suspect DID only gets new evidence while its workflow dials (ADR 0030): at night
+        # the same window would be re-read every tick
+        suspect_did = wf.suspect_did and dials_between(now, now + tick, [wf.dialling_window])
+        if wf.open_incident or suspect_did or wf.suspect_prompt or wf.drain_chain_pending:
             step, bound = tick, f"incident_or_suspect:{wf.workflow_id}"
     b_minute, b_name = min(boundaries(now, ctx))
     if b_minute - now < step:
@@ -118,7 +122,7 @@ def overnight_allowed(now: int, boundary: int, ctx: PlannerContext) -> bool:
             return False
         if wf.has_pending and _may_decide(now, boundary, ctx.tick, wf):
             return False
-        if wf.open_incident or wf.suspect_did or wf.suspect_prompt or wf.drain_chain_pending:
+        if wf.open_incident or wf.suspect_prompt or wf.drain_chain_pending:
             return False
     return True
 

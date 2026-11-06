@@ -204,6 +204,28 @@ class Thresholds:
                                             "UCB95 of r_d is below 0.85 in any trailing window "
                                             "of 12, 24 or 48 dialling hours (covers 0.75 to 0.85).")
     did_slow_conf: float = T(0.95, "5.9", "Confidence of the slow-path upper bound.")
+    did_slow_path_degrades: bool = T(False, "5.9, 15.3, ADR 0030", "Whether a slow-path "
+                                     "shortfall degrades the DID (share 0). Off: in the loop, "
+                                     "a DID carrying the load of its old share after a spread "
+                                     "read 0.6 to 0.8 for days, was degraded, and all traffic "
+                                     "moved to the other DID, which then overloaded (ping-pong "
+                                     "concentration on public_02). The slow path still updates "
+                                     "the healthy DIDs' estimates, so a persistent shortfall "
+                                     "gets a share proportional to r_d instead.")
+    did_slow_floor_r: float = T(0.5, "5.9, ADR 0030", "Slow path, always on: a healthy DID "
+                                "whose UCB95 of r_d vs the established DIDs is below 0.5 in any "
+                                "slow window is degraded and never re-admitted. Load alone "
+                                "cannot read this low: the worst load-only ratio is a single "
+                                "fully loaded DID against a fresh one, about 0.61 (A-7).")
+    did_slow_min_dials: int = T(100, "5.9, ADR 0030", "The slow path judges a window only with at "
+                                "least 100 dials on the DID and on its comparator, like the fast "
+                                "path's minimum: a DID with 35 dials and 0 connects against a "
+                                "large comparator would otherwise already cross the line.")
+    did_equal_load_ratio: float = T(0.9, "5.9, ADR 0030", "Healthy DIDs get shares proportional to "
+                                    "r_d only if the better DID carried at least 0.9 of the worse "
+                                    "one's dials over the longest slow window; with fewer, load "
+                                    "explains the gap (a fresh DID always reads better than a "
+                                    "loaded one) and the split stays equal (A-7).")
     did_readmit_days: int = T(3, "5.9", "Re-admission of a degraded DID is a probe after 3 days "
                               "(load decays with tau 2 days).")
     did_fast_windows_h: tuple[int, ...] = T((2, 4, 8), "7.3", "Fast detector windows (dialling "
@@ -212,6 +234,14 @@ class Thresholds:
     did_fast_z: float = T(-4.0, "7.3", "... z <= -4.0 (3.2e-5 per test) ...")
     did_fast_r: float = T(0.75, "7.3", "... and r_d <= 0.75 (excludes natural load imbalance, "
                           "about 0.90).")
+    did_fast_ref_h: int = T(8, "7.3, ADR 0030", "Reference window before the alarm window: an "
+                            "alarm needs the DID credibly above did_fast_r there (lower 95% "
+                            "bound); a DID already short (load after a spread) is a persistent "
+                            "shortfall for the slow path, not a flag.")
+    did_rebalance_min_tv: float = T(0.05, "5.9, ADR 0030", "A caller-ID change that only "
+                                    "re-weights DIDs already carrying traffic (no probe starts, "
+                                    "nothing drained) is proposed only if its TV is >= 0.05, so "
+                                    "proportional shares do not churn configs or approvals.")
     did_suspect_window_h: int = T(1, "7.3", "Suspect window: the trailing 1 dialling hour ...")
     did_suspect_z: float = T(-2.5, "7.3", "... z <= -2.5 ...")
     did_suspect_min_dials: int = T(50, "7.3", "... with >= 50 dials: tick-sized steps until alarm "
@@ -248,6 +278,11 @@ class Thresholds:
                                   "connects.")
     drift_no_history_days: int = T(2, "7.5", "No history: the first 2 dialling days of our own "
                                    "data are the baseline.")
+    drift_baseline_days: int = T(3, "7.5, ADR 0030", "Pickup drift: each block is judged against "
+                                 "the trailing 3 dialling days before its day (history for D0), "
+                                 "not the whole history: history starts with no caller-ID load, "
+                                 "so its early days read about 10% high on a one-DID workflow "
+                                 "and the CUSUM alarmed on D0 before any change.")
 
     # ------------------------------------------------------------------ prompt safety (7.1)
     verdict_stage1_n: int = T(300, "7.1", "Stage 1 of the safety verdict: n = 300 (3 credits).")

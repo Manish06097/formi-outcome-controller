@@ -28,9 +28,10 @@ from controller.cohorts.cells import CellCatalog
 from controller.cohorts.cohortset import GridCohortSet
 from controller.cohorts.grid import GridInputs, build_grid
 from controller.learning.did import DidHealthModel
-from controller.learning.schedule import HourCurvesModel, window_hours
+from controller.learning.schedule import (HourCurvesModel, schedule_change_check,
+                                          window_hours)
 from controller.settings import Thresholds
-from controller.types import (P3_ROUTINE, CohortDef, DidState, Finding, PatchRequest,
+from controller.types import (P3_ROUTINE, CohortDef, DidState, Finding, HourCurveSet, PatchRequest,
                               PickupArrays, WorkflowSnapshot, freeze, thaw)
 
 OWNER_COHORTS = "cohorts.grid"
@@ -57,6 +58,7 @@ class ProbeLearner:
     t: Thresholds = field(default_factory=Thresholds)
     _grids: dict[str, GridCohortSet | None] = field(default_factory=dict)
     _did: dict[str, DidHealthModel] = field(default_factory=dict)
+    _curves: dict[str, HourCurveSet] = field(default_factory=dict)
 
     # ------------------------------------------------------------------ caller ID (5.9)
     def did_model(self, ws: WorkflowSnapshot) -> DidHealthModel:
@@ -92,18 +94,43 @@ class ProbeLearner:
                 self._grids[wf] = g if any(e.origin == "grid" for e in g.entries) else None
         return self._grids[wf]
 
-    def plan_schedule(self, ws: WorkflowSnapshot, business: Sequence[CohortDef]
-                      ) -> list[PatchRequest]:
+    def curves(self, ws: WorkflowSnapshot, business: Sequence[CohortDef]
+               ) -> tuple[GridCohortSet, HourCurveSet] | None:
+        """The workflow's grid and its hour curves from history only. History never changes, so
+        both are computed once per process and a restarted process gets the same ones."""
+        wf = ws.spec.workflow_id
         g = self.grid(ws, business)
         if g is None:
+            return None
+        if wf not in self._curves:
+            hist_ws = dataclasses.replace(ws, pickup=history_pickup(ws.pickup), cohorts=g)
+            self._curves[wf] = HourCurvesModel(self.t).fit(hist_ws)
+        return g, self._curves[wf]
+
+    def verify_schedule_change(self, ws: WorkflowSnapshot, business: Sequence[CohortDef],
+                               applied_minute: int) -> Finding | None:
+        """5.8's credible band on the 2 segments after an applied table (None = not yet). With
+        no history grid there is no curve to judge by: the table was not ours to verify."""
+        fitted = self.curves(ws, business)
+        if fitted is None:
+            return Finding(ws.spec.workflow_id, "schedule", "verified", "workflow", 0.0, 0.0,
+                           ws.now, freeze({"note": "no history curves"}))
+        g, curves = fitted
+        return schedule_change_check(dataclasses.replace(ws, cohorts=g), curves, applied_minute,
+                                     self.t)
+
+    def plan_schedule(self, ws: WorkflowSnapshot, business: Sequence[CohortDef]
+                      ) -> list[PatchRequest]:
+        fitted = self.curves(ws, business)
+        if fitted is None:
             return []
+        g, curves = fitted
         live_ids = ws.live.cohort_ids()
         ours = g.to_config()
         deployed = tuple(ws.live.cohorts) == tuple(ours)
         untouched = tuple(ws.live.cohorts) == tuple(business)
         hist_ws = dataclasses.replace(ws, pickup=history_pickup(ws.pickup), cohorts=g)
-        model = HourCurvesModel(self.t)
-        reqs = model.plan_hour_weights(hist_ws, model.fit(hist_ws))
+        reqs = HourCurvesModel(self.t).plan_hour_weights(hist_ws, curves)
         if not deployed and not untouched:
             # someone else changed the cohort list: never replace it; tables of our cohorts
             # that are still defined only

@@ -4,8 +4,8 @@ release train inside the orchestrator's stages, over Postgres and the write-ahea
 Owner: integration step I2 (milestone M3). Implements DESIGN.md 4.1 steps 4, 5, 8 and 9 (REFRESH's
 supervisor-edit handler, LIFECYCLE, GOVERN, VERIFY), 2 restart step 5 (the proposal sweep), 6.1 to
 6.7 through `governance/*` and `planner/overlay.py`, and 8.2 and 8.3 through
-`governance/effects.py`. It also runs the probe-only learner (`learning/probe.py`) in DETECT and
-DECIDE when `CTL_LEARNER=probe`. ADR 0029.
+`governance/effects.py`. It also runs the pickup levers (`learning/probe.py`, `loop/pickup.py`) in
+DETECT, DECIDE and VERIFY when `CTL_LEARNER=probe`. ADR 0029, ADR 0030.
 
 State: nothing lives only here. Proposals, transitions, the approval mirror, the overlay
 (patches, owners, cooldowns), DID states and every decision are in the run schema; `attach`
@@ -19,12 +19,16 @@ Per step, in the orchestrator's order:
   LIFECYCLE  policy re-read (9.7); `recover` (crash leftovers); `tick` (apply visible approvals
              after the pre-apply checks, resolve rejected and expired, release noticed
              auto-applies); auto-release of held patches
-  DETECT     DID states (probe learner): SPRT on probe dials, slow path, persisted every step
-  DECIDE     at each workflow's planning point (its routine slot minutes): learner patches, each
-             with its decision row, into the overlay
+  DETECT     DID states (probe learner): SPRT on probe dials, slow path, the flagged-DID detector
+             and the KPI drift CUSUMs (`loop/pickup.py`), persisted every step
+  DECIDE     every stop: the next drain step of a draining DID incident, and the caller-ID plan
+             of a workflow where a DID carrying traffic just turned bad; at each workflow's
+             planning point (its routine slot minutes): learner patches, each with its decision
+             row and behind the caller-ID harm gate, into the overlay
   GOVERN     `ReleaseTrain.run`: compose, route, timing, act; one decision row per workflow that
              had something to do
-  VERIFY     `ProposalLifecycle.verify` (kind verifiers are wired by later steps)
+  VERIFY     `ProposalLifecycle.verify` with the caller-ID and schedule verifiers, then DID drain
+             verification
 """
 from __future__ import annotations
 
@@ -37,28 +41,29 @@ from psycopg.types.json import Jsonb
 from controller.audit.writer import record, write_decision
 from controller.governance.builder import BuildContext
 from controller.governance.effects import IntentEffects, attach_effect_hooks
-from controller.governance.lifecycle import LifecycleDeps, ProposalLifecycle
+from controller.governance.lifecycle import LifecycleDeps, ProposalLifecycle, VerifyResult
 from controller.governance.release import ReleaseDeps, ReleaseTrain
 from controller.governance.store_pg import OverlayStore, PgProposalStore, TxScope, holds_of
 from controller.governance.timing import choose_submit, routine_slots
 from controller.learning.probe import OWNER_COHORTS, ProbeLearner, did_rows
+from controller.learning.schedule import OWNER as OWNER_SCHEDULE
 from controller.loop.orchestrator import LoopHooks, Runtime, StageCounts
+from controller.loop.pickup import PickupLevers, json_safe
 from controller.obs.alerts import raise_alert
 from controller.planner.overlay import LIVE_STATES, OverlayContext, dominant
 from controller.snapshot import load_snapshot
 from controller.store import repos
-from controller.types import (DEFAULT_COHORT, IN_FLIGHT_STATES, CohortDef, Config,
-                              ConfigChange, Decision, DidState, EffectivePolicy, FrozenDict,
-                              Hold, PatchRequest, Proposal, Tx, WorkflowSnapshot, canonical_json,
-                              freeze, thaw)
+from controller.types import (DEFAULT_COHORT, IN_FLIGHT_STATES, P0_INCIDENT, P1_ROLLBACK, CohortDef,
+                              Config, ConfigChange, Decision, DidState, EffectivePolicy,
+                              FrozenDict, Hold, PatchRequest, Proposal, Tx, WorkflowSnapshot,
+                              canonical_json, freeze, thaw)
 from controller.world.configs import load_cells
 from controller.world.directives import load_directives
 from controller.world.registry import WorkflowRegistry
 
 log = logging.getLogger(__name__)
 
-SCHEDULE_REVERT_LOOKBACK_MIN = 7 * 1440
-"""classify_risk: a schedule table equal to one live in the last 7 days is a revert (6.5)."""
+RULE_SCHEDULE_RESTORE = "5.8/schedule_restore"
 
 
 class GovernanceHooks(LoopHooks):
@@ -91,18 +96,22 @@ class GovernanceHooks(LoopHooks):
             in_flight=lambda wf: self.store.in_states(IN_FLIGHT_STATES, wf))
         for wid, cohorts in self.business.items():
             self.overlay.mark_supervisor_cohorts(wid, [c.id for c in cohorts])
+        self.pickup = PickupLevers(self.t, rt.catalog, self._decision)
         self.lc = ProposalLifecycle(LifecycleDeps(
             store=self.store, overlay=self.overlay, sim=rt.client,
             executor=IntentEffects(rt.intents, self.scope), policy_of=self.registry.policy,
             clock=self._clock, epoch=rt.epoch, run6=rt.run6,
             settings_hash=rt.settings.settings_hash(), code_version=rt.settings.env.code_version,
-            t=self.t, holds=self._holds, on_alert=self._alert, on_applied=self._on_applied))
+            t=self.t, holds=self._holds, on_alert=self._alert, on_applied=self._on_applied,
+            verifiers=self._pickup_verifiers(), on_rollback=self._on_rollback))
         self.release = ReleaseTrain(ReleaseDeps(
             overlay=self.overlay, lifecycle=self.lc, policy_of=self.registry.policy,
             workflows=self.registry.workflow_ids, live=self._live,
             build_context=self._build_context, holds=self._holds,
             suspect_since=self._suspect_since, t=self.t))
         attach_effect_hooks(rt.registry, lambda: self.lc, self.scope)
+        with self.scope.tx() as tx:
+            self.pickup.restore(tx)
 
     def _business_cohorts(self, tx: Tx, wid: str) -> tuple[CohortDef, ...]:
         """The business default's cohorts (version 1): supervisor-owned from the start (5.2)."""
@@ -175,7 +184,7 @@ class GovernanceHooks(LoopHooks):
             rows = repos.config_versions(tx, self.rt.catalog.code(wf))
         return [r.config for r in rows if r.config is not None
                 and (r.applied_minute is None
-                     or r.applied_minute > self.now - SCHEDULE_REVERT_LOOKBACK_MIN)]
+                     or r.applied_minute > self.now - self.t.schedule_revert_lookback_min)]
 
     def _build_context(self, wf: str) -> BuildContext:
         """What the request builder needs for the affected-leads count (6.6): the cells, the
@@ -227,8 +236,13 @@ class GovernanceHooks(LoopHooks):
                 slots.add(when)
         notices = [p.notice_until_minute for p in self.store.in_states(("noticed",), workflow_id)
                    if p.notice_until_minute is not None]
+        # an incident needs tick-sized stops while it acts (a drain chain moves one step per
+        # stop); a drained DID waiting for its 2 dialling hours of verification does not
+        acting = any(i.kind != "did_degraded" or i.state == "draining"
+                     for i in self.pickup.mgr.open_incidents(workflow_id))
         return {"planned_slots": tuple(sorted(s for s in slots if s > now)),
-                "notice_expiries": tuple(sorted(notices))}
+                "notice_expiries": tuple(sorted(notices)),
+                "open_incident": acting}
 
     def full_sweep(self, rt: Runtime) -> None:
         """Restart step 5: every proposal a crash left mid-call against the simulator, unsent
@@ -300,8 +314,13 @@ class GovernanceHooks(LoopHooks):
 
     def _reread_policies(self, rt: Runtime) -> None:
         """9.7: the policy is read from the API every step; a changed field is audited, and a
-        fresh read clears the post-403 auto-apply block."""
-        changes = self.registry.load(rt.client.workflows(), rt.tick)
+        fresh read clears the post-403 auto-apply block. A workflow that was not there at the
+        start has no catalog entry or history, so it is reported and left alone."""
+        specs = rt.client.workflows()
+        known = [s for s in specs if s.workflow_id in rt.catalog.codes]
+        self._report_unknown_workflows([s.workflow_id for s in specs
+                                        if s.workflow_id not in rt.catalog.codes])
+        changes = self.registry.load(known, rt.tick)
         if not changes:
             return
         with self.scope.tx() as tx:
@@ -311,6 +330,19 @@ class GovernanceHooks(LoopHooks):
                        details={"old": str(c.old), "new": str(c.new)})
         for wf in {c.workflow_id for c in changes}:
             self.lc.policy_reread(wf)
+
+    def _report_unknown_workflows(self, ids: Sequence[str]) -> None:
+        if not ids:
+            return
+        with self.scope.tx() as tx:
+            for wid in sorted(ids):
+                alert = raise_alert(tx, "UNKNOWN_WORKFLOW", None, wid,
+                                    f"{wid} appeared mid-run; ignored until a new run",
+                                    sim_minute=self.now)
+                if alert is not None:
+                    record(tx, wf=None, actor="controller", action="workflow_ignored",
+                           subject=("workflow", wid),
+                           summary=f"{wid} is not in this run's catalog", details={})
 
     def _applied_count(self) -> int:
         with self.scope.tx() as tx:
@@ -328,8 +360,49 @@ class GovernanceHooks(LoopHooks):
                              in_flight=self.store.holder(wf), end_minute=clock.end_minute,
                              run_id=self.rt.schema)
 
+    def bootstrap(self, rt: Runtime) -> StageCounts | None:
+        """Restart step 6, once per run (DESIGN.md 2, 5.2, 5.9): each workflow's D0 cohort grid
+        from history, recorded in `cohort_def` with its decision row (the grid reaches the
+        config through governance, at the workflow's first routine slot), and the D0 DID states
+        from history. Idempotent: rows are keyed and upserted, so an interrupted bootstrap
+        reruns to the same result."""
+        if self.learner is None:
+            return None
+        self.now = self._db_clock()
+        n = 0
+        for wf in self.registry.workflow_ids():
+            with self.scope.tx() as tx:
+                ws = self._snapshot(tx, wf)
+                g = self.learner.grid(ws, self.business[wf])
+                if g is not None:
+                    for row in g.rows(created_minute=self.now):
+                        tx.execute("""INSERT INTO cohort_def (cohort_key, wf, where_canon,
+                                                              def_hash, cells, origin,
+                                                              created_minute)
+                                      VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                      ON CONFLICT (cohort_key) DO NOTHING""",
+                                   (row["cohort_key"], self.rt.catalog.code(wf),
+                                    _jsonb(row["where_canon"]), row["def_hash"], row["cells"],
+                                    row["origin"], row["created_minute"]))
+                write_decision(tx, self._decision(
+                    wf, OWNER_COHORTS, "cohort_grid", "5.2/build_grid",
+                    {"business_cohorts": [c.id for c in self.business[wf]]},
+                    {"cohorts": list(g.keys()) if g is not None else [],
+                     "set_key": g.key() if g is not None else None,
+                     "evidence": json_safe(g.evidence) if g is not None else
+                     {"reason": "no history grid cohort"}}))
+                if not ws.did_state:
+                    states = self.learner.did_bootstrap(ws)
+                    self._write_did_states(tx, wf, states)
+                    write_decision(tx, self._decision(
+                        wf, "learning.did", "did_state", "5.9/bootstrap", {},
+                        {"states": {d: st.status for d, st in sorted(states.items())}}))
+                n += 1
+        return StageCounts(decisions=n)
+
     def detect(self, rt: Runtime, now: int) -> StageCounts | None:
-        """DID states every step (the SPRT reads each tick's probe dials once)."""
+        """DID states every step (the SPRT reads each tick's probe dials once), then the
+        flagged-DID detector and the KPI drift CUSUMs (`loop/pickup.py`)."""
         self.now = now
         if self.learner is None:
             return None
@@ -341,14 +414,21 @@ class GovernanceHooks(LoopHooks):
                     findings = []
                 else:
                     states, findings = self.learner.did_step(ws)
-                changed = {n: s for n, s in states.items() if ws.did_state.get(n) != s}
-                if changed:
-                    self._write_did_states(tx, wf, changed)
+                had_healthy = not ws.did_state or any(
+                    s.status == "healthy" for s in ws.did_state.values())
                 for f in findings:
+                    if f.kind == "no_healthy" and not had_healthy:
+                        continue        # recorded when it starts, not at every step it lasts
                     write_decision(tx, self._decision(
                         wf, "learning.did", "did_state", f"5.9/{f.kind}",
                         {"did": f.scope, "stat": f.stat, "threshold": f.threshold},
-                        {"status": changed[f.scope].status} if f.scope in changed else {}))
+                        {"status": states[f.scope].status} if f.scope in states else {}))
+                ws1 = dataclasses.replace(ws, did_state=FrozenDict(states))
+                states = {**states, **self.pickup.detect(tx, ws1,
+                                                         self.learner.did_model(ws1))}
+                changed = {n: s for n, s in states.items() if ws.did_state.get(n) != s}
+                if changed:
+                    self._write_did_states(tx, wf, changed)
         return None
 
     def _write_did_states(self, tx: Tx, wf: str, states: Mapping[str, DidState]) -> None:
@@ -370,26 +450,72 @@ class GovernanceHooks(LoopHooks):
         return now in routine_slots(now // 1440, self.registry.policy(wf), t=self.t)
 
     def decide(self, rt: Runtime, now: int) -> StageCounts | None:
+        """Every stop: the next drain step of a draining DID incident (P0b, 7.3). At the
+        workflow's planning points: the probe learner's requests (probes, spread, cohorts and
+        hour weights), each cut back by the caller-ID harm gate; a change the gate cuts to
+        nothing is a recorded decision not to act."""
         self.now = now
         if self.learner is None:
             return None
         n = 0
         for wf in self.registry.workflow_ids():
-            if not self.is_planning_point(wf, now):
+            planning = self.is_planning_point(wf, now)
+            turned_bad = not planning and self._did_turned_bad(wf, now)
+            if not planning and not turned_bad and not self.pickup.draining(wf):
                 continue
             with self.scope.tx() as tx:
                 ws = self._snapshot(tx, wf)
-                reqs = self.learner.plan(ws, self.business[wf])
+                model = self.learner.did_model(ws)
+                reqs = self.pickup.drain_requests(tx, ws, model)
+                if planning:
+                    reqs += self._without_rolled_back_tables(
+                        tx, wf, self.learner.plan(ws, self.business[wf]))
+                elif turned_bad:
+                    reqs += [r for r in model.plan_caller_ids(ws) if r.cls != P0_INCIDENT]
+                if planning or turned_bad:
+                    self._record_blocked(tx, wf, model, now)
                 for req in reqs:
                     if self._already_wanted(req):
                         continue
                     did = write_decision(tx, self._decision(
                         wf, req.owner, "patch", _rule_of(req),
-                        {"path": list(req.path), "evidence": thaw(req.evidence)},
+                        {"path": list(req.path), "evidence": json_safe(req.evidence)},
                         {"value": _json_value(req.value), "class": req.cls}))
                     self.overlay.add(dataclasses.replace(req, decision_id=did))
                     n += 1
         return StageCounts(decisions=n)
+
+    def _did_turned_bad(self, wf: str, now: int) -> bool:
+        """DETECT just moved a DID that still carries traffic to degraded or unhealthy (the
+        floor, the SPRT or the slow path; a fast alarm opens an incident instead, which
+        `draining` covers). Its share comes off now, not at the next routine slot. Read from
+        `did_state`, so a restart between DETECT and DECIDE sees the same."""
+        live = self.rt.mirror.live(wf)[1]
+        carried = {d for k in {DEFAULT_COHORT, *live.allocations}
+                   for d, w in live.dist(k, "caller_id").items() if w > 0}
+        return any(s.status in ("degraded", "unhealthy") and s.since_minute == now
+                   and d in carried for d, s in self.did_states(wf).items())
+
+    def _record_blocked(self, tx: Tx, wf: str, model: Any, now: int) -> None:
+        """A change the harm gate cut to nothing is a decision not to act (0.1)."""
+        for b in model.blocked:
+            write_decision(tx, self._decision(
+                wf, "learning.did", "no_action", "0.1/did_gate", json_safe(b),
+                {"blocked": "harm gate cut the change to nothing"}))
+            raise_alert(tx, "HARM_GATE_BLOCK", self.rt.catalog.code(wf),
+                        f"{wf}:caller_id:{b['scope']}",
+                        f"caller-ID change on {b['scope']} blocked: P(dd < -2%) "
+                        f"{b['full_p_dd_below_line']:.3f} > {b['alpha_d']}", sim_minute=now)
+
+    def _without_rolled_back_tables(self, tx: Tx, wf: str, reqs: list[PatchRequest]
+                                    ) -> list[PatchRequest]:
+        """After a table failed verification (5.8) the curves are not trusted for this workflow:
+        proposing them again would undo the restore at the next slot."""
+        if not any(r.path[0] == "hour_weights" for r in reqs):
+            return reqs
+        restored = tx.execute("""SELECT 1 FROM decision WHERE wf = %s AND rule_id = %s LIMIT 1""",
+                              (self.rt.catalog.code(wf), RULE_SCHEDULE_RESTORE)).fetchone()
+        return [r for r in reqs if r.path[0] != "hour_weights"] if restored else reqs
 
     def _already_wanted(self, req: PatchRequest) -> bool:
         """A live patch on the same path with the same value already carries this request."""
@@ -417,14 +543,61 @@ class GovernanceHooks(LoopHooks):
                 d.wf, "governance.release", "release", f"6.2/{d.action}",
                 {"now": now}, {"action": d.action, "reason": d.reason,
                                "proposal_id": d.proposal_id,
-                               "planned_minute": d.planned_minute}))
+                               "planned_minute": d.planned_minute,
+                               "auto_refused": list(d.auto_refused)}))
             if d.action == "no_safe_window":
                 raise_alert(tx, "NO_SAFE_WINDOW", self.rt.catalog.code(d.wf), d.wf, d.reason,
                             sim_minute=now)
 
+    def _pickup_verifiers(self) -> dict[str, Any]:
+        """The kind verifiers of 6.1 for the levers of this module."""
+        if self.learner is None:
+            return {}
+        return {"caller_id": self._verify_pickup, "schedule": self._verify_pickup}
+
+    def _verify_pickup(self, p: Proposal, now: int) -> VerifyResult:
+        with self.scope.tx() as tx:
+            ws = self._snapshot(tx, p.wf)
+        return self.pickup.verify_change(
+            ws, p, lambda at: self.learner.verify_schedule_change(ws, self.business[p.wf], at))
+
+    def _on_rollback(self, p: Proposal, r: VerifyResult) -> None:
+        """A failed hour table comes back out as a P1 (5.8, risk-reducing because the old table
+        was live in the look-back, 6.5). A failed caller-ID check only pages: the DID detectors
+        act on what they find (7.3)."""
+        if r.page != "SCHEDULE_UNVERIFIED":
+            return
+        with self.scope.tx() as tx:
+            old = self.rt.mirror.body(p.wf, p.base_version, tx)
+            if old is None or p.proposed_config is None:
+                return
+            new = p.proposed_config
+            for k in sorted(set(old.hour_weights) | set(new.hour_weights)):
+                before = old.hour_weights.get(k)
+                if before == new.hour_weights.get(k):
+                    continue
+                value = dict(before) if before is not None else None
+                did = write_decision(tx, self._decision(
+                    p.wf, OWNER_SCHEDULE, "patch", RULE_SCHEDULE_RESTORE,
+                    {"proposal_id": p.proposal_id, "cohort": k, "reasons": list(r.reasons)},
+                    {"value": value, "class": P1_ROLLBACK}))
+                self.overlay.add(PatchRequest(
+                    wf=p.wf, owner=OWNER_SCHEDULE, path=("hour_weights", k),
+                    value=FrozenDict(value) if value is not None else None, cls=P1_ROLLBACK,
+                    p0_rank=None, decision_id=did,
+                    evidence=freeze({"kind": "schedule", "cohort": k,
+                                     "restores": p.proposal_id})))
+
     def verify(self, rt: Runtime, now: int) -> StageCounts | None:
         self.now = now
         self.lc.verify(now)
+        if self.learner is not None:
+            for wf in self.registry.workflow_ids():
+                if not any(i.state == "verifying"
+                           for i in self.pickup.mgr.open_incidents(wf, "did_degraded")):
+                    continue
+                with self.scope.tx() as tx:
+                    self.pickup.verify(tx, self._snapshot(tx, wf))
         return None
 
 

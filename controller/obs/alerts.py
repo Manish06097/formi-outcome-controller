@@ -63,6 +63,20 @@ CODES: dict[str, AlertCode] = {c.code: c for c in (
     AlertCode("CLIENT_GATE_UNREACHABLE", "page", "event",
               "safe prompts cannot pass the client validation gate reliably"),
     AlertCode("NO_HEALTHY_DID", "page", "condition", "no caller ID can take traffic"),
+    AlertCode("DID_DEGRADED", "page", "event",
+              "the fast DID detector alarmed on a caller ID (7.3); a P0b drain is running"),
+    AlertCode("DID_DRAIN_UNVERIFIED", "page", "event",
+              "two dialling hours after a DID drain, the drained DID still dials or workflow "
+              "pickup is below 0.9 of its pre-incident level (7.3)"),
+    AlertCode("DID_CHANGE_UNVERIFIED", "page", "event",
+              "two dialling hours after a caller-ID change, a DID it dropped still dials or "
+              "workflow pickup is credibly below 0.9 of the 24h before (5.9, 7.3)"),
+    AlertCode("SCHEDULE_UNVERIFIED", "page", "event",
+              "the 2 segments after an hour table fell below its credible band; a P1 restores "
+              "the previous table (5.8)"),
+    AlertCode("UNKNOWN_WORKFLOW", "page", "event",
+              "the API lists a workflow that was not there when this run started; it is ignored "
+              "until a new run"),
     AlertCode("NO_SAFE_WINDOW", "page", "event", "no expiry-safe submit minute in the next 24h"),
     AlertCode("NEW_WORLD", "page", "event", "the simulator restarted or the scenario re-ran"),
     AlertCode("UNKNOWN_WRITER", "page", "event",

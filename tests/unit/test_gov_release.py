@@ -131,6 +131,24 @@ def test_chain_step_moves_max_shift_on_the_straight_line():
     assert chain_lambda(_comp(live, small), pol, T) == 1.0
 
 
+def test_every_chain_step_passes_our_own_check_on_the_stored_form():
+    """Regression (ADR 0030): at lam = cap / worst the normalised step landed on the cap with
+    float noise and failed `max_shift - margin` about one time in six, which sent a drain step
+    of custom (d) to an approval. A step must pass the check exactly, for any start."""
+    from controller.governance.policy import sim_verdict
+    from controller.types import AutoApplyPolicy
+    pol = policy(allowed_dims=["caller_id"], max_shift=0.05)
+    aa = AutoApplyPolicy(enabled=True, allowed_dims=("caller_id",), max_shift=0.05)
+    for i in range(200):
+        d2 = 0.06 + i * 0.0013337
+        live = base_config(caller_id={"D1": 1 - d2, "D2": d2})
+        target = live.with_allocation("default", "caller_id", {"D1": 1.0})
+        c = _comp(live, target)
+        step = interpolate(live, target.as_stored(), chain_lambda(c, pol, T)).as_stored()
+        v = sim_verdict(aa, live, step, margin=T.max_shift_margin)
+        assert not v.shift_exceeds, (d2, v.shift)
+
+
 def test_no_submit_reason_tells_fatigue_from_a_missing_window():
     """At cap 1 a rejected routine request leaves no slot for 48h: that is the budget working,
     not NO_SAFE_WINDOW (found in the gov_c_cap1 variant, step I2)."""

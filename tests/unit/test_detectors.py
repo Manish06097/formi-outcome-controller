@@ -2,6 +2,8 @@
 flag CUSUM on the hourly series, prompt triggers and D0 screens, KPI drift CUSUM."""
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
@@ -212,7 +214,7 @@ def test_drift_quiet_in_control_and_alarms_on_a_20_percent_pickup_drop():
     dd = DriftDetector()
     st, f = dd.update(drift_ws(hist + ok, 5 * 1440), {})
     assert not any(x.kind == "pickup_down" for x in f)
-    assert st["pickup_rate"].baseline_kind == "history"
+    assert st["pickup_rate"].baseline_kind == "own"     # D4's blocks: the trailing D1 to D3
     drop = pickup_rows(3, 2, 5, p_mult=lambda d, h: 0.8 if (d > 5 or h >= 12) else 1.0)
     alarm = None
     for now in range(5 * 1440 + 10 * 60, 7 * 1440, 60):
@@ -222,6 +224,19 @@ def test_drift_quiet_in_control_and_alarms_on_a_20_percent_pickup_drop():
             break
     assert alarm is not None
     assert (alarm - (5 * 1440 + 12 * 60)) / 60 <= 8      # table: about 3.8 dialling hours
+
+
+def test_drift_ignores_the_cold_start_of_history():
+    """History starts with no caller-ID load, so its first days pick up more than the steady
+    state (ADR 0030: found end to end, the CUSUM alarmed on D0 before any change). Judged
+    against the trailing days only, an unchanged world raises no drift."""
+    cold = lambda d, h: 1.0 + 0.25 * math.exp((d + 14) / -2.0)     # +25% at D-14, gone by D-7
+    hist = pickup_rows(11, 14, -14, p_mult=cold)
+    ok = pickup_rows(12, 3, 0)
+    dd = DriftDetector()
+    st, f = dd.update(drift_ws(hist + ok, 3 * 1440), {})
+    assert not any(x.kind == "pickup_down" for x in f)
+    assert st["pickup_rate"].last_block >= 2 * 24 + 20
 
 
 def test_drift_upward_arm_is_view_only_and_no_history_uses_own_baseline():
@@ -248,11 +263,54 @@ def test_engagement_drift_from_the_hourly_flag_series():
 
 
 def test_detect_entry_point_runs_every_detector():
-    rows = cancel_like_did_rows(1, 1, 10 * 60, 0.333)
+    rows = cancel_like_did_rows(1, 2, 1440 + 10 * 60, 0.333)
     spec = synth.make_spec(dials_per_hour=400)
-    ws = synth.snapshot(spec, did=synth.did_arrays(rows), now=13 * 60,
+    ws = synth.snapshot(spec, did=synth.did_arrays(rows), now=1440 + 13 * 60,
                         flags=synth.flag_series(flag_rows(1, 48, lambda h: 0.01, start=-48)))
     f = detect(ws, DetectorState("wf_a"))
     assert any(x.detector == "did" and x.kind == "alarm" for x in f)
     assert any(x.detector == "flag" and x.kind == "reset" for x in f)
     assert isinstance(Config, type)
+
+
+# ------------------------------------------------------------------------------- ADR 0030 rules
+
+def _did_rows(seed, shares, r=None, r_after=None, days=2):
+    rng = np.random.default_rng(seed)
+    out = []
+    for d in range(days):
+        out += synth.simulate_did_day(rng, day=d, tick=TICK, window=(9, 21), dials_per_hour=400,
+                                      shares=shares, p=0.25, r=r, r_after=r_after)
+    return out
+
+
+def test_did_detector_leaves_a_persistent_shortfall_to_the_slow_path():
+    """A DID that has run at r = 0.6 all along (an incumbent still carrying the load of its old
+    share after a spread) is not a sudden flag: no alarm, no suspect. The same DID falling from
+    1.0 to 0.36 at D1 10:00 alarms."""
+    shares = {0: 1 / 3, 1: 1 / 3, 2: 1 / 3}
+    steady = _did_rows(5, shares, r={1: 0.6})
+    for now in range(1440 + 11 * 60, 1440 + 21 * 60, 60):
+        assert not [f for f in DidDetector().detect(did_ws(steady, now)) if f.scope == "D2"]
+    flagged = _did_rows(5, shares, r_after={1: (1440 + 10 * 60, 0.36)})
+    kinds = {f.kind for now in range(1440 + 11 * 60, 1440 + 14 * 60, TICK)
+             for f in DidDetector().detect(did_ws(flagged, now)) if f.scope == "D2"}
+    assert "alarm" in kinds
+
+
+def test_did_detector_needs_a_comparator_with_enough_dials():
+    """A flagged DID carrying 98% of the dials against two 1% DIDs: the comparator has about 16
+    dials in 2 hours, too few to call anything (a 5-dial comparator once gave z = -4.6)."""
+    rows = _did_rows(6, {0: 0.01, 1: 0.98, 2: 0.01}, r_after={1: (1440 + 10 * 60, 0.36)})
+    for now in range(1440 + 10 * 60 + TICK, 1440 + 13 * 60, TICK):
+        assert not [f for f in DidDetector().detect(did_ws(rows, now)) if f.kind == "alarm"]
+
+
+def test_probes_are_never_comparators():
+    """Against probes an incumbent always looks degraded (they carry no load), so a workflow
+    whose other DIDs are all probing has no comparator: the drift detector covers it."""
+    rows = _did_rows(7, {0: 0.5, 1: 0.25, 2: 0.25}, r_after={0: (1440 + 10 * 60, 0.36)})
+    probing = {n: DidState("wf_a", n, "probing") for n in ("D2", "D3")}
+    probing["D1"] = DidState("wf_a", "D1", "healthy")
+    for now in range(1440 + 11 * 60, 1440 + 14 * 60, TICK):
+        assert DidDetector().detect(did_ws(rows, now, probing)) == []

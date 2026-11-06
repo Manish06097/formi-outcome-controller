@@ -279,7 +279,8 @@ def test_pickup_drift_on_a_sole_did_marks_it_suspect_and_starts_probes():
     assert any(a["code"] == "KPI_DRIFT" for a in m.alerts)
     plan = m.did_model.plan_caller_ids(m.states_for(ws))
     v = dict(plan[0].value)
-    assert v["D2"] == pytest.approx(0.028) and v["D3"] == pytest.approx(0.028)
+    # one untested DID per change at the full probe share (ADR 0030, test_did.py)
+    assert v["D2"] == pytest.approx(0.028) and "D3" not in v
     assert plan[0].evidence["alert"] == "NO_HEALTHY_DID"
     assert sim.calls == []                                    # the DID path needs no credits
 

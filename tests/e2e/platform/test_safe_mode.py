@@ -108,8 +108,9 @@ def test_governance_lifecycle_keeps_running_when_the_learner_breaks(sim_factory,
     assert query(db_dsn, schema, "SELECT count(*) FROM intent WHERE status = 'started'") == [(0,)]
     created = query(db_dsn, schema, "SELECT count(*) FROM proposal")[0][0]
     applied = query(db_dsn, schema, "SELECT count(*) FROM proposal WHERE state IN "
-                                    "('APPLIED', 'VERIFYING', 'VERIFIED')")[0][0]
-    assert created > 0 and applied > 0, (created, applied)
+                                    "('applied', 'verifying', 'verified')")[0][0]
+    states = query(db_dsn, schema, "SELECT state, count(*) FROM proposal GROUP BY 1 ORDER BY 1")
+    assert created > 0 and applied > 0, (created, applied, states)
     client = SimClient(sim.url)
     assert any(len(client.config_history(s.workflow_id)) > 1 for s in client.workflows())
     # no double applies, no rejected auto-applies: governance stayed correct in safe mode

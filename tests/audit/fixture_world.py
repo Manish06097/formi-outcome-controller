@@ -88,6 +88,9 @@ def build(dsn: str) -> str:
 def api_dsn(dsn: str) -> str:
     parts = dict(p.split("=", 1) for p in dsn.split())
     parts["user"], parts["password"] = "ctl_api", API_PASSWORD
+    # libpq defaults dbname to the user name; a DSN without dbname (CTL_TEST_PG_DSN) would then
+    # name a database "ctl_api" that does not exist. Compose connects to dbname=postgres.
+    parts.setdefault("dbname", "postgres")
     return " ".join(f"{k}={v}" for k, v in parts.items())
 
 

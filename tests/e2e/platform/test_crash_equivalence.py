@@ -108,6 +108,11 @@ def _one_run(base_dsn: str, workdir, fault: str | None, learner: str = "none",
                                                   ORDER BY 1"""),
                "runs": query(dsn, schema, """SELECT count(*), count(*) FILTER (WHERE designated)
                                              FROM validation_run"""),
+               "lost_intents": query(dsn, schema, """SELECT idem_key, 1 FROM intent
+                                                     WHERE response->>'lost' = 'true'"""),
+               "retries": query(dsn, schema, """SELECT idem_key, 1 FROM intent
+                                                WHERE kind IN ('validation', 'suggest_fixes')
+                                                AND idem_key ~ ':r[0-9]+$'"""),
                "history": {w.workflow_id: len(SimClient(sim.url).config_history(w.workflow_id))
                            for w in SimClient(sim.url).workflows()}}
         return out
@@ -231,13 +236,13 @@ def test_crash_equivalence_money(clean_money, pg_dsn, tmp_path, kind, n, phase):
         assert out["ledger"] == clean_money["ledger"]
         assert diff_dumps(clean_money["dump"], out["dump"]) == []
         return
-    extra = _ledger_total(out["ledger"]) - _ledger_total(clean_money["ledger"])
-    assert 0 <= extra <= 10, f"a lost call costs at most one extra run (10 credits): {extra}"
-    lost = [r for r in out["ledger"] if r not in clean_money["ledger"]]
-    n_runs_clean, n_runs = clean_money["runs"][0][0], out["runs"][0][0]
-    if kind == "validation":
-        assert n_runs <= n_runs_clean + 1
-    else:
-        assert extra == 0 and n_runs == n_runs_clean, (extra, lost)
+    # The world after a lost call differs from the clean run's (the repeated run has a new id,
+    # and the id seeds the outcome), so totals are not comparable; the property is structural:
+    # exactly one intent was lost, it was repeated at most once, and the books balance (above).
+    lost = [k for k, _ in out["lost_intents"]]
+    assert len(lost) == 1 and lost[0].split(":")[0] in ("val", "sug"), lost
+    assert not [k for k, _ in out["retries"] if k.endswith(":r3")], out["retries"]
+    if kind == "suggest_fixes":
+        assert not [k for k, _ in out["retries"]], "a lost suggest-fixes call is not repeated"
     assert all(state == "resolved" for _, state in out["incidents"]), out["incidents"]
     assert [i for i, _ in out["incidents"]] == [i for i, _ in clean_money["incidents"]]

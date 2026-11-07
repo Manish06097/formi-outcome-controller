@@ -111,3 +111,15 @@ def test_record_writes_ledger_and_envelope(pg_dsn):
                            ).fetchone()
         assert env == (130.0, 3.0, "normal")
         conn.execute("DROP SCHEMA t4_credits CASCADE")
+
+
+def test_refund_undoes_an_authorize_whose_spend_is_already_stored():
+    """A replayed intent after a crash: the result transaction committed before the process died,
+    so the in-memory debit made for the repeat must be given back (ADR 0032)."""
+    b = OrderedCreditBudget(plan_pools(200, 5, False, {"a": 1}, llm_suggest=False))
+    b.sync(200)
+    before = (b.left("R"), b.api_remaining)
+    assert b.authorize("a", "R", "verdict_full", 3)
+    assert (b.left("R"), b.api_remaining) == (before[0] - 3, before[1] - 3)
+    b.refund("a", "R", 3)
+    assert (b.left("R"), b.api_remaining) == before

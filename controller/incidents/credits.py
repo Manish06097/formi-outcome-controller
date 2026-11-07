@@ -171,6 +171,15 @@ class OrderedCreditBudget:
         self._last = {"tenant": tenant, "pool": pool, "purpose": purpose, "amount": amount}
         return True
 
+    def refund(self, tenant: str, pool: Literal["R", "S", "U"], amount: float) -> None:
+        """Undo an in-memory `authorize` whose spend is already in the store (a replayed intent
+        after a crash: the result transaction committed before the process died)."""
+        p = self.pools.get((pool, SHARED if pool in ("R", "U") else tenant))
+        if p is not None:
+            p.spent -= amount
+        if self.api_remaining is not None:
+            self.api_remaining += amount
+
     def authorize_incident(self, tenant: str, purpose: str, amount: float) -> str | None:
         """An incident spend: from R, else from U (which exists to top R up). Returns the pool
         that paid, or None."""

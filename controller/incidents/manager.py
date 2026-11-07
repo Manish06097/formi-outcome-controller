@@ -132,18 +132,28 @@ class IncidentManagerImpl:
         """Open, advance and fix incidents for this stop; returns P0 patches (P0a prompt fixes,
         P0b drain steps). Called every stop, with or without new findings, so open incidents keep
         moving (a drain chain emits one step per stop)."""
-        out: list[PatchRequest] = []
+        self.on_prompt_findings(ws, findings)
+        self.on_detections(ws, findings)
+        out = self.fix_patches(ws)
+        out.extend(self.drain_patches(ws))
+        return out
+
+    def on_prompt_findings(self, ws: WorkflowSnapshot, findings: list[Finding]) -> None:
+        """The prompt-safety part of `on_findings` (7.1): a prompt change, a flag CUSUM alarm or a
+        D0 screen may judge a prompt and open an incident. Makes the validation calls."""
         for f in sorted(findings, key=lambda x: (x.detector, x.kind, x.scope)):
             if f.detector in ("prompt", "flag", "screen"):
                 self._on_prompt_finding(ws, f)
-        self.on_detections(ws, findings)
+
+    def fix_patches(self, ws: WorkflowSnapshot) -> list[PatchRequest]:
+        """The P0a fix request of every open or blocked prompt incident of this workflow."""
+        out: list[PatchRequest] = []
         for inc in sorted(self.open_incidents(ws.spec.workflow_id, "prompt_safety"),
                           key=lambda i: i.incident_id):
             if inc.state in ("open", "blocked"):
                 req = self._select_fix(ws, inc)
                 if req is not None:
                     out.append(req)
-        out.extend(self.drain_patches(ws))
         return out
 
     def on_detections(self, ws: WorkflowSnapshot, findings: list[Finding]) -> None:
@@ -276,9 +286,11 @@ class IncidentManagerImpl:
             reason = "disabled (CTL_LLM_SUGGEST=0)"
         elif self.credits.mode() == "low":
             reason = "credits LOW"
-        elif self.credits.authorize_incident(self.runner.tenant_of(wf), "suggest_fixes",
-                                             self.t.cost_suggest_fixes) is None:
-            reason = "credits refused"
+        else:
+            pool = self.credits.authorize_incident(self.runner.tenant_of(wf), "suggest_fixes",
+                                                   self.t.cost_suggest_fixes)
+            if pool is None:
+                reason = "credits refused"
         if reason is not None:
             self._ev(inc, suggest={"called": False, "reason": reason})
             self._decide(ws, "suggest_fixes", "17.1/skip", {"incident_id": inc.incident_id},
@@ -287,8 +299,14 @@ class IncidentManagerImpl:
         problem = (f"Prompt {inc.evidence['bad_prompt']} on {wf} judged unsafe "
                    f"(hallucination); need a safer prompt version.")
         try:
-            got = self.llm.suggest_fixes(wf, problem)  # type: ignore[union-attr]
+            with_meta = getattr(self.llm, "suggest_with", None)
+            meta = {"purpose": "suggest_fixes", "pool": pool, "incident_id": inc.incident_id,
+                    "cost": self.t.cost_suggest_fixes, "tenant": self.runner.tenant_of(wf)}
+            got = (with_meta(wf, problem, meta) if with_meta
+                   else self.llm.suggest_fixes(wf, problem))  # type: ignore[union-attr]
         except Exception as e:  # noqa: BLE001 - the call is advisory; record and go on
+            if pool is not None:
+                self.credits.refund(self.runner.tenant_of(wf), pool, self.t.cost_suggest_fixes)
             self._ev(inc, suggest={"called": True, "error": type(e).__name__})
             self._decide(ws, "suggest_fixes", "17.1/error", {"incident_id": inc.incident_id},
                          {"error": str(e)})
@@ -381,7 +399,7 @@ class IncidentManagerImpl:
         self._decide(ws, "fix_selection", f"7.1/{tier}", {"incident_id": inc.incident_id,
                                                           "order_checked": tried_log},
                      {"prompt": prompt, "gate_run": v.gate_run})
-        inc = self._ev(inc, fix_prompt=prompt, fix_tier=tier, checked=tried_log,
+        inc = self._ev(inc, fix_prompt=prompt, fix_tier=tier, fix_gate_run=v.gate_run, checked=tried_log,
                        fix_proposed_minute=ws.now)
         self._put(replace(inc, state="fixing", credits_spent=inc.credits_spent + spent))
         return PatchRequest(wf=wf, owner=OWNER, path=("prompt",), value=prompt, cls=P0_INCIDENT,

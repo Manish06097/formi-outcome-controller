@@ -47,6 +47,7 @@ from controller.governance.store_pg import OverlayStore, PgProposalStore, TxScop
 from controller.governance.timing import choose_submit, routine_slots
 from controller.learning.probe import OWNER_COHORTS, ProbeLearner, did_rows
 from controller.learning.schedule import OWNER as OWNER_SCHEDULE
+from controller.loop.incidents_hooks import PromptSafety
 from controller.loop.orchestrator import LoopHooks, Runtime, StageCounts
 from controller.loop.pickup import PickupLevers, json_safe
 from controller.obs.alerts import raise_alert
@@ -112,6 +113,9 @@ class GovernanceHooks(LoopHooks):
         attach_effect_hooks(rt.registry, lambda: self.lc, self.scope)
         with self.scope.tx() as tx:
             self.pickup.restore(tx)
+        self.prompts = PromptSafety(self) if self.learner is not None else None
+        if self.prompts is not None:
+            self.prompts.attach()
 
     def _business_cohorts(self, tx: Tx, wid: str) -> tuple[CohortDef, ...]:
         """The business default's cohorts (version 1): supervisor-owned from the start (5.2)."""
@@ -269,6 +273,8 @@ class GovernanceHooks(LoopHooks):
         """6.7 for every supervisor version, inside REFRESH's transaction."""
         with self.scope.bind(tx):
             self.now = repos.get_clock(tx).sim_minute
+            if self.prompts is not None:
+                self.prompts.on_config_changes(tx, changes)
             for ch in changes:
                 if not ch.is_supervisor or ch.config is None:
                     continue
@@ -398,6 +404,8 @@ class GovernanceHooks(LoopHooks):
                         wf, "learning.did", "did_state", "5.9/bootstrap", {},
                         {"states": {d: st.status for d, st in sorted(states.items())}}))
                 n += 1
+        if self.prompts is not None:
+            n += self.prompts.bootstrap()
         return StageCounts(decisions=n)
 
     def detect(self, rt: Runtime, now: int) -> StageCounts | None:
@@ -429,6 +437,8 @@ class GovernanceHooks(LoopHooks):
                 changed = {n: s for n, s in states.items() if ws.did_state.get(n) != s}
                 if changed:
                     self._write_did_states(tx, wf, changed)
+        if self.prompts is not None:
+            self.prompts.detect()
         return None
 
     def _write_did_states(self, tx: Tx, wf: str, states: Mapping[str, DidState]) -> None:
@@ -483,6 +493,8 @@ class GovernanceHooks(LoopHooks):
                         {"value": _json_value(req.value), "class": req.cls}))
                     self.overlay.add(dataclasses.replace(req, decision_id=did))
                     n += 1
+        if self.prompts is not None:
+            n += self.prompts.decide()
         return StageCounts(decisions=n)
 
     def _did_turned_bad(self, wf: str, now: int) -> bool:
@@ -598,6 +610,8 @@ class GovernanceHooks(LoopHooks):
                     continue
                 with self.scope.tx() as tx:
                     self.pickup.verify(tx, self._snapshot(tx, wf))
+            if self.prompts is not None:
+                self.prompts.verify()
         return None
 
 

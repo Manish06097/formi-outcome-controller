@@ -137,7 +137,7 @@ class SafetyVerdictRunner:
 
     # ------------------------------------------------------------------ one run
     def _validate(self, wf: str, prompt: str, n: int, purpose: str, pool: str | None,
-                  stage: int, decision_key: str | None) -> ValidationRun:
+                  stage: int, decision_key: str | None, designate: bool = False) -> ValidationRun:
         cost = math.ceil(n / 100) * self.t.cost_validation_per_100
         tenant = self.tenant_of(wf)
         if pool is None:
@@ -146,18 +146,30 @@ class SafetyVerdictRunner:
             paid = pool if self.credits.authorize(tenant, pool, purpose, cost) else None  # type: ignore[arg-type]
         if paid is None:
             raise CreditsUnavailable(f"{purpose}: {cost} credits refused for {wf}/{prompt}")
+        meta = {"purpose": purpose, "pool": paid, "stage": stage, "decision_key": decision_key,
+                "cost": cost, "tenant": tenant, "designated": designate}
         try:
-            run = self.client.validate(wf, prompt, n)
+            with_meta = getattr(self.client, "validate_with", None)
+            run = with_meta(wf, prompt, n, meta) if with_meta else self.client.validate(wf, prompt, n)
         except PaymentRequired as e:   # 402: page, stop non-incident spend (7.2)
             self.credits.on_402()
             raise CreditsUnavailable(str(e)) from e
+        except CreditsUnavailable:
+            self.credits.refund(tenant, paid, cost)   # type: ignore[arg-type]
+            raise
+        except Exception:
+            self.credits.refund(tenant, paid, cost)   # type: ignore[arg-type]
+            raise
         if run.credits_remaining is not None:
             self.credits.sync(run.credits_remaining)
-        self.runs.setdefault((wf, prompt), []).append(run)
-        self.run_log.append({"run_id": run.validation_run_id, "wf": wf, "prompt": prompt,
-                             "n": run.n, "failures": run.failures, "pass_rate": run.pass_rate,
-                             "purpose": purpose, "pool": paid, "stage": stage, "cost": cost,
-                             "decision_key": decision_key})
+        known = self.runs.setdefault((wf, prompt), [])
+        if all(r.validation_run_id != run.validation_run_id for r in known):
+            known.append(run)
+        if all(r["run_id"] != run.validation_run_id for r in self.run_log):
+            self.run_log.append({"run_id": run.validation_run_id, "wf": wf, "prompt": prompt,
+                                 "n": run.n, "failures": run.failures,
+                                 "pass_rate": run.pass_rate, "purpose": purpose, "pool": paid,
+                                 "stage": stage, "cost": cost, "decision_key": decision_key})
         return run
 
     # ------------------------------------------------------------------ the verdict
@@ -180,7 +192,9 @@ class SafetyVerdictRunner:
         prior = list(self.runs.get((wf, prompt), ())) if pool_with_prior else []
         designate_stage1 = for_proposal and not plan.tight \
             and (dkey, wf, prompt) not in self.designated
-        r1 = self._validate(wf, prompt, self.t.verdict_stage1_n, purpose, pool, 1, dkey)
+        r1 = self._validate(wf, prompt, self.t.verdict_stage1_n, purpose, pool, 1, dkey,
+                            designate_stage1)
+        prior = [r for r in prior if r.validation_run_id != r1.validation_run_id]
         if designate_stage1:
             self.designated[(dkey, wf, prompt)] = r1.validation_run_id
         runs = prior + [r1]
@@ -237,7 +251,7 @@ class SafetyVerdictRunner:
                     return replace(v, gate_run=None, approvable=False)
                 run_id = stage1[-1].validation_run_id
             else:
-                run = self._validate(wf, prompt, plan.n_e, "gate_evidence", None, 0, dkey)
+                run = self._validate(wf, prompt, plan.n_e, "gate_evidence", None, 0, dkey, True)
                 run_id = run.validation_run_id
                 by_id[run_id] = run
             self.designated[key] = run_id

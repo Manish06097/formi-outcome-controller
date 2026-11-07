@@ -81,8 +81,8 @@ def engagement_workflows(g: dict, run_dir: Path) -> list[str]:
     import yaml  # test tooling only
     scen = next((run_dir / "scenario").glob("*.yaml"))
     doc = yaml.safe_load(scen.read_text())
-    return sorted(w["id"] for w in doc["workflows"]
-                  if w["objective"]["primary"] == "engagement_rate")
+    wfs = [w for t in doc["tenants"] for w in t["workflows"]]
+    return sorted(w["id"] for w in wfs if w["objective"]["primary"] == "engagement_rate")
 
 
 def summarise(cell: Cell, out: Path) -> dict | None:

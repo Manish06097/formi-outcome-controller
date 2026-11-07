@@ -43,12 +43,30 @@ done
 t_ready=$(date +%s)
 echo "[load_test] simulator ready after $((t_ready - t0)) s (history generation)" >&2
 
+# No Docker (CTL_NO_DOCKER=1 PG_DSN=...): run.sh runs scripts/run_local.sh; memory is the RSS of the
+# controller process and the sum of the RSS of all processes of the Postgres cluster at CTL_PG_PORT
+# (an upper bound: shared buffers count once per backend that touched them).
+NO_DOCKER="${CTL_NO_DOCKER:-0}"
+sample_local() {
+  now=$(date +%s)
+  rp="$(pgrep -f "run_local.sh http://127.0.0.1:$PORT" | head -1 || true)"
+  cp="$([ -n "$rp" ] && pgrep -P "$rp" -f controller | head -1 || true)"
+  [ -n "$cp" ] && printf '%s\tlocal-controller-1\t%s KiB\t-\n' "$now" "$(ps -o rss= -p "$cp" | tr -d ' ')" >> "$WORK/stats.tsv"
+  pm="$(head -1 "${PGDATA_DIR:-/opt/homebrew/var/postgresql@17}/postmaster.pid" 2>/dev/null || true)"
+  if [ -n "$pm" ]; then
+    kb="$({ echo "$pm"; pgrep -P "$pm"; } | xargs -I{} ps -o rss= -p {} 2>/dev/null | awk '{s+=$1} END {print s+0}')"
+    printf '%s\tlocal-db-1\t%s KiB\t-\n' "$now" "$kb" >> "$WORK/stats.tsv"
+  fi
+}
+
 sample() {
   while true; do
     now=$(date +%s)
+    if [ "$NO_DOCKER" = 1 ]; then sample_local; else
     docker stats --no-stream --format '{{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}' \
       $(docker ps -q --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME") \
       2>/dev/null | sed "s/^/$now\t/" >> "$WORK/stats.tsv" || true
+    fi
     printf '%s\tsimulator\t%s KiB\t-\n' "$now" "$(ps -o rss= -p "$sim_pid" | tr -d ' ')" \
       >> "$WORK/stats.tsv"
     sleep 2

@@ -19,7 +19,9 @@ from psycopg import sql
 TABLES = ("cell", "campaign", "lead_dim", "call_fact", "config_event", "approval_event",
           "event_other", "config_version", "config_cohort", "r_engage", "r_pickup", "r_did",
           "r_flags", "workflow", "allocation_provenance")
-EXCLUDE = {"ingested_chunk": {"ingested_wall", "txn_ms"}}
+# decision_id is an identity value: a crash that rolls back a transaction skips ids, and ids of
+# decisions made before and after a restart differ without the decision differing.
+EXCLUDE = {"ingested_chunk": {"ingested_wall", "txn_ms"}, "allocation_provenance": {"decision_id"}}
 
 
 def digest(conn: psycopg.Connection, schema: str, table: str) -> tuple[int, str]:

@@ -191,6 +191,15 @@ class ConfigMirror:
         self._bodies[(workflow_id, version)] = stored
         self._live[workflow_id] = (version, stored)
 
+    def record_provenance(self, tx: Tx, workflow_id: str, version: int, config: Config,
+                          overrides: dict[tuple[str, str], dict[str, Any]]) -> None:
+        """Materialise `allocation_provenance` for a version of ours (DESIGN.md 9.4). Without it
+        why-heard reports COHORT_MISMATCH for every call dialled under a controller version.
+        `overrides` names the proposal behind each (cohort, dim) the proposal changed; every
+        other row carries the default source, as for a supervisor version."""
+        provenance(tx, self.catalog.code(workflow_id), version, config,
+                   self.catalog.spec(workflow_id), {"source": "default"}, overrides)
+
     def _record_body(self, tx: Tx, wid: str, version: int, actor: str, config: Config,
                      source: str, applied_minute: int | None) -> None:
         wf = self.catalog.code(wid)

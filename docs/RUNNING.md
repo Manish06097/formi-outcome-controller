@@ -12,7 +12,7 @@ Status of the pieces this guide mentions (so nothing here surprises you):
 | Private scenario variants and the matrix runner | `scenarios/private/`, `scripts/variants/` | built (M0b) |
 | `run.sh` with Docker Compose, the loop, ingest, crash safety | `run.sh`, `compose*.yml`, `controller/loop`, `controller/ingest`, `controller/reliability` | built (M1, M2) |
 | Governance in the loop: proposals and overlay in Postgres, lifecycle, release train, supervisor-edit rebase | `controller/governance`, `controller/planner`, `controller/loop/governance.py` | built (M3, step I2, ADR 0029) |
-| Learners | `controller/learning`, `controller/incidents` | `CTL_LEARNER=probe` runs caller-ID probes and spreads, per-cohort call times from history, and engagement learning (welcome and voice experiments, winners, decay rollback, the harm gate on every change); incident response lands with M4 and M6 |
+| Learners | `controller/learning`, `controller/incidents` | `CTL_LEARNER=probe` runs caller-ID probes and spreads, per-cohort call times from history, engagement learning (welcome and voice experiments, winners, decay rollback, the harm gate on every change) and incident response (prompt fixes, caller-ID drain) |
 
 ## 1. Prerequisites
 
@@ -56,6 +56,15 @@ stops Postgres (data stays in its volume); `CTL_KEEP_UP=1` leaves Postgres and t
 ```bash
 CTL_NO_DOCKER=1 PG_DSN="host=127.0.0.1 port=5432 user=postgres password=... dbname=postgres" ./run.sh http://127.0.0.1:8700
 ```
+
+`make grade` names things by the scenario file: `runs/mine_<file name>` and `reports/<file name>.md`
+(`reports/public_01_dev.md`). `reports/public_01.md` and `reports/public_02.md` are the README's names:
+the same grade tables plus a reading of the numbers and the exact commands used.
+
+If the Docker daemon hangs (`docker ps` never returns), do not wait on it: use `CTL_NO_DOCKER=1`
+with any Postgres 16 or newer. Two runs of one scenario make the same decisions (decision seeds use
+the scenario fingerprint, not the per-run schema counter), so a run is reproducible and a crashed
+run can be compared with a clean one.
 
 Every setting is an environment variable read by `controller/settings.py` (`EnvSettings`):
 `CTL_SIM_URL`, `PG_DSN` or `CTL_PG_HOST/PORT/USER/PASSWORD/DB`, `CTL_API_PORT` (8780),
@@ -106,6 +115,18 @@ python -m controller.audit weekly-digest --tenant northwind_life
 - `replay-decision`: recomputes the decision from the stored inputs and prints stored and
   recomputed values side by side; it warns first if the decision's `settings_hash` or
   `code_version` differ from the running ones. Exit 1 if anything differs (ADR 0026).
+- `why-changed` lists "what happened after" from `proposal_transition`, the audit rows about the
+  proposal or its version, decisions that name the proposal and alerts that name it; for a
+  supervisor version it lists the rebase, stale marks, interrupted experiments and the incident it
+  opened. `audit_log.caused_by` is a decision id, not an audit id, and intent rows (the crash-safety
+  plumbing) are left out.
+- `why-heard` needs `allocation_provenance`, which every version writes when it is recorded
+  (ours in the same transaction as the apply). A call it cannot explain is `COHORT_MISMATCH`.
+- `replay-sample` replays only decisions with a registered recomputer: `learning.harm/harm_gate`,
+  `learning.allocator/allocation` and `harm_stop`, `learning.decay/rollback`,
+  `learning.winners/looks`. The random sample is mostly harm gates; to cover every kind pick ids per
+  `(module, kind)` and run `replay-decision` on each (`docs/design/build-reports/I6.md` has the query).
+  A warning that `code_version` differs only means HEAD moved since the run started.
 - Every command takes `--json`, `--schema run_...` (default: `$CTL_SCHEMA`, else the newest
   active run) and `--dsn` (default: the controller's settings). Exit 2 means not found or a bad
   argument.
@@ -156,7 +177,10 @@ reads `hold` at every step.
 .venv/bin/python -m pytest -q -m e2e                          # real simulator over HTTP
 ```
 
-Tests that need Postgres use `CTL_TEST_PG_DSN` when set, else start a throwaway `postgres:16`
+The `ctl_api` tests (`tests/audit/test_api.py`, `test_hold_audit.py`) log in as the read-only role
+with `CTL_TEST_PG_DSN`'s host and port and `dbname=postgres` when the DSN names none, and set that
+role's password on the cluster (`ALTER ROLE ctl_api LOGIN PASSWORD ...`, cluster-wide, so use a
+throwaway cluster). Tests that need Postgres use `CTL_TEST_PG_DSN` when set, else start a throwaway `postgres:16`
 container on a random port and remove it at the end (`tests/support/pg.py`). Tests that need a
 simulator start `python -m sim serve` as a subprocess (`tests/support/sim_process.py`).
 
@@ -189,6 +213,20 @@ scenario with a throwaway database and grade it, without Docker:
 It writes `grade.md`, `controller.log` and `summary.json` (exit codes, wall time, the grader's
 governance block) under `--out`. `--env CTL_FAULT=apply:1:after_http` injects a crash.
 Baseline wall times are in `docs/measurements/private-variants-baseline.md`.
+
+### Crash and load evidence without Docker
+
+```bash
+export CTL_NO_DOCKER=1 PG_DSN="host=127.0.0.1 port=55479 user=postgres password=ctl dbname=postgres" CTL_PG_PORT=55479
+CTL_KILL_SIM_PORT=8763 CTL_KILLS=8 CTL_KILL_BASELINE=runs/base_public_01_dev \
+    CTL_KILL_REPORT=reports/crash_recovery.md scripts/kill_test.sh scenarios/public_01_dev.yaml
+CTL_LOAD_SIM_PORT=8764 PGDATA_DIR=/path/to/pgdata scripts/load_test.sh scenarios/public_03_load.yaml
+```
+
+`kill_test.sh` kills the controller process with `kill -9` (no containers), compares the crashed
+run with a clean one table by table and by the `sim grade` output, and exits 1 on any difference.
+`load_test.sh` samples process memory (`PGDATA_DIR` locates `postmaster.pid`; Postgres memory is the
+sum of its processes' RSS, an upper bound because shared buffers count once per backend).
 
 ## 8. Extending
 

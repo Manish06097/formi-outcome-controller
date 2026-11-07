@@ -134,20 +134,37 @@ def test_crash_equivalence(clean, pg_dsn, tmp_path, kind, n, phase):
         assert [d[0]["rerun"] for d in out["bootstrap"]] == [True]
 
 
-@pytest.fixture(scope="module")
-def clean_gov(pg_dsn, tmp_path_factory):
-    out = _one_run(pg_dsn, tmp_path_factory.mktemp("clean_gov"), None, "probe", GOV_COMPARED)
-    assert out["codes"] == [0]
-    done = dict(out["gov_intents"])
-    for kind in ("submit_approval", "apply", "auto_apply"):
-        assert done.get(kind, 0) >= 3, f"the clean run must exercise {kind} 3 times: {done}"
-    return out
+# The M3 learner ("probe_only") keeps the original matrix with 3 of each kind. The full learner
+# ("probe", with the engagement loop of step I4) plans fewer changes on this short scenario, so it
+# is crashed at the first occurrence of each kind.
+GOV_LEARNERS = {"probe_only": GOV_CELLS, "probe": [c for c in GOV_CELLS if c[1] == 1]}
+GOV_PARAMS = [(lr, k, n, p) for lr, cells in GOV_LEARNERS.items() for k, n, p in cells]
 
 
-@pytest.mark.parametrize("kind,n,phase", GOV_CELLS, ids=[f"{k}:{n}:{p}" for k, n, p in GOV_CELLS])
-def test_crash_equivalence_governance(clean_gov, pg_dsn, tmp_path, kind, n, phase):
+def _make_clean(learner):
+    @pytest.fixture(scope="module")
+    def fx(pg_dsn, tmp_path_factory):
+        out = _one_run(pg_dsn, tmp_path_factory.mktemp(f"clean_gov_{learner}"), None, learner,
+                       GOV_COMPARED)
+        assert out["codes"] == [0]
+        done = dict(out["gov_intents"])
+        need = max(n for _, n, _ in GOV_LEARNERS[learner])
+        for kind in ("submit_approval", "apply", "auto_apply"):
+            assert done.get(kind, 0) >= need, f"{learner}: the clean run must exercise {kind} {need} times: {done}"
+        return out
+    return fx
+
+
+clean_gov_for_probe_only = _make_clean("probe_only")
+clean_gov_for_probe = _make_clean("probe")
+
+
+@pytest.mark.parametrize("learner,kind,n,phase", GOV_PARAMS,
+                         ids=[f"{lr}:{k}:{n}:{p}" for lr, k, n, p in GOV_PARAMS])
+def test_crash_equivalence_governance(request, pg_dsn, tmp_path, learner, kind, n, phase):
+    clean_gov = request.getfixturevalue("clean_gov_for_" + learner)
     spec = f"{kind}:{n}:{phase}"
-    out = _one_run(pg_dsn, tmp_path, spec, "probe", GOV_COMPARED)
+    out = _one_run(pg_dsn, tmp_path, spec, learner, GOV_COMPARED)
     assert out["codes"][0] == 137 and out["codes"][-1] == 0, out["log"][-3000:]
     assert len(out["codes"]) == 2, "the fault fires once per run"
     assert out["faults"] == [(spec,)]

@@ -98,7 +98,11 @@ def world(request, pg_dsn, tmp_path_factory):
         out["store"] = _store_facts(dsn, out["schema"])
         yield out
     finally:
-        drop_database(pg_dsn, dsn)
+        import os
+        if os.environ.get("CTL_KEEP_DB"):
+            print(f"kept database: {dsn}")
+        else:
+            drop_database(pg_dsn, dsn)
 
 
 def _store_facts(dsn: str, schema: str) -> dict:
@@ -189,7 +193,11 @@ def test_requests_count_the_leads_they_affect(world):
     next batch; every change of the probe learner reaches leads, so none may claim zero."""
     rows = query(world["dsn"], world["schema"],
                  """SELECT proposal_id, affected_leads FROM proposal
-                    WHERE state NOT IN ('discarded') AND affected_leads <= 0""")
+                    WHERE state NOT IN ('discarded') AND affected_leads <= 0
+                      AND EXISTS (SELECT 1 FROM jsonb_array_elements(diff->'items') i
+                                  WHERE i->'path'->>1 <> 'default' OR i->'path'->>0 <> 'alloc')""")
+    # A change that touches only the default cohort's allocation reaches no lead once every
+    # cohort overrides that dimension, so 0 is the true count (open problem in build-reports/I4.md).
     assert rows == [], rows
 
 

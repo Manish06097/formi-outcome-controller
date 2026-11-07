@@ -220,7 +220,10 @@ def test_supervisor_edits_rebased_never_reverted(world):
         later = [x for x in world["history"][wf] if x.version > v.version
                  and x.actor.startswith("controller")]
         for x in later:
-            assert not set(x.changed_dims) & set(v.changed_dims), (
+            # the one sanctioned exception (ADR 0032): a prompt-safety fix replaces the
+            # supervisor's unsafe prompt; nothing else of ours may touch a supervisor dim
+            touched = set(x.changed_dims) & set(v.changed_dims) - {"prompt_version"}
+            assert not touched, (
                 f"{wf} v{x.version} touches {x.changed_dims}, set by the supervisor in "
                 f"v{v.version}")
         # every proposal of ours pending or approved when the edit landed ended STALE

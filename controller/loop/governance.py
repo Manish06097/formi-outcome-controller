@@ -198,7 +198,7 @@ class GovernanceHooks(LoopHooks):
                 and (r.applied_minute is None
                      or r.applied_minute > self.now - self.t.schedule_revert_lookback_min)]
 
-    def _build_context(self, wf: str) -> BuildContext:
+    def _build_context(self, wf: str, comp: Any = None) -> BuildContext:
         """What the request builder needs for the affected-leads count (6.6): the cells, the
         active leads in each, and each cell's share of new leads (first attempts per cell over
         the history days, else over our own days). Posterior replays are wired with the
@@ -223,7 +223,7 @@ class GovernanceHooks(LoopHooks):
                            mid_flight=spec.mid_flight, cells=cells,
                            active_by_cell=FrozenDict(active),
                            hist_share_by_cell=FrozenDict(share))
-        return self.engagement.enrich(wf, ctx) if self.engagement else ctx
+        return self.engagement.enrich(wf, ctx, comp) if self.engagement else ctx
 
     def _decision(self, wf: str | None, module: str, kind: str, rule: str,
                   inputs: Mapping[str, Any], outcome: Mapping[str, Any] | None = None) -> Decision:
@@ -581,11 +581,31 @@ class GovernanceHooks(LoopHooks):
         """Engagement's allocation and `none` verifiers, with the pickup levers' caller-ID and
         schedule verifiers winning where both define a kind (I3 owns those two)."""
         eng = self.engagement.verifiers() if self.engagement else {}
-        return {**eng, **self._pickup_verifiers()}
+        return {**eng, **self._pickup_verifiers(), **self._prompt_verifiers()}
+
+    def _prompt_verifiers(self) -> dict[str, Any]:
+        """A prompt fix is verified by its incident (7.1, `incidents/manager.py`): the proposal
+        leaves VERIFYING when the incident that asked for it resolves or fails verification."""
+        if self.learner is None:
+            return {}
+        return {"prompt": self._verify_prompt_fix}
+
+    def _verify_prompt_fix(self, p: Proposal, now: int) -> VerifyResult:
+        fix = p.proposed_config.prompt_version if p.proposed_config is not None else None
+        for inc in sorted(self.pickup.mgr.incidents.values(), key=lambda i: i.incident_id):
+            if inc.kind != "prompt_safety" or inc.fix_proposal_id != p.proposal_id:
+                continue
+            if inc.state == "resolved":
+                return VerifyResult("verified", (f"incident {inc.incident_id} resolved",))
+            if fix is not None and fix in inc.evidence.get("tried", ()):
+                return VerifyResult("rollback", (f"incident {inc.incident_id}: fix {fix} failed "
+                                                 "its verification",))
+        return VerifyResult("pending")
 
     def _on_rollback_all(self, p: Proposal, r: VerifyResult) -> None:
         self._on_rollback(p, r)
-        if self.engagement is not None:
+        if self.engagement is not None and "prompt_version" not in (p.diff or {}).get(
+                "changed_dims", ()):      # a failed prompt fix is the incident manager's to retry
             self.engagement.on_verify_failed(p, r)
 
     def _pickup_verifiers(self) -> dict[str, Any]:

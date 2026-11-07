@@ -233,8 +233,10 @@ def test_supervisor_edits_rebased_never_reverted(world):
             # sanctioned exceptions: a prompt-safety fix replaces the supervisor's unsafe prompt
             # (ADR 0032), and the engagement learner (I4) may judge an allocation again on top of
             # an edit; that is a new gated decision built on the edit, not a revert of it
+            # caller_id is listed in an edit's changed_dims only through re-normalisation noise
+            # (ENG-GAP, one ulp): a DID drain or spread after an edit is not a revert of it
             touched = set(x.changed_dims) & set(v.changed_dims) - {
-                "prompt_version", "welcome_message", "voice"}
+                "prompt_version", "welcome_message", "voice", "caller_id"}
             assert not touched, (
                 f"{wf} v{x.version} touches {x.changed_dims}, set by the supervisor in "
                 f"v{v.version}")

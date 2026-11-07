@@ -135,6 +135,8 @@ def _decay_watched(ws: WorkflowSnapshot, dim: str, arm: str, scope: str, t: Thre
     """The arm's decay monitor (its scope's or the population's) has folded at least
     `decay_clean_segments` segments and is not in alarm. A decaying arm that is ramped before this
     holds a large share through its whole decline (ADR 0034)."""
+    if t.decay_clean_segments <= 0:      # 0 switches the cap off (ADR 0034)
+        return True
     for s in ws.decay:
         if s.dim == dim and s.arm == arm and s.scope in (scope, "population") and not s.alarm \
                 and s.seg_first is not None \

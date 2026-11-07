@@ -210,7 +210,8 @@ class ReleaseDeps:
     workflows: Callable[[], Sequence[str]]
     live: Callable[[str], tuple[int, object]]
     """wf -> (version, Config) read fresh from the API"""
-    build_context: Callable[[str], BuildContext]
+    build_context: Callable[..., BuildContext]
+    """(workflow, composition) -> context; the composition is optional for fakes."""
     holds: Callable[[str], Sequence[Hold]] = lambda wf: ()
     suspect_since: Callable[[str], int | None] = lambda wf: None
     t: Thresholds = field(default_factory=Thresholds)
@@ -255,7 +256,7 @@ class ReleaseTrain:
 
     def _package(self, comp: Composition) -> RequestPackage:
         """The approval package (also used for the auto-apply rationale and evidence)."""
-        ctx = self.d.build_context(comp.wf)
+        ctx = self.d.build_context(comp.wf, comp)
         notes = self.d.overlay.supervisor_notes(comp.wf, [p.path for p in comp.patches])
         if notes and not ctx.supervisor_notes:
             ctx = BuildContext(**{**ctx.__dict__, "supervisor_notes": tuple(notes)})

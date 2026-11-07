@@ -107,7 +107,7 @@ class EngagementLoop:
     def __init__(self, hooks: Any):
         self.g = hooks
         self._gate_seen: dict[tuple[str, str, str], bool] = {}
-        self._last_gate: dict[str, tuple[ep.GateVerdict, Any]] = {}
+        self._last_gate: dict[str, tuple[str, str, ep.GateVerdict, Any]] = {}
 
     def attach(self) -> None:
         rt = self.g.rt
@@ -706,7 +706,7 @@ class EngagementLoop:
             return None
         alpha = ep.alpha_for(comp.cls, self.t)
         v, ws, fits, ta = self._judge(comp.wf, comp.live, comp.proposed, alpha, comp.cls)
-        self._last_gate[comp.wf] = (v, fits)
+        self._last_gate[comp.wf] = (comp.proposed.hash(), comp.live.hash(), v, fits)
         hold = self._to_hold(comp.patches, comp.cls, v, ws, comp.live, comp.proposed)
         key = (comp.wf, comp.proposed.hash(), comp.live.hash())
         if self._gate_seen.get(key) != v.passes:
@@ -1006,13 +1006,23 @@ class EngagementLoop:
                                         cls=P1_ROLLBACK, p0_rank=None, evidence=ev))
         return out
 
-    def enrich(self, wf: str, ctx: Any) -> Any:
-        """The request builder's dry run (6.6): the draws and the harm report of the gate that
-        just judged this workflow's composition."""
-        last = self._last_gate.get(wf)
-        if last is None:
+    def enrich(self, wf: str, ctx: Any, comp: Composition | None = None) -> Any:
+        """The request builder's dry run (6.6): the draws and the harm report of the gate on
+        this composition. The in-memory verdict of the last gate is used only when it judged
+        this very change against this very live config; otherwise (the change was gated before
+        another proposal of the same tick was applied, or the process restarted in between) the
+        gate runs again, so the package is a function of the store and the API alone and a
+        restarted run builds the same proposal as a clean one."""
+        if comp is None:
             return ctx
-        v, fits = last
+        last = self._last_gate.get(wf)
+        if last is None or last[:2] != (comp.proposed.hash(), comp.live.hash()):
+            if not comp.changed_dims:
+                return ctx
+            alpha = ep.alpha_for(comp.cls, self.t)
+            v, _, fits, _ = self._judge(wf, comp.live, comp.proposed, alpha, comp.cls)
+        else:
+            v, fits = last[2], last[3]
         upd: dict[str, Any] = {"harm": v.report, "guardrail": v.guard}
         if fits is not None and ctx.cells:
             act = {int(c): float(n) for c, n in dict(ctx.active_by_cell).items()}

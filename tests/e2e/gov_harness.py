@@ -85,7 +85,7 @@ class Harness:
         snap = self.client.config(wf)
         return snap.version, snap.config
 
-    def _build_ctx(self, wf: str) -> BuildContext:
+    def _build_ctx(self, wf: str, comp=None) -> BuildContext:
         spec = self.registry.spec(wf)
         return BuildContext(primary_kpi=spec.objective.primary,
                             batch_size=spec.daily_batch.size, mid_flight=spec.mid_flight)

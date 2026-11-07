@@ -16,7 +16,7 @@ queries depend on them:
   `subject_id = config_version_subject(workflow_id, version)`; a supervisor version's chain of
   consequences starts from it (9.4: stale marks, interrupts, rebase, cooldown).
 - A proposal's audit rows have `subject_type = 'proposal'` and `subject_id = proposal_id`; every
-  consequence row sets `caused_by` to the row that caused it.
+  consequence row sets `caused_by` to the decision that caused it.
 - A decision not to act has `kind = 'no_action'` (the weekly digest counts those of the caller-ID
   and schedule modules).
 - `proposal.evidence` may carry `kpi` (the impact score's KPI label), `notes` (supervisor-facing
@@ -124,9 +124,10 @@ def _pct(x: float | None) -> str:
 
 @dataclass(frozen=True)
 class AuditEvent:
-    """One row of the "what happened after" chain, in order."""
+    """One row of the "what happened after" list, in order. `source` says which table it came
+    from: audit_log, proposal_transition, decision or alert."""
 
-    audit_id: int
+    audit_id: int | None
     sim_minute: int
     at: str
     actor: str
@@ -134,6 +135,7 @@ class AuditEvent:
     subject: str
     summary: str
     caused_by: int | None
+    source: str = "audit_log"
 
 
 @dataclass(frozen=True)
@@ -185,23 +187,122 @@ LEFT JOIN approval_mirror a ON a.approval_id = coalesce(v.approval_id, p.approva
 LEFT JOIN decision d ON d.decision_id = p.decision_id
 """
 
-_CHAIN_SQL = """
-WITH RECURSIVE chain AS (
-  SELECT * FROM audit_log WHERE subject_type = %(st)s AND subject_id = %(sid)s
-  UNION
-  SELECT a.* FROM audit_log a JOIN chain c ON a.caused_by = c.audit_id)
-SELECT audit_id, sim_minute, actor, action, subject_type, subject_id, summary, caused_by
-FROM chain ORDER BY sim_minute, audit_id
-"""
+# ----------------------------------------------------------------------------- aftermath
+# `audit_log.caused_by` holds the DECISION id behind a row (audit/writer.py), not another audit
+# row, so the consequences of a change are found by decision id, by subject, and in the tables
+# that record them directly (proposal_transition, decision, alert). Intent rows (the crash-safety
+# plumbing around every side effect) are left out: the transitions already say what they did.
+
+_PLUMBING_TRANSITIONS = frozenset({"draft", "submitting", "applying", "auto_applying", "verifying"})
+_CLIENT_STATES = frozenset({"approved", "rejected", "expired"})
+_SUPERVISOR_ALERTS = ("SUPERVISOR_EDIT", "EXPERIMENT_INTERRUPTED", "UNKNOWN_WRITER")
 
 
-def audit_chain(conn: Any, subject_type: str, subject_id: str) -> list[AuditEvent]:
-    """Every audit row about a subject plus everything it caused, transitively, in order."""
-    rows = fetch_all(conn.execute(_CHAIN_SQL, {"st": subject_type, "sid": subject_id}))
-    return [AuditEvent(audit_id=r["audit_id"], sim_minute=r["sim_minute"],
-                       at=label(r["sim_minute"]), actor=r["actor"], action=r["action"],
-                       subject=f"{r['subject_type']}:{r['subject_id']}", summary=r["summary"],
-                       caused_by=r["caused_by"]) for r in rows]
+def _event(minute: int, actor: str, action: str, subject: str, summary: str, *,
+           source: str, row_id: int | None = None, caused_by: int | None = None) -> AuditEvent:
+    return AuditEvent(audit_id=row_id, sim_minute=minute, at=label(minute), actor=actor,
+                      action=action, subject=subject, summary=summary, caused_by=caused_by,
+                      source=source)
+
+
+def _audit_events(conn: Any, subjects: list[tuple[str, str]], decision_ids: list[int]) -> list[AuditEvent]:
+    rows = fetch_all(conn.execute(
+        "SELECT audit_id, sim_minute, actor, action, subject_type, subject_id, summary, caused_by "
+        "FROM audit_log WHERE subject_type <> 'intent' AND "
+        "((subject_type, subject_id) IN (SELECT * FROM unnest(%s::text[], %s::text[])) "
+        " OR caused_by = ANY(%s))",
+        ([a for a, _ in subjects], [b for _, b in subjects], decision_ids)))
+    return [_event(r["sim_minute"], r["actor"], r["action"], f"{r['subject_type']}:{r['subject_id']}",
+                   r["summary"], source="audit_log", row_id=r["audit_id"], caused_by=r["caused_by"])
+            for r in rows]
+
+
+def _transition_events(conn: Any, proposal_id: str) -> list[AuditEvent]:
+    rows = fetch_all(conn.execute(
+        "SELECT seq, to_state, sim_minute, reason, decision_id FROM proposal_transition "
+        "WHERE proposal_id = %s ORDER BY seq", (proposal_id,)))
+    return [_event(r["sim_minute"], "client approver" if r["to_state"] in _CLIENT_STATES else "controller",
+                   r["to_state"], f"proposal:{proposal_id}", r["reason"] or r["to_state"],
+                   source="proposal_transition", caused_by=r["decision_id"])
+            for r in rows if r["to_state"] not in _PLUMBING_TRANSITIONS]
+
+
+def _decision_event(r: dict[str, Any], what: str) -> AuditEvent:
+    out = r["outcome"] if isinstance(r["outcome"], dict) else {}
+    return _event(r["sim_minute"], "controller", r["kind"], f"decision:{r['decision_id']}",
+                  f"{r['module']} / {r['kind']} (rule {r['rule_id']}) {what}"
+                  + (f": {out['reason']}" if out.get("reason") else ""),
+                  source="decision", row_id=r["decision_id"])
+
+
+def _proposal_aftermath(conn: Any, wf: int, proposal_id: str, decision_ids: list[int]) -> list[AuditEvent]:
+    """Transitions, audit rows about the proposal or caused by its decisions, other decisions
+    that name it (harm stops, rollbacks, verification; routine 'wait' notes are left out) and
+    alerts that name it."""
+    out = _transition_events(conn, proposal_id)
+    out += _audit_events(conn, [("proposal", proposal_id)], decision_ids)
+    like = f"%{proposal_id}%"
+    for r in fetch_all(conn.execute(
+            "SELECT decision_id, sim_minute, module, kind, rule_id, outcome FROM decision "
+            "WHERE (inputs::text LIKE %s OR outcome::text LIKE %s) AND decision_id <> ALL(%s) "
+            "AND NOT (module = 'governance.release' AND outcome ->> 'action' = 'wait') "
+            "ORDER BY decision_id", (like, like, decision_ids))):
+        out.append(_decision_event(r, "named this proposal"))
+    for r in fetch_all(conn.execute(
+            "SELECT alert_id, sim_minute, code, message FROM alert "
+            "WHERE message LIKE %s OR dedupe_key LIKE %s", (like, like))):
+        out.append(_event(r["sim_minute"] or 0, "controller", r["code"], f"alert:{r['alert_id']}",
+                          r["message"], source="alert", row_id=r["alert_id"]))
+    return out
+
+
+def _supervisor_aftermath(conn: Any, wf: int, workflow_id: str, version: int) -> list[AuditEvent]:
+    """Our reaction to a supervisor version: the rows about it, the rebase decision, stale marks,
+    interrupted experiments, and the proposals we opened in the same step (an incident fix)."""
+    subject = config_version_subject(workflow_id, version)
+    out = _audit_events(conn, [("config_version", subject)], [])
+    dec_ids = [e.caused_by for e in out if e.caused_by is not None]
+    seen = min((e.sim_minute for e in out), default=None)
+    if seen is None:
+        return out
+    for r in fetch_all(conn.execute(
+            "SELECT decision_id, sim_minute, module, kind, rule_id, outcome FROM decision "
+            "WHERE wf = %s AND sim_minute = %s AND (decision_id = ANY(%s) "
+            "OR (module, kind) IN (('incidents.manager', 'incident_open'))) "
+            "ORDER BY decision_id", (wf, seen, dec_ids))):
+        out.append(_decision_event(r, "in reaction"))
+    for r in fetch_all(conn.execute(
+            "SELECT pt.proposal_id, pt.to_state, pt.sim_minute, pt.reason, pt.decision_id "
+            "FROM proposal_transition pt JOIN proposal p USING (proposal_id) "
+            "WHERE p.wf = %s AND pt.sim_minute = %s AND pt.to_state IN ('stale', 'discarded', 'pending') "
+            "ORDER BY pt.proposal_id, pt.seq", (wf, seen))):
+        out.append(_event(r["sim_minute"], "controller", r["to_state"], f"proposal:{r['proposal_id']}",
+                          r["reason"] or r["to_state"], source="proposal_transition",
+                          caused_by=r["decision_id"]))
+    for r in fetch_all(conn.execute(
+            "SELECT alert_id, sim_minute, code, message FROM alert "
+            "WHERE wf = %s AND sim_minute = %s AND code = ANY(%s)", (wf, seen, list(_SUPERVISOR_ALERTS)))):
+        out.append(_event(r["sim_minute"], "controller", r["code"], f"alert:{r['alert_id']}",
+                          r["message"], source="alert", row_id=r["alert_id"]))
+    return out
+
+
+def _aftermath(conn: Any, wf: int, workflow_id: str, version: int,
+               proposal: dict[str, Any] | None, decision_ids: list[int]) -> list[AuditEvent]:
+    if proposal is not None:
+        out = _proposal_aftermath(conn, wf, proposal["proposal_id"], decision_ids)
+        out += _audit_events(conn, [("config_version", config_version_subject(workflow_id, version))], [])
+    else:
+        out = _supervisor_aftermath(conn, wf, workflow_id, version)
+    order = {"audit_log": 0, "proposal_transition": 1, "decision": 2, "alert": 3}
+    seen: set[tuple[str, str, int]] = set()
+    uniq = []
+    for e in sorted(out, key=lambda e: (e.sim_minute, order[e.source], e.audit_id or 0)):
+        key = (e.source, e.subject + e.action, e.sim_minute)
+        if key not in seen:
+            seen.add(key)
+            uniq.append(e)
+    return uniq
 
 
 def why_changed(conn: Any, workflow_id: str, at: str | int) -> ChangeExplanation:
@@ -253,10 +354,9 @@ def why_changed(conn: Any, workflow_id: str, at: str | int) -> ChangeExplanation
     elif proposal is not None:
         findings.append(f"proposal {proposal['proposal_id']} has no decision row: every change "
                         "must be recorded before it is made")
-    if proposal is not None:
-        after = audit_chain(conn, "proposal", proposal["proposal_id"])
-    else:
-        after = audit_chain(conn, "config_version", config_version_subject(workflow_id, r["version"]))
+    decision_ids = sorted({t["decision_id"] for t in transitions if t["decision_id"] is not None}
+                          | ({r["d_id"]} if r["d_id"] is not None else set()))
+    after = _aftermath(conn, wf["wf"], workflow_id, r["version"], proposal, decision_ids)
     return ChangeExplanation(
         workflow_id=workflow_id, at_minute=t, at=label(t), version=r["version"],
         applied_minute=r["applied_minute"], applied_at=when(r["applied_minute"]), actor=r["actor"],

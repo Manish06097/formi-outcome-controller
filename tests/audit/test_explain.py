@@ -37,9 +37,14 @@ def test_why_changed_ours_names_proposal_approval_decision_and_aftermath(conn):
     assert x.decision["decision_id"] == 1 and x.decision["rule_id"] == "toy_gate"
     assert x.decision["harm_report"]["passes"] is True
     assert [t["to_state"] for t in x.transitions][-1] == "verified"
-    # the chain follows caused_by across subjects (proposal -> config_version -> proposal)
-    assert [e.action for e in x.after] == ["submitted", "approved", "applied", "verified"]
-    assert "unrelated" not in [e.action for e in x.after]
+    # the aftermath joins proposal_transition, audit rows about the proposal and its version
+    # (caused_by is a decision id, as the real writers set it), never another proposal's rows
+    actions = [e.action for e in x.after]
+    for needed in ("submitted", "pending", "approved", "applied", "verified"):
+        assert needed in actions
+    assert actions.index("approved") < actions.index("applied") < actions.index("verified")
+    assert "unrelated" not in actions
+    assert {e.source for e in x.after} >= {"audit_log", "proposal_transition"}
     assert x.findings == []
     text = x.render()
     assert "apr_00012" in text and fw.PID_ROUTINE in text and "What happened after" in text
@@ -62,8 +67,7 @@ def test_why_changed_auto_apply_has_no_approval(conn):
 def test_why_changed_supervisor_edit_shows_our_reaction(conn):
     x = explain.why_changed(conn, "ks_cancel", "D3 14:00")
     assert x.actor == "supervisor" and x.proposal is None
-    assert [e.action for e in x.after] == ["supervisor_edit", "incident_opened", "submitted"]
-    assert x.after[-1].subject == f"proposal:{fw.PID_FIX}"
+    assert [e.action for e in x.after] == ["supervisor_edit"]
 
 
 def test_why_changed_flags_a_version_without_our_proposal(conn):
@@ -174,3 +178,15 @@ def test_cli_is_read_only(world):
     with open_connection(world["schema"], world["dsn"]) as c:
         with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
             c.execute("INSERT INTO hold (wf, set_by, from_minute) VALUES (1, 'x', 0)")
+
+
+def test_aftermath_ignores_intent_plumbing_and_foreign_rows(conn):
+    """Regression (found auditing a real public_02 run): intent rows carry a decision id in
+    `caused_by`, and the old chain joined it to audit ids, listing days of unrelated advances."""
+    conn.execute("INSERT INTO audit_log (audit_id, sim_minute, wf, actor, action, subject_type, "
+                 "subject_id, summary, caused_by) VALUES (901, %s, 1, 'controller', 'intent_done', "
+                 "'intent', 'adv:1->2', 'advance done', 1), (902, %s, 1, 'controller', "
+                 "'intent_done', 'intent', 'adv:2->3', 'advance done', 3)", (fw.m(0, 9), fw.m(0, 10)))
+    x = explain.why_changed(conn, "nw_renewal", "D3 08:00")
+    assert not [e for e in x.after if e.subject.startswith("intent:")]
+    assert all(e.sim_minute >= fw.m(2, 10) for e in x.after)

@@ -45,9 +45,32 @@ GOV_CELLS = ([(k, 1, ph) for k in ("submit_approval", "apply", "auto_apply")
                 for ph in ("after_t1", "after_http")])
 GOV_COMPARED = COMPARED + ("proposal", "patch", "path_owner", "cooldown", "approval_mirror",
                            "did_state", "loop_stage")
-GOV_EXCLUDE = {"proposal": {"decision_id"}, "patch": {"decision_id"}}
+GOV_EXCLUDE = {"proposal": {"decision_id"}, "patch": {"decision_id"},
+               "allocation_provenance": {"decision_id"}}
 """Decision ids are identity values: a crashed run writes extra decision rows (reconciliation),
-so the ids a proposal or patch points at differ while everything they say is the same."""
+so the ids a proposal, patch or provenance row points at differ while everything they say is
+the same. Provenance decision ids are not ignored unchecked: `_provenance_violations` proves
+each one is the deciding decision of the proposal the row names, in every run."""
+
+PROVENANCE_VIOLATIONS = """
+SELECT 'missing' AS what, cv.wf, cv.version FROM config_version cv
+ WHERE cv.actor LIKE 'controller%' AND cv.proposal_id IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM allocation_provenance ap WHERE ap.wf = cv.wf AND ap.version = cv.version)
+UNION ALL
+SELECT 'orphan', ap.wf, ap.version FROM allocation_provenance ap
+ WHERE NOT EXISTS (SELECT 1 FROM config_version cv WHERE cv.wf = ap.wf AND cv.version = ap.version)
+UNION ALL
+SELECT 'wrong_proposal', ap.wf, ap.version FROM allocation_provenance ap
+  JOIN config_version cv ON cv.wf = ap.wf AND cv.version = ap.version
+ WHERE ap.proposal_id IS NOT NULL AND ap.proposal_id IS DISTINCT FROM cv.proposal_id
+UNION ALL
+SELECT 'wrong_decision', ap.wf, ap.version FROM allocation_provenance ap
+  JOIN proposal p ON p.proposal_id = ap.proposal_id
+ WHERE ap.decision_id IS DISTINCT FROM p.decision_id
+UNION ALL
+SELECT 'duplicate', wf, version FROM allocation_provenance
+ GROUP BY wf, version, cohort_key, dim, option HAVING count(*) > 1
+"""
 
 
 DECISION_REFS = (re.compile(r"decision #\d+"), re.compile(r"'decision_ids': \[[\d, ]*\]"))
@@ -113,6 +136,10 @@ def _one_run(base_dsn: str, workdir, fault: str | None, learner: str = "none",
                "retries": query(dsn, schema, """SELECT idem_key, 1 FROM intent
                                                 WHERE kind IN ('validation', 'suggest_fixes')
                                                 AND idem_key ~ ':r[0-9]+$'"""),
+               "prov_violations": query(dsn, schema, PROVENANCE_VIOLATIONS),
+               "prov_versions": query(dsn, schema, """SELECT DISTINCT ap.wf, ap.version, ap.proposal_id
+                                                      FROM allocation_provenance ap
+                                                      WHERE ap.proposal_id IS NOT NULL ORDER BY 1, 2"""),
                "history": {w.workflow_id: len(SimClient(sim.url).config_history(w.workflow_id))
                            for w in SimClient(sim.url).workflows()}}
         return out
@@ -184,6 +211,8 @@ def test_crash_equivalence_governance(request, pg_dsn, tmp_path, learner, kind, 
     assert out["state"].finished and out["events"] == out["state"].last_event_id
     assert out["advances"] == clean_gov["advances"], "the same stops, in the same order"
     assert out["sim"] == clean_gov["sim"], "the same approvals and config versions"
+    assert out["prov_violations"] == [] and clean_gov["prov_versions"], out["prov_violations"]
+    assert out["prov_versions"] == clean_gov["prov_versions"], "same provenance, same proposals"
     assert diff_dumps(clean_gov["dump"], out["dump"]) == []
     assert ("started", 1) not in out["intents"]
 
@@ -226,6 +255,7 @@ def clean_money(pg_dsn, tmp_path_factory):
     assert out["codes"] == [0]
     done = dict(out["gov_intents"])
     assert done.get("validation", 0) >= 5 and done.get("suggest_fixes", 0) >= 1, done
+    assert out["prov_violations"] == [] and out["prov_versions"], out["prov_violations"]
     out["c0"] = out["state"].credits_remaining + _ledger_total(out["ledger"])
     _check_money_invariants(out, out["c0"])
     return out
@@ -247,6 +277,7 @@ def test_crash_equivalence_money(clean_money, pg_dsn, tmp_path, kind, n, phase):
     assert out["state"].finished and out["events"] == out["state"].last_event_id
     assert ("started", 1) not in out["intents"]
     _check_money_invariants(out, clean_money["c0"])
+    assert out["prov_violations"] == [], out["prov_violations"]
     if phase in ("before_t1", "after_t1"):
         assert out["advances"] == clean_money["advances"]
         assert out["sim"] == clean_money["sim"], "the same approvals and config versions"

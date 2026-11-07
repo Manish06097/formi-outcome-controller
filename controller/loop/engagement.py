@@ -780,7 +780,11 @@ class EngagementLoop:
             ws = self.g._snapshot(tx, wf)
         fits = None
         if wf in self.workflows() and set(live.changed_dims(new)) & set(ENGAGEMENT_DIMS):
-            fits = ep.fit(ws, self.model, self.t, "plan", kinds=("ew",))
+            # the draws the planner of this class used: rollbacks and harm stops are planned in
+            # the urgent stage, everything else at the planning point. Other draws would make
+            # a plan that sits at the edge of its own gate fail it by Monte Carlo noise.
+            purpose = "urgent" if cls <= P1_ROLLBACK else "plan"
+            fits = ep.fit(ws, self.model, self.t, purpose, kinds=("ew",))
         ta = self._t_apply(ws, urgent=cls <= P1_ROLLBACK)
         v = ep.run_gate(ws, fits.ew if fits else None, live, new, self.t, alpha,
                         ep.seed_for(ws, "gate", "did"), ta)

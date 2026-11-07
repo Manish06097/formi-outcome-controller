@@ -90,7 +90,7 @@ def _q(w: dict, sql: str) -> list[tuple]:
 
 
 def _wf_spec(w: dict, wf: str) -> dict:
-    return next(x for x in w["scenario"]["workflows"] if x["id"] == wf)
+    return next(x for t in w["scenario"]["tenants"] for x in t["workflows"] if x["id"] == wf)
 
 
 def _calls(w: dict, wf: str):

@@ -154,7 +154,12 @@ class ConfigMirror:
             body, source = None, "unknown"
         if body is not None and not event.actor.startswith("controller"):
             dims = noise_free_dims(self.body(wid, event.version - 1, tx), body, event.changed_dims)
-            event = replace(event, changed_dims=dims)
+            if dims != tuple(event.changed_dims):
+                # ingest stored the simulator's list when it met the event; the raw list stays
+                # in config_event, the version row keeps what really changed
+                tx.execute("UPDATE config_version SET changed_dims = %s WHERE wf = %s AND version = %s",
+                           (list(dims), wf, event.version))
+                event = replace(event, changed_dims=dims)
         repos.upsert_config_version(tx, wf, event.version, event.actor, None, "unknown",
                                     applied_minute=event.minute, proposal_id=event.proposal_id,
                                     approval_id=event.approval_id,

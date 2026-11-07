@@ -112,6 +112,7 @@ class GovernanceHooks(LoopHooks):
             t=self.t, holds=self._holds, on_alert=self._alert, on_applied=self._on_applied,
             regate=self.engagement.regate if self.engagement else None,
             verifiers=self._all_verifiers(), on_rollback=self._on_rollback_all))
+        self.lc.restore_auto_blocks(*self.store.auto_block_history())
         self.release = ReleaseTrain(ReleaseDeps(
             overlay=self.overlay, lifecycle=self.lc, policy_of=self.registry.policy,
             workflows=self.registry.workflow_ids, live=self._live,

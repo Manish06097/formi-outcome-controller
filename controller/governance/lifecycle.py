@@ -1034,6 +1034,21 @@ class ProposalLifecycle:
                                       overlay="open"))
         return out
 
+    def restore_auto_blocks(self, forbidden: Mapping[str, tuple[int, str, str]],
+                            policy_changed: Mapping[str, int]) -> None:
+        """AUDIT-2 F5: rebuild the post-403 block after a restart. `forbidden` is each
+        workflow's latest `forbidden` transition (minute, proposal id, reason) and
+        `policy_changed` the minute of its last audited policy change; a 403 that no later policy
+        read has cleared still blocks, exactly as in the process that saw it."""
+        self.auto_blocked.update(blocks_after_403(forbidden, policy_changed))
+
     def policy_reread(self, wf: str) -> None:
         """A fresh policy read clears the post-403 auto-apply block (6.5)."""
         self.auto_blocked.pop(wf, None)
+
+
+def blocks_after_403(forbidden: Mapping[str, tuple[int, str, str]],
+                     policy_changed: Mapping[str, int]) -> dict[str, str]:
+    """workflow id -> block text for every 403 newer than the workflow's last policy change."""
+    return {wf: f"403 on {pid}: {why}" for wf, (minute, pid, why) in forbidden.items()
+            if minute > policy_changed.get(wf, -1)}

@@ -57,6 +57,7 @@ from controller.audit.replay import encode_array, encode_inputs, hash_inputs
 from controller.audit.writer import write_decision
 from controller.governance.lifecycle import ArmObservation, ShareObservation, VerifyResult
 from controller.governance.lifecycle import verify_allocation as check_allocation
+from controller.learning.allocator import same_dist
 from controller.learning import engagement_plan as ep
 from controller.learning.connects import ConnectModel
 from controller.learning.decay import PageDecayMonitor, segment_ratio
@@ -590,7 +591,7 @@ class EngagementLoop:
         for k in [*ws.live.cohort_ids(), DEFAULT_COHORT]:
             a = (ws.live.allocations.get(k) or {}).get(dim)
             b = (promo.allocations.get(k) or {}).get(dim)
-            if a == b:
+            if same_dist(a, b):
                 continue
             out.append(PatchRequest(
                 wf=ws.spec.workflow_id, owner=OWNER_WINNERS, path=("alloc", k, dim),

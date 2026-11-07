@@ -504,6 +504,15 @@ def _expected_gain(r: GateResult) -> float:
     return float(np.mean(r.e_new[:, c].sum(axis=1) / r.e_cur[:, c].sum(axis=1) - 1.0))
 
 
+def same_dist(a: Mapping[str, float] | None, b: Mapping[str, float] | None) -> bool:
+    """Two allocations are the same change-wise when they agree to 1e-9. The simulator's
+    normalisation sums in key order, and a config read back from JSONB has its keys in another
+    order, so exact equality made a replay see a patch the live run did not (a 1 ulp difference)."""
+    if a is None or b is None:
+        return a is b
+    return set(a) == set(b) and all(abs(float(a[k]) - float(b[k])) <= 1e-9 for k in a)
+
+
 def _patches(ws: WorkflowSnapshot, live: Config, new: Config, cls: int,
              evidence: Mapping[str, Any], decision_id: int | None) -> tuple[PatchRequest, ...]:
     out = []
@@ -511,7 +520,7 @@ def _patches(ws: WorkflowSnapshot, live: Config, new: Config, cls: int,
         for dim in ENGAGEMENT_DIMS:
             a = (live.allocations.get(k) or {}).get(dim)
             b = (new.allocations.get(k) or {}).get(dim)
-            if a == b:
+            if same_dist(a, b):
                 continue
             out.append(PatchRequest(wf=ws.spec.workflow_id, owner=OWNER, path=("alloc", k, dim),
                                     value=FrozenDict(b) if b is not None else None, cls=cls,

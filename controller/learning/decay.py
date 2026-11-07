@@ -38,7 +38,7 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
-from controller.learning.allocator import _cohorts, _round_shares, build_config
+from controller.learning.allocator import _cohorts, _round_shares, build_config, same_dist
 from controller.learning.engagement import (ENGAGEMENT_DIMS, CLOSED_EXPERIMENT_STATES,
                                             EffectCache, dim_arms)
 from controller.learning.harm import GateContext, largest_passing
@@ -259,7 +259,7 @@ class PageDecayMonitor:
             for dim in ENGAGEMENT_DIMS:
                 a = (live.allocations.get(k) or {}).get(dim)
                 b = (new.allocations.get(k) or {}).get(dim)
-                if a != b:
+                if not same_dist(a, b):
                     out.append(PatchRequest(
                         wf=ws.spec.workflow_id, owner=OWNER, path=("alloc", k, dim),
                         value=FrozenDict(b) if b is not None else None, cls=P1_ROLLBACK,

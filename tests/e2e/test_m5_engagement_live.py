@@ -19,6 +19,7 @@ guardrail forecast, and the end-game freeze holds.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -78,7 +79,10 @@ def world(request, pg_dsn, tmp_path_factory):
                "schema": schema, "grade": grade(str(sim.run_dir),
                                                 str(_baseline(SCENARIOS[name], workdir)))}
     finally:
-        drop_database(pg_dsn, dsn)
+        if os.environ.get("CTL_KEEP_DB"):       # debugging: keep the run's database to inspect
+            print(f"kept database: {dsn}")
+        else:
+            drop_database(pg_dsn, dsn)
 
 
 def _q(w: dict, sql: str, params=None) -> list[tuple]:
@@ -140,7 +144,7 @@ def test_no_ramp_or_promotion_of_a_decaying_variant_is_graded_harmful(world):
     if world["name"] != "decaying_winner":
         pytest.skip("scenario without the J2 (g) acceptance")
     bad = [c for c in _changes(world)
-           if set(c["changed_dims"]) & ENGAGEMENT_DIMS and c["verdict"] == "harmful"]
+           if set(c["dims"]) & ENGAGEMENT_DIMS and c["verdict"] == "harmful"]
     assert bad == []
 
 

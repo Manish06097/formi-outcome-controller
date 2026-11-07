@@ -247,6 +247,15 @@ found no provenance row for an option the customer actually heard.
 **Do:** our config mirror is wrong. Compare `config_version.config` with
 `GET /workflows/{id}/config` and fix the mirror before anything else is proposed on the workflow.
 
+**Two sources, tell them apart by the message.** (1) `why-heard` finds a call whose option has no
+`allocation_provenance` row: the mirror is wrong, as above. Every version of ours writes its
+provenance when it is applied (`record_provenance`), so a missing row means a version whose apply
+was not recorded. (2) The allocation verify step (`verify_allocation`, DESIGN 6.1) pages it when
+one realised share is more than 3 binomial SE from the configured one; the message starts with
+`(a) <cohort>/<dim>/<option>: realised ... vs configured ... (SE ...)`. One such line at 3 to 3.5 SE
+among the dozens of (cohort, dim, option) shares checked per allocation is expected by chance
+(public_01 shows one of 3.0 SE in a clean run); look for repeats on the same cohort and option.
+
 <a id="SAFE_MODE"></a>
 ### SAFE_MODE
 

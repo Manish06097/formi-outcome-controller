@@ -118,9 +118,9 @@ log "crashed run done: $crashed_schema after $restarts restarts"
   echo '```'
   echo
 } > "$OUT"
+status=0
 "$PY" scripts/compare_runs.py --dsn "$DSN" --clean "$clean_schema" --crashed "$crashed_schema" \
-  --state "$WORK/state.json" >> "$OUT"
-status=$?
+  --state "$WORK/state.json" >> "$OUT" || status=$?
 # The simulator's own verdict must also be identical: grade both runs against the no-op baseline.
 BASE="${CTL_KILL_BASELINE:-}"
 if [ -n "$BASE" ] && [ -d "$BASE" ]; then

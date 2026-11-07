@@ -12,7 +12,7 @@ Status of the pieces this guide mentions (so nothing here surprises you):
 | Private scenario variants and the matrix runner | `scenarios/private/`, `scripts/variants/` | built (M0b) |
 | `run.sh` with Docker Compose, the loop, ingest, crash safety | `run.sh`, `compose*.yml`, `controller/loop`, `controller/ingest`, `controller/reliability` | built (M1, M2) |
 | Governance in the loop: proposals and overlay in Postgres, lifecycle, release train, supervisor-edit rebase | `controller/governance`, `controller/planner`, `controller/loop/governance.py` | built (M3, step I2, ADR 0029) |
-| Learners | `controller/learning`, `controller/incidents` | `CTL_LEARNER=probe` runs caller-ID probes and spreads, per-cohort call times from history, and engagement learning (welcome and voice experiments, winners, decay rollback, the harm gate on every change); incident response lands with M4 and M6 |
+| Learners | `controller/learning`, `controller/incidents` | `CTL_LEARNER=probe` runs caller-ID probes and spreads, per-cohort call times from history, engagement learning (welcome and voice experiments, winners, decay rollback, the harm gate on every change) and incident response (prompt fixes, caller-ID drain) |
 
 ## 1. Prerequisites
 

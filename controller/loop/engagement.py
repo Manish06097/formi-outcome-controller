@@ -412,26 +412,30 @@ class EngagementLoop:
         fits = ep.fit(ws, self.model, self.t, "urgent", kinds=("ew",))
         n = 0
         wf = ws.spec.workflow_id
-        stops = [] if self._pending(wf, OWNER_ALLOCATOR) else [
-            r for r in ep.run_harm_stops(ws, fits.ew, self.t) if not self._wanted(r)]
+        all_stops = [] if self._pending(wf, OWNER_ALLOCATOR) else ep.run_harm_stops(
+            ws, fits.ew, self.t)
+        # the stored outcome is the rule's whole output (what a replay recomputes); only the
+        # requests nobody wants yet are added
+        stops = [r for r in all_stops if not self._wanted(r)]
         if stops:
             sids = self._store_fits(tx, ws, fits, {"purpose": "urgent"})
             did = write_decision(tx, self._decision(
                 wf, "learning.allocator", "harm_stop", "5.4/harm_stop", {"now": ws.now},
-                {"patches": ep.patches_json(stops),
-                 "stopped": thaw(stops[0].evidence).get("stopped", [])},
+                {"patches": ep.patches_json(all_stops),
+                 "stopped": thaw(all_stops[0].evidence).get("stopped", [])},
                 snapshot_ids=sids, seed=fits.seeds["ew"]))
             n += self._add(tx, stops, did)
         if any(s.alarm for s in ws.decay) and not self._pending(wf, OWNER_DECAY):
             ta = self._t_apply(ws, urgent=True)
-            rbs = [r for r in ep.run_rollbacks(ws, fits.ew, self.t, ta) if not self._wanted(r)]
+            all_rbs = ep.run_rollbacks(ws, fits.ew, self.t, ta)
+            rbs = [r for r in all_rbs if not self._wanted(r)]
             if rbs:
                 sids = self._store_fits(tx, ws, fits, {"purpose": "urgent", "t_apply": ta})
                 did = write_decision(tx, self._decision(
                     wf, "learning.decay", "rollback", "5.7/rollback",
                     {"now": ws.now, "t_apply": ta},
-                    {"patches": ep.patches_json(rbs),
-                     "rollbacks": thaw(rbs[0].evidence).get("rollbacks", [])},
+                    {"patches": ep.patches_json(all_rbs),
+                     "rollbacks": thaw(all_rbs[0].evidence).get("rollbacks", [])},
                     snapshot_ids=sids, seed=fits.seeds["ew"]))
                 n += self._add(tx, rbs, did)
         return n

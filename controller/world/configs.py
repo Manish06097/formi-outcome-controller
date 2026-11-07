@@ -16,6 +16,7 @@ with ingest, which may meet a cohort on a call before the mirror sees the body).
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import Any, Iterable, Mapping
 
 from controller.audit.writer import provenance
@@ -53,7 +54,42 @@ def changed_paths(old: Config | None, new: Config) -> tuple[tuple[str, ...], ...
     seen = set(new_paths)
     paths = new_paths + [p for p in iter_paths(old) if p not in seen]
     return tuple(p for p in paths
-                 if _safe_value(old, p) != _safe_value(new, p))
+                 if not _same_value(_safe_value(old, p), _safe_value(new, p)))
+
+
+FLOAT_TOL = 1e-9
+"""Two shares agree when they differ by less than this. The simulator re-normalises every
+allocation it stores, summing in key order, so a cohort an edit did not touch can come back one
+ulp away from the body we sent (0.6253 and 0.6253000000000001)."""
+
+
+def _same_value(a: Any, b: Any) -> bool:
+    if isinstance(a, Mapping) and isinstance(b, Mapping):
+        return set(a) == set(b) and all(_same_value(a[k], b[k]) for k in a)
+    if isinstance(a, float) or isinstance(b, float):
+        try:
+            return abs(float(a) - float(b)) <= FLOAT_TOL
+        except (TypeError, ValueError):
+            return False
+    return a == b
+
+
+def noise_free_dims(old: Config | None, new: Config | None, dims: Iterable[str]) -> tuple[str, ...]:
+    """The dims an event reports as changed, minus the allocation dims whose effective share
+    distribution differs nowhere by more than FLOAT_TOL. The simulator's own `changed_dims`
+    compares exactly, so a supervisor edit of the default voice also listed `welcome_message` and
+    interrupted the welcome experiment (public_02 nw_renewal, ENG-GAP)."""
+    dims = tuple(dims)
+    if old is None or new is None:
+        return dims
+    keys = set(old.allocations) | set(new.allocations)
+    out = []
+    for d in dims:
+        if d in ("welcome_message", "voice", "caller_id") and not any(
+                not _same_value(dict(old.dist(k, d)), dict(new.dist(k, d))) for k in keys):
+            continue
+        out.append(d)
+    return tuple(out)
 
 
 def _safe_value(cfg: Config, path: tuple[str, ...]) -> Any:
@@ -116,6 +152,9 @@ class ConfigMirror:
             body, source = snap.config, "fetched"
         else:
             body, source = None, "unknown"
+        if body is not None and not event.actor.startswith("controller"):
+            dims = noise_free_dims(self.body(wid, event.version - 1, tx), body, event.changed_dims)
+            event = replace(event, changed_dims=dims)
         repos.upsert_config_version(tx, wf, event.version, event.actor, None, "unknown",
                                     applied_minute=event.minute, proposal_id=event.proposal_id,
                                     approval_id=event.approval_id,

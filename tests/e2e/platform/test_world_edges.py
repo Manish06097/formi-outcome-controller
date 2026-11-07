@@ -97,9 +97,9 @@ def test_a_policy_change_between_restarts_resumes_the_same_run(sim_factory, prox
     assert status == "active"
 
     wf = SimClient(proxy.url).workflows()[0]
-    new_ttl = int(wf.raw["governance"]["ttl_hours"]) + 1
-    proxy.rewrite = {"ttl_hours": new_ttl}
-    assert SimClient(proxy.url).workflows()[0].raw["governance"]["ttl_hours"] == new_ttl
+    new_ttl = int(wf.raw["governance"]["proposal_ttl_hours"]) + 1
+    proxy.rewrite = {"proposal_ttl_hours": new_ttl}
+    assert SimClient(proxy.url).workflows()[0].raw["governance"]["proposal_ttl_hours"] == new_ttl
 
     second = run_controller(proxy.url, db_dsn, log)
     assert second.exit_codes == [0], second.log[-2000:]

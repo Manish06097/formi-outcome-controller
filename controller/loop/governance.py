@@ -55,7 +55,7 @@ from controller.loop.orchestrator import LoopHooks, Runtime, StageCounts
 from controller.loop.pickup import PickupLevers, json_safe
 from controller.obs.alerts import raise_alert
 from controller.planner.overlay import LIVE_STATES, OverlayContext, dominant
-from controller.snapshot import load_snapshot
+from controller.snapshot import RollupCache, load_snapshot
 from controller.store import repos
 from controller.types import (DEFAULT_COHORT, IN_FLIGHT_STATES, P0_INCIDENT, P1_ROLLBACK, CohortDef,
                               Config, ConfigChange, Decision, DidState, EffectivePolicy,
@@ -78,6 +78,7 @@ class GovernanceHooks(LoopHooks):
         self.learner = ProbeLearner() if learner in ("probe", "probe_only") else None
         self.engagement = EngagementLoop(self) if learner == "probe" else None
         self.now = 0
+        self._rollups = RollupCache()
 
     # ------------------------------------------------------------------ wiring (on every start)
     def attach(self, rt: Runtime) -> None:
@@ -377,7 +378,7 @@ class GovernanceHooks(LoopHooks):
                              policy=self.registry.policy(wf), live=live, live_version=version,
                              now=self.now, did_state=self.did_states(wf, tx),
                              in_flight=self.store.holder(wf), end_minute=clock.end_minute,
-                             run_id=self._seed_run_id())
+                             run_id=self._seed_run_id(), rollups=self._rollups)
 
     def _seed_run_id(self) -> str:
         """The run's identity for decision seeds: the scenario fingerprint part of the schema

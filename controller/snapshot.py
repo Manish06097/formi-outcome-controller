@@ -203,34 +203,90 @@ def _arrays(rows: list[tuple[Any, ...]], n_cols: int) -> list[np.ndarray]:
     return [a[:, i].copy() for i in range(n_cols)]
 
 
+class RawRollups:
+    """One workflow's rollup arrays and active-lead counts exactly as the queries return them."""
+
+    __slots__ = ("engage", "pickup", "did", "flags", "active_rows")
+
+    def __init__(self, engage: list[np.ndarray], pickup: list[np.ndarray],
+                 did: list[np.ndarray], flags: list[np.ndarray],
+                 active_rows: list[tuple[Any, ...]]):
+        self.engage, self.pickup, self.did, self.flags = engage, pickup, did, flags
+        self.active_rows = active_rows
+
+
+def _read_rollups(conn: Any, wf: int) -> RawRollups:
+    q = conn.execute
+    engage = _arrays(q(
+        """SELECT seg, cell, config_version, prompt, w, v, connected, engaged, flags
+           FROM r_engage WHERE wf = %s ORDER BY seg, cell, config_version, prompt, w, v""",
+        (wf,)).fetchall(), 9)
+    pickup = _arrays(q(
+        """SELECT sim_day, hour, cell, attempt_bucket, dials, connected FROM r_pickup
+           WHERE wf = %s ORDER BY sim_day, hour, cell, attempt_bucket""", (wf,)).fetchall(), 6)
+    did = _arrays(q(
+        """SELECT tick_no, hour, cohort_code, did, dials, connected FROM r_did WHERE wf = %s
+           ORDER BY tick_no, hour, cohort_code, did""", (wf,)).fetchall(), 6)
+    flags = _arrays(q(
+        """SELECT sim_hour, prompt, connected, flags, engaged FROM r_flags WHERE wf = %s
+           ORDER BY sim_hour, prompt""", (wf,)).fetchall(), 5)
+    act = q("""SELECT cell, count(*) FROM lead_dim WHERE wf = %s AND state = 0
+               AND cell IS NOT NULL GROUP BY cell ORDER BY cell""", (wf,)).fetchall()
+    return RawRollups(engage, pickup, did, flags, [tuple(r) for r in act])
+
+
+class RollupCache:
+    """A memo of `_read_rollups`, keyed by what the store says it has ingested.
+
+    r_engage, r_pickup, r_did, r_flags and lead_dim are written only by the ingest transform,
+    in the same transaction as the chunk's `ingested_chunk` row (ingest/transform.sql). So the
+    rows of a workflow are a pure function of (run schema, chunks committed): the key is read from
+    the store on every call (one tiny query), and a changed key (new chunk, another schema, a
+    restart that starts with an empty memo) means a re-read. Nothing here can feed a decision a
+    value the store would not return right now; it only skips repeating the same SELECT several
+    times per step (detect, decide, verify and each hook take their own snapshot)."""
+
+    def __init__(self) -> None:
+        self._key: tuple[Any, ...] | None = None
+        self._rows: dict[int, RawRollups] = {}
+
+    @staticmethod
+    def store_key(conn: Any) -> tuple[Any, ...]:
+        return tuple(conn.execute(
+            "SELECT current_schema(), count(*), coalesce(max(chunk_no), -1), "
+            "coalesce(max(until_minute), -1), coalesce(sum(events), 0) FROM ingested_chunk"
+        ).fetchone())
+
+    def get(self, conn: Any, wf: int) -> RawRollups:
+        key = self.store_key(conn)
+        if key != self._key:
+            self._key, self._rows = key, {}
+        got = self._rows.get(wf)
+        if got is None:
+            got = self._rows[wf] = _read_rollups(conn, wf)
+        return got
+
+
 def load_snapshot(conn: Any, wf: int, *, spec: WorkflowSpec, policy: EffectivePolicy,
                   live: Config, live_version: int, now: Minute, cohorts: Any = None,
                   did_state: Mapping[str, Any] | None = None, in_flight: Proposal | None = None,
                   used_24h: Sequence[Minute] = (), end_minute: Minute | None = None,
-                  run_id: str = "", snapshot_id: int = 0) -> WorkflowSnapshot:
+                  run_id: str = "", snapshot_id: int = 0,
+                  rollups: "RollupCache | None" = None) -> WorkflowSnapshot:
     """Read one workflow's rollups and learned state from the run schema (search_path set).
 
     `wf` is the dense workflow code of `workflow.wf`. Spec, policy and the live config come from
     the world registry and config mirror (tracks T1 and T2), which own those reads.
     """
     q = conn.execute
-    engage = EngageArrays(*_arrays(q(
-        """SELECT seg, cell, config_version, prompt, w, v, connected, engaged, flags
-           FROM r_engage WHERE wf = %s ORDER BY seg, cell, config_version, prompt, w, v""",
-        (wf,)).fetchall(), 9))
-    pickup = PickupArrays(*_arrays(q(
-        """SELECT sim_day, hour, cell, attempt_bucket, dials, connected FROM r_pickup
-           WHERE wf = %s ORDER BY sim_day, hour, cell, attempt_bucket""", (wf,)).fetchall(), 6))
-    did = DidArrays(*_arrays(q(
-        """SELECT tick_no, hour, cohort_code, did, dials, connected FROM r_did WHERE wf = %s
-           ORDER BY tick_no, hour, cohort_code, did""", (wf,)).fetchall(), 6))
-    flags = FlagSeries(*_arrays(q(
-        """SELECT sim_hour, prompt, connected, flags, engaged FROM r_flags WHERE wf = %s
-           ORDER BY sim_hour, prompt""", (wf,)).fetchall(), 5))
+    raw = rollups.get(conn, wf) if rollups is not None else _read_rollups(conn, wf)
+    engage = EngageArrays(*[a.copy() for a in raw.engage])
+    pickup = PickupArrays(*[a.copy() for a in raw.pickup])
+    did = DidArrays(*[a.copy() for a in raw.did])
+    flags = FlagSeries(*[a.copy() for a in raw.flags])
     cells = {int(r[0]): Cell(int(r[0]), r[1], r[2], r[3], r[4]) for r in q(
         "SELECT cell_id, lang, tier, age, value FROM cell ORDER BY cell_id").fetchall()}
-    act = q("""SELECT cell, count(*) FROM lead_dim WHERE wf = %s AND state = 0
-               AND cell IS NOT NULL GROUP BY cell ORDER BY cell""", (wf,)).fetchall()
+    act = raw.active_rows
     active = None
     if act:
         ac = np.asarray([r[0] for r in act], dtype=np.int64)

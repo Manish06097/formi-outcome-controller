@@ -133,7 +133,7 @@ class PageDecayMonitor:
                 for scope in [POPULATION, *_cohorts(live)]:
                     members = _cohorts(live) if scope == POPULATION else [scope]
                     share = _share(live, coh, lead, members, exp.dim, a)
-                    if share >= t.decay_arm_share:
+                    if share >= t.decay_arm_share - t.rounding:
                         out.append((scope, exp.dim, a, arms.control))
         for h in ws.holdouts:
             if h.state == "active" and h.winner_arm:
@@ -162,7 +162,7 @@ class PageDecayMonitor:
                                       segment)
                 st = DecayMonitorState(wf=ws.spec.workflow_id, scope=scope, dim=dim, arm=arm,
                                        cusum=0.0, seg_last=segment - 1, theta_ref=ref,
-                                       alarm=False)
+                                       alarm=False, seg_first=segment)
             cus = PageCusum(k=t.decay_cusum_k, h=t.decay_cusum_h, stat=st.cusum,
                             last=st.seg_last, alarm=st.alarm)
             zs = []
@@ -203,7 +203,7 @@ class PageDecayMonitor:
         seg = segment_of(ws.now, ws.spec.dialling_window)
         ref = self._theta_ref(ws, cache, dim, arm, control, cells, pop, coh, scope, seg - 1)
         st = DecayMonitorState(wf=ws.spec.workflow_id, scope=scope, dim=dim, arm=arm, cusum=0.0,
-                               seg_last=seg - 1, theta_ref=ref, alarm=False)
+                               seg_last=seg - 1, theta_ref=ref, alarm=False, seg_first=seg)
         self._s[(scope, dim, arm)] = st
         return st
 

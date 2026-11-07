@@ -131,6 +131,18 @@ def _decay_alarm(ws: WorkflowSnapshot, dim: str, arm: str, scope: str) -> bool:
     return False
 
 
+def _decay_watched(ws: WorkflowSnapshot, dim: str, arm: str, scope: str, t: Thresholds) -> bool:
+    """The arm's decay monitor (its scope's or the population's) has folded at least
+    `decay_clean_segments` segments and is not in alarm. A decaying arm that is ramped before this
+    holds a large share through its whole decline (ADR 0034)."""
+    for s in ws.decay:
+        if s.dim == dim and s.arm == arm and s.scope in (scope, "population") and not s.alarm \
+                and s.seg_first is not None \
+                and s.seg_last - s.seg_first + 1 >= t.decay_clean_segments:
+            return True
+    return False
+
+
 def _holdout_share(ws: WorkflowSnapshot, dim: str, scope: str) -> float:
     for h in ws.holdouts:
         if h.dim == dim and h.scope in (scope, "population") and h.state == "active":
@@ -209,6 +221,9 @@ def _bounds(ws: WorkflowSnapshot, arms: DimArms, scope: str, cur: Mapping[str, f
             lo[a], hi[a] = t.arm_floor, 1.0 - lo[arms.control]
         else:
             lo[a], hi[a] = t.arm_floor, t.arm_ceiling
+            if not _decay_watched(ws, arms.dim, a, scope, t):
+                # ADR 0034: above the monitoring floor only an arm whose decay we could see
+                hi[a] = min(hi[a], max(t.decay_arm_share, c))
         if _decay_alarm(ws, arms.dim, a, scope):
             hi[a] = min(hi[a], c)
             lo[a] = min(lo[a], c)

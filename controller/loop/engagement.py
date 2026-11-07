@@ -347,13 +347,14 @@ class EngagementLoop:
         code = self._code(ws.spec.workflow_id)
         for s in states:
             tx.execute("""INSERT INTO decay_monitor (wf, scope, dim, arm, cusum, seg_last,
-                                                      theta_ref, alarm)
-                          VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                                      theta_ref, alarm, seg_first)
+                          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                           ON CONFLICT (wf, scope, dim, arm) DO UPDATE SET cusum = excluded.cusum,
                               seg_last = excluded.seg_last, theta_ref = excluded.theta_ref,
-                              alarm = excluded.alarm""",
+                              alarm = excluded.alarm, seg_first = excluded.seg_first""",
                        (code, s.scope, s.dim, self._opt(ws, s.dim, s.arm), float(s.cusum),
-                        int(s.seg_last), float(s.theta_ref), bool(s.alarm)))
+                        int(s.seg_last), float(s.theta_ref), bool(s.alarm),
+                        None if s.seg_first is None else int(s.seg_first)))
 
     # ================================================================== DECIDE
     def decide(self, now: int) -> int:
@@ -380,7 +381,7 @@ class EngagementLoop:
         """AUDIT-1 finding 3: the forecast before a pickup-lever patch enters the overlay, on
         every workflow. A refused request is a recorded decision not to act."""
         f = ep.filter_by_guardrail(ws, reqs, self.t)
-        if f.dropped:
+        if f.dropped or f.exempt:
             wf = ws.spec.workflow_id
             kpi = ws.spec.objective.guardrail_kpi
             did = write_decision(tx, self._decision(
@@ -389,10 +390,13 @@ class EngagementLoop:
                  "tolerance": self.t.guardrail_drop_tol},
                 {"dropped": [{"path": list(pa), "drop": d, "p_breach": b}
                              for pa, d, b in f.dropped],
+                 "exempt_p0": [{"path": list(pa), "drop": d, "p_breach": b}
+                               for pa, d, b in f.exempt],
                  "kept": [list(r.path) for r in f.keep]}))
-            raise_alert(tx, "HARM_GATE_BLOCK", self._code(wf), f"{wf}:guardrail",
-                        f"{wf}: guardrail forecast ({kpi}) refused {len(f.dropped)} pickup-lever "
-                        f"change(s) (decision #{did})", sim_minute=self.now)
+            if f.dropped:
+                raise_alert(tx, "HARM_GATE_BLOCK", self._code(wf), f"{wf}:guardrail",
+                            f"{wf}: guardrail forecast ({kpi}) refused {len(f.dropped)} "
+                            f"pickup-lever change(s) (decision #{did})", sim_minute=self.now)
         return list(f.keep)
 
     def _exposed(self, ws: WorkflowSnapshot) -> bool:

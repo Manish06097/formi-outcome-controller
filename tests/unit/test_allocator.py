@@ -4,6 +4,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from controller.settings import Thresholds
+
 from controller.learning.allocator import (harm_stops, open_experiments, plan_allocation_detail,
                                            plan_allocations, project_shares)
 from controller.learning.engagement import BetaBinomialModel
@@ -67,9 +69,14 @@ def _ramped_world(seed=1, days=3, mult=None):
     return w, cfg, exps
 
 
+def _clean_monitor(arm: str, first: int = 2, last: int = 5, alarm: bool = False):
+    return DecayMonitorState(wf="wf_test", scope="population", dim="welcome_message", arm=arm,
+                             cusum=0.5, seg_last=last, theta_ref=0.1, alarm=alarm, seg_first=first)
+
+
 def test_plan_moves_toward_the_better_arm_and_removes_the_bad_one():
     w, cfg, exps = _ramped_world()
-    ws = w.snapshot(cfg, 6, experiments=exps)
+    ws = w.snapshot(cfg, 6, experiments=exps, decay=[_clean_monitor("W2"), _clean_monitor("W3")])
     plan = plan_allocation_detail(ws, _draws(ws))
     d = plan.proposed.dist("default", "welcome_message")
     assert d["W2"] > 0.15 and d["W2"] <= 0.5 + 1e-9
@@ -84,6 +91,21 @@ def test_same_data_and_seed_give_the_same_plan():
     a = plan_allocation_detail(ws, _draws(ws, seed=99))
     b = plan_allocation_detail(ws, _draws(ws, seed=99))
     assert a.proposed == b.proposed and a.patches == b.patches and a.lambdas == b.lambdas
+
+
+def test_an_arm_the_decay_monitor_has_not_seen_cannot_rise_above_the_monitoring_floor():
+    """ADR 0034 (ENG-GAP): the better arm W2 is held at the monitoring floor until its monitor
+    has folded two segments; with them it ramps. One folded segment is not enough."""
+    w, cfg, exps = _ramped_world()
+    floor = Thresholds().decay_arm_share
+    unseen = w.snapshot(cfg, 6, experiments=exps)
+    one = w.snapshot(cfg, 6, experiments=exps, decay=[_clean_monitor("W2", first=5, last=5)])
+    seen = w.snapshot(cfg, 6, experiments=exps, decay=[_clean_monitor("W2")])
+    for ws in (unseen, one):
+        d = plan_allocation_detail(ws, _draws(ws)).proposed.dist("default", "welcome_message")
+        assert d["W2"] <= max(floor, 0.15) + 1e-9
+    d = plan_allocation_detail(seen, _draws(seen)).proposed.dist("default", "welcome_message")
+    assert d["W2"] > 0.15
 
 
 def test_a_decay_alarm_freezes_increases():

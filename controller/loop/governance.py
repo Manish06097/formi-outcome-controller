@@ -166,6 +166,8 @@ class GovernanceHooks(LoopHooks):
             self.rt.mirror.record_ours(tx, p.wf, version, p.proposed_config, actor,
                                        p.applied_minute if p.applied_minute is not None
                                        else self.now, p.proposal_id, p.approval_id, dims)
+            self.rt.mirror.record_provenance(tx, p.wf, version, p.proposed_config,
+                                             _provenance_overrides(p))
 
     def did_states(self, wf: str, tx: Tx | None = None) -> dict[str, DidState]:
         opts = self.rt.catalog.spec(wf).options["caller_id"]
@@ -686,3 +688,26 @@ def dataclass_row(obj: Any) -> tuple:
 
 __all__ = ["GovernanceHooks"]
 
+
+
+_PROV_SOURCE_BY_CLASS = {1: "rollback", 2: "winner"}
+
+
+def _provenance_overrides(p: Proposal) -> dict[tuple[str, str], dict[str, Any]]:
+    """The proposal behind each (cohort, dim) it changed, from its diff items (9.4 "why heard").
+    Allocation changes of a routine proposal are experiment arms (welcome, voice) or caller-ID
+    probes; a promotion is a winner, a rollback a rollback."""
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in (p.diff or {}).get("items", ()):
+        path = list(item.get("path", ()))
+        if len(path) == 3 and path[0] == "alloc":
+            cohort, dim = path[1], path[2]
+        elif path == ["prompt_version"]:
+            cohort, dim = "default", "prompt_version"
+        else:
+            continue
+        source = _PROV_SOURCE_BY_CLASS.get(p.cls) or (
+            "probe" if dim == "caller_id" else "arm" if dim in ("welcome_message", "voice") else "default")
+        out[(cohort, dim)] = {"source": source, "proposal_id": p.proposal_id,
+                              "approval_id": p.approval_id, "decision_id": p.decision_id}
+    return out

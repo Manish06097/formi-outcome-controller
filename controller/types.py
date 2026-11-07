@@ -506,7 +506,7 @@ def _preimage(stored: tuple[tuple[str, float], ...]) -> tuple[tuple[str, float],
 
 
 def _freeze_alloc(allocations: Mapping[str, Mapping[str, Mapping[str, float]]]) -> FrozenDict:
-    return FrozenDict({k: FrozenDict({d: FrozenDict({o: float(w) for o, w in ws.items()})
+    return FrozenDict({k: FrozenDict({d: FrozenDict({o: float(w) for o, w in sorted(ws.items())})
                                       for d, ws in dims.items()})
                        for k, dims in allocations.items()})
 

@@ -215,7 +215,7 @@ class GateContext:
         col = {d: i for i, d in enumerate(did_post.dids)}
         def health(cfg: Config, coh: Sequence[str]) -> np.ndarray:
             tot = np.zeros(r.shape[0])
-            for k in set(coh):
+            for k in sorted(set(coh)):
                 lead = float(self.lead[np.array([c == k for c in coh])].sum())
                 for d, p in cfg.dist(k, "caller_id").items():
                     rd = r[:, col[d]] if d in col else np.ones(r.shape[0])

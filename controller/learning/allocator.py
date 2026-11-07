@@ -101,7 +101,7 @@ def _round_shares(w: Mapping[str, float]) -> dict[str, float]:
 
 
 def tv(a: Mapping[str, float], b: Mapping[str, float]) -> float:
-    keys = set(a) | set(b)
+    keys = sorted(set(a) | set(b))
     return 0.5 * sum(abs(a.get(k, 0.0) - b.get(k, 0.0)) for k in keys)
 
 
@@ -258,7 +258,7 @@ def _norm(w: Mapping[str, float]) -> dict[str, float]:
 
 
 def _proposal(cur: Mapping[str, float], target: Mapping[str, float], lam: float) -> dict[str, float]:
-    keys = set(cur) | set(target)
+    keys = sorted(set(cur) | set(target))
     return _round_shares({o: cur.get(o, 0.0) + lam * (target.get(o, 0.0) - cur.get(o, 0.0))
                           for o in keys})
 

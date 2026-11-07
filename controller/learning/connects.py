@@ -83,14 +83,14 @@ class ConnectModel:
     def _did_factor(self, cfg: Config) -> np.ndarray:
         coh = cohort_of_cells(cfg, self.ws.cells, self.cells)
         memo: dict[str, float] = {}
-        for k in set(coh):
+        for k in sorted(set(coh)):
             memo[k] = sum(float(p) * self.r.get(d, 1.0) for d, p in cfg.dist(k, "caller_id").items())
         return np.array([memo[k] for k in coh]) if coh else np.zeros(0)
 
     def _weights(self, cfg: Config) -> np.ndarray:
         coh = cohort_of_cells(cfg, self.ws.cells, self.cells)
         tables: dict[str, np.ndarray] = {}
-        for k in set(coh):
+        for k in sorted(set(coh)):
             table = cfg.hour_table(k)
             tables[k] = np.ones(len(self.hours)) if table is None else np.array(
                 [float(table.get(h, 0.0)) for h in self.hours])

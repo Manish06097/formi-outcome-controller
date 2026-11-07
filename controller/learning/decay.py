@@ -288,7 +288,7 @@ class PageDecayMonitor:
                 out[k] = {}
                 for d, tgt in m.items():
                     cur = dict(live.dist(k, d))
-                    keys = set(cur) | set(tgt)
+                    keys = sorted(set(cur) | set(tgt))
                     out[k][d] = _round_shares({o: cur.get(o, 0.0) + lam * (tgt.get(o, 0.0)
                                                                            - cur.get(o, 0.0))
                                                for o in keys})

@@ -109,6 +109,18 @@ a prompt by re-running validation until one passes.
 
 **Do:** ask the client to review the gate. Never re-run validation to fish for a pass.
 
+<a id="INCIDENT_FIX_FAILED"></a>
+### INCIDENT_FIX_FAILED
+
+**Means:** a prompt fix is live but 300 connected calls under it show a flag rate whose upper 95%
+bound is not below twice the baseline, or engagement fell more than 5% against the 72 hours before
+the incident. The incident reopened and the next candidate goes as a P0 proposal.
+
+**Look first:** `SELECT evidence->'verification' FROM incident WHERE incident_id = <id>;`
+
+**Do:** nothing unless `NO_SAFE_PROMPT` follows; the candidate order is fixed and the failed
+prompt is excluded.
+
 <a id="NO_HEALTHY_DID"></a>
 ### NO_HEALTHY_DID
 
@@ -326,6 +338,13 @@ An arm was dropped for futility. Information only.
 ### ARM_REMOVED
 
 An arm was removed from an experiment. Information only.
+
+<a id="LOST_VALIDATION_RUN"></a>
+### LOST_VALIDATION_RUN
+
+A validation (or suggest-fixes) call reached the simulator and the controller died before it saved
+the answer. The credits are in `credit_ledger` (reconciled from the balance). A validation is paid
+once more under a second key; a suggest-fixes call is not repeated. Information only.
 
 <a id="KPI_DRIFT"></a>
 ### KPI_DRIFT

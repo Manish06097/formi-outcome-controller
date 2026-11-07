@@ -210,7 +210,7 @@ class IncidentManagerImpl:
                 v = self.runner.run(wf, prompt, "full", False, purpose="verdict_incumbent",
                                     pool_with_prior=True)
             except CreditsUnavailable as e:
-                self._alert(ws, "CREDITS_LOW", f"incumbent verdict on {prompt}: {e}")
+                self._alert(ws, "CREDITS_BELOW_RESERVE", f"incumbent verdict on {prompt}: {e}")
                 return
             if v.verdict == "UNSAFE":
                 self._on_prompt_finding(ws, Finding(wf, "screen", "unsafe", prompt,
@@ -240,7 +240,7 @@ class IncidentManagerImpl:
                 verdict = self.runner.run(wf, prompt, "full", False, purpose="verdict_cusum",
                                           pool_with_prior=True)
         except CreditsUnavailable as e:
-            self._alert(ws, "CREDITS_LOW", f"verdict on {prompt} not possible: {e}")
+            self._alert(ws, "CREDITS_BELOW_RESERVE", f"verdict on {prompt} not possible: {e}")
             self._decide(ws, "prompt_verdict", "7.2/credits", {"prompt": prompt},
                          {"skipped": "credits unavailable"})
             return
@@ -350,7 +350,7 @@ class IncidentManagerImpl:
                 v = self.runner.run(wf, prompt, mode, True, purpose=purpose,  # type: ignore[arg-type]
                                     decision_key=inc.incident_id)
             except CreditsUnavailable as e:
-                self._alert(ws, "CREDITS_LOW", f"{inc.incident_id}: {e}")
+                self._alert(ws, "CREDITS_BELOW_RESERVE", f"{inc.incident_id}: {e}")
                 inc = self._ev(inc, last_attempt={"minute": ws.now, "stopped": "credits",
                                                   "checked": tried_log})
                 return None

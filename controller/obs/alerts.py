@@ -62,6 +62,8 @@ CODES: dict[str, AlertCode] = {c.code: c for c in (
     AlertCode("NO_SAFE_PROMPT", "page", "event", "every catalog prompt is UNSAFE"),
     AlertCode("CLIENT_GATE_UNREACHABLE", "page", "event",
               "safe prompts cannot pass the client validation gate reliably"),
+    AlertCode("INCIDENT_FIX_FAILED", "page", "event",
+              "a prompt fix failed its post-apply verification; the next candidate goes as a P0"),
     AlertCode("NO_HEALTHY_DID", "page", "condition", "no caller ID can take traffic"),
     AlertCode("DID_DEGRADED", "page", "event",
               "the fast DID detector alarmed on a caller ID (7.3); a P0b drain is running"),
@@ -101,6 +103,9 @@ CODES: dict[str, AlertCode] = {c.code: c for c in (
     AlertCode("DECAY_ALARM_CLEARED", "digest", "event", "a decay CUSUM alarm cleared"),
     AlertCode("FUTILITY_DROP", "digest", "event", "an arm was dropped for futility"),
     AlertCode("ARM_REMOVED", "digest", "event", "an arm was removed"),
+    AlertCode("LOST_VALIDATION_RUN", "digest", "event",
+              "a validation or suggest-fixes call took effect and its result was lost; its "
+              "credits are in the ledger and the run was repeated at most once"),
     AlertCode("KPI_DRIFT", "digest", "event",
               "a KPI drift monitor alarmed (7.5), with its mix decomposition"),
     AlertCode("SUPERVISOR_EDIT", "digest", "event", "a client supervisor edited a config"),

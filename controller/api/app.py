@@ -114,7 +114,9 @@ class Api:
     def _schema(self, conn: Any) -> str:
         schema = self.pinned
         if schema is None:
-            row = conn.execute("SELECT schema_name FROM ctl.run_registry WHERE status = 'active' "
+            # A finished run is still the run to show (CTL_KEEP_UP leaves the API up after exit).
+            row = conn.execute("SELECT schema_name FROM ctl.run_registry "
+                               "WHERE status IN ('active', 'done') "
                                "ORDER BY created_wall DESC, schema_name DESC LIMIT 1").fetchone()
             schema = row[0] if row else None
         if not schema or not _SCHEMA_RE.match(schema):

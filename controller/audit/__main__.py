@@ -33,9 +33,9 @@ _SCHEMA_RE = re.compile(r"^run_[0-9a-f]{12}_[0-9]+$")
 
 
 def latest_schema(conn: Any) -> str | None:
-    """The newest active run schema, by registry creation time."""
-    row = conn.execute("SELECT schema_name FROM ctl.run_registry WHERE status = 'active' "
-                       "ORDER BY created_wall DESC, schema_name DESC LIMIT 1").fetchone()
+    """The newest active or finished run schema, by registry creation time."""
+    row = conn.execute("SELECT schema_name FROM ctl.run_registry "
+                       "WHERE status IN ('active', 'done') ORDER BY created_wall DESC, schema_name DESC LIMIT 1").fetchone()
     return None if row is None else str(row[0])
 
 

@@ -100,7 +100,7 @@ def test_slots_case_a_uses_in_hours_tier_before_pre_open():
 def test_slots_case_b_pre_open():
     pol = policy(**CASE_B)
     assert pol.preferred_slot_min == 14 * 60 + 30    # 14:00 + min(60, 25% of 120 = 30)
-    assert routine_slots(3, pol) == [hm(3, 12)]      # latest pre-open tick with p <= 1%
+    assert routine_slots(3, pol) == [hm(3, 11, 45)]  # latest pre-open tick with p = 0 (12:00 has 1/211)
 
 
 def test_slots_ttl4_normal_hours():
@@ -123,9 +123,9 @@ def test_kestrel_cancel_directive_slot_and_caps():
 
 def test_not_before_binds_fallback_tiers():
     # a hard 11:00 with approvers 14-16 and TTL 4: preferred = max(14:00, 11:00) has p = 57%;
-    # tier 3 searches pre-open ticks at or after 11:00 only: 12:00 is the latest safe one
+    # tier 3 searches pre-open ticks at or after 11:00 only: 11:45 is the latest with p = 0
     pol = policy(tenant_id="kestrel_finance", use_case="cancel", **CASE_B)
-    assert routine_slots(0, pol) == [hm(0, 12)]
+    assert routine_slots(0, pol) == [hm(0, 11, 45)]
     # TTL-12 case (a) with a not_before of 11:00: 11:00 has p = 61/421 and every safe tick
     # (10:00, pre-open) is before 11:00, so the day has no routine slot (NO_SAFE_WINDOW)
     pol_a = policy(tenant_id="kestrel_finance", use_case="cancel", **CASE_A)

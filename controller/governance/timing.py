@@ -106,8 +106,9 @@ def routine_slots(d: int, pol: EffectivePolicy, *, t: Thresholds | None = None) 
     2. else the latest expiry-safe in-hours tick between approver open and the preferred slot
        (the 6.3 text: "pre-open only when no in-hours time is safe"; TTL 12h with latency
        60-480 gives 10:00, p = 1/421);
-    3. else the latest expiry-safe tick before approvers open, unless the directive forbids
-       pre-open submits (approvers 14-16 with TTL 4h gives 12:00).
+    3. else the latest tick before approvers open with P(expire) = 0, else the latest
+       expiry-safe one, unless the directive forbids pre-open submits (approvers 14-16 with
+       TTL 4h and latency 30-240 gives 11:45: 12:00 would expire at latency 240, p = 1/211).
     Slot 2 (routine budget of 2 or more) is slot 1 + 240 [T] when that is expiry-safe."""
     th = _t(t)
     p_max = th.submit_expiry_p_max
@@ -138,7 +139,12 @@ def _slot1(base: int, pol: EffectivePolicy, p_max: float) -> int | None:
     if pol.pre_open_submits == "never":
         return None
     pre_open = [m for m in range(base, open_min, pol.tick) if ok(m)]
-    return max(pre_open) if pre_open else None
+    # Before the approvers open the decision lands at the open minute or later whatever the
+    # submit minute, so a few minutes earlier cost nothing: take the latest tick whose expiry
+    # probability is exactly zero when there is one, rather than a 1/211 risk that would turn
+    # into a real expiry on some run (the expiry draw is a hash of the proposal id).
+    riskless = [m for m in pre_open if p_expire(m, pol) == 0.0]
+    return max(riskless) if riskless else (max(pre_open) if pre_open else None)
 
 
 def is_slot_minute(m: int, pol: EffectivePolicy, *, t: Thresholds | None = None) -> bool:

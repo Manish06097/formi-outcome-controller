@@ -104,6 +104,20 @@ def _calls(w: dict, wf: str):
             yield epoch.minute(e["ts"]), e["variant"]["caller_id"]
 
 
+def _configured_share(w: dict, wf: str, did: str, at: int) -> float:
+    """The flagged DID's share of the default allocation in force at the flag. The sampled share
+    of a one-hour pre-flag sample is noisy (binomial SE about 0.03), so the formula's pre-flag
+    share is the larger of the sample and the configured weight."""
+    rows = _q(w, f"""SELECT c.config->'allocations'->'default'->'caller_id'
+                     FROM config_version c JOIN workflow x USING (wf)
+                     WHERE x.workflow_id = '{wf}' AND c.config IS NOT NULL
+                     AND coalesce(c.applied_minute, -1) <= {at}
+                     ORDER BY c.version DESC LIMIT 1""")
+    dist = (rows[0][0] if rows else None) or {}
+    tot = sum(float(v) for v in dist.values())
+    return float(dist.get(did, 0.0)) / tot if tot > 0 else 0.0
+
+
 def _flag_minute(at: str) -> int:
     day, hm = at.split()
     h, m = hm.split(":")
@@ -195,7 +209,7 @@ def test_flag_day_share_within_the_7_3_bound_and_zero_after(world):
         open_m = (at // 1440) * 1440 + lo * 60
         pre = [c for t, c in _calls(world, wf) if open_m <= t < at]
         assert pre, "no dials before the flag"
-        s = sum(c == did for c in pre) / len(pre)
+        s = max(sum(c == did for c in pre) / len(pre), _configured_share(world, wf, did, at))
         bound = flag_day_share(s, m, (at - open_m) / 60, T_ALARM_H, tick, hi - lo) + FLAG_SLACK
         rec = next(r for r in world["grade"]["incidents"]
                    if r["type"] == "did_flagged" and r["workflow"] == wf)

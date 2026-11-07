@@ -376,7 +376,14 @@ class GovernanceHooks(LoopHooks):
                              policy=self.registry.policy(wf), live=live, live_version=version,
                              now=self.now, did_state=self.did_states(wf, tx),
                              in_flight=self.store.holder(wf), end_minute=clock.end_minute,
-                             run_id=self.rt.schema)
+                             run_id=self._seed_run_id())
+
+    def _seed_run_id(self) -> str:
+        """The run's identity for decision seeds: the scenario fingerprint part of the schema
+        name, without the per-fingerprint counter (`run_<fp12>_<n>`). Two runs of one world then
+        draw the same randomness, so a clean run and a crashed run can be compared decision by
+        decision (scripts/kill_test.sh); the stored seed still drives replay."""
+        return self.rt.schema.rsplit("_", 1)[0]
 
     def bootstrap(self, rt: Runtime) -> StageCounts | None:
         """Restart step 6, once per run (DESIGN.md 2, 5.2, 5.9): each workflow's D0 cohort grid

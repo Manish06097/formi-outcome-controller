@@ -29,6 +29,10 @@ FAULTS="${CTL_KILL_FAULTS:-chunk_copy:1:mid,advance:20:after_http,advance:40:aft
 OUT="${CTL_KILL_REPORT:-reports/kill_test.md}"
 PY="${CTL_PYTHON:-.venv/bin/python}"
 DSN="host=127.0.0.1 port=$CTL_PG_PORT user=postgres password=ctl dbname=postgres"
+# No Docker (CTL_NO_DOCKER=1 PG_DSN=...): the same test through scripts/run_local.sh; the random
+# kill is `kill -9` of the controller process that run_local.sh started for this simulator.
+NO_DOCKER="${CTL_NO_DOCKER:-0}"
+[ "$NO_DOCKER" = 1 ] && DSN="${PG_DSN:?set PG_DSN with CTL_NO_DOCKER=1}"
 # Not under TMPDIR: docker CLI plugins put a unix socket there, and a long TMPDIR breaks it.
 WORK="${CTL_KILL_WORK:-$(mktemp -d /tmp/formi_kill.XXXXXX)}"
 mkdir -p "$WORK"
@@ -73,6 +77,16 @@ start_sim crashed
 killer() {
   for i in $(seq 1 "$KILLS"); do
     sleep $((KMIN + RANDOM % (KMAX - KMIN + 1)))
+    if [ "$NO_DOCKER" = 1 ]; then
+      rp="$(pgrep -f "run_local.sh http://127.0.0.1:$PORT" | head -1 || true)"
+      c="$([ -n "$rp" ] && pgrep -P "$rp" -f controller | head -1 || true)"
+      if [ -n "$c" ] && kill -9 "$c" 2>/dev/null; then
+        log "kill $i: SIGKILL pid $c at $(date +%T)"
+      else
+        log "kill $i: no controller process running at $(date +%T)"
+      fi
+      continue
+    fi
     c="$(docker ps -q --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
          --filter "label=com.docker.compose.service=controller" | head -1)"
     if [ -n "$c" ]; then
@@ -96,7 +110,7 @@ log "crashed run done: $crashed_schema after $restarts restarts"
 {
   echo "# Kill test: $SCENARIO"
   echo
-  echo "Produced by \`scripts/kill_test.sh\` on $(date +%F) (measured on this Mac, Docker Desktop)."
+  echo "Produced by \`scripts/kill_test.sh\` on $(date +%F) (measured on this Mac, $([ "$NO_DOCKER" = 1 ] && echo "no Docker: run_local.sh against a local Postgres" || echo "Docker Desktop"))."
   echo "Faults: \`$FAULTS\`; random SIGKILLs: $KILLS every ${KMIN}-${KMAX} s; run.sh restarts: $restarts."
   echo
   echo '```'
@@ -107,5 +121,25 @@ log "crashed run done: $crashed_schema after $restarts restarts"
 "$PY" scripts/compare_runs.py --dsn "$DSN" --clean "$clean_schema" --crashed "$crashed_schema" \
   --state "$WORK/state.json" >> "$OUT"
 status=$?
+# The simulator's own verdict must also be identical: grade both runs against the no-op baseline.
+BASE="${CTL_KILL_BASELINE:-}"
+if [ -n "$BASE" ] && [ -d "$BASE" ]; then
+  "$PY" -m sim grade --run "$WORK/clean" --baseline "$BASE" --out "$WORK/grade_clean.md" >/dev/null 2>&1 || true
+  "$PY" -m sim grade --run "$WORK/crashed" --baseline "$BASE" --out "$WORK/grade_crashed.md" >/dev/null 2>&1 || true
+  {
+    echo
+    echo "## Grade report of the crashed run against the clean run"
+    echo
+    if diff -u "$WORK/grade_clean.md" "$WORK/grade_crashed.md" > "$WORK/grade.diff"; then
+      echo "\`sim grade\` output is byte-identical for the clean and the crashed run."
+    else
+      echo "\`sim grade\` output DIFFERS:"
+      echo '```diff'
+      cat "$WORK/grade.diff"
+      echo '```'
+      status=1
+    fi
+  } >> "$OUT"
+fi
 cat "$OUT"
 exit $status

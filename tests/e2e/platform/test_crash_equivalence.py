@@ -75,9 +75,9 @@ def _sim_view(url: str) -> dict:
 
 
 def _one_run(base_dsn: str, workdir, fault: str | None, learner: str = "none",
-             tables: tuple[str, ...] = COMPARED):
+             tables: tuple[str, ...] = COMPARED, scenario: str = "scenarios/public_01_dev.yaml"):
     dsn = create_database(base_dsn)
-    sim = SimProcess("scenarios/public_01_dev.yaml", workdir, port=SIM_PORT, overrides=SHORT,
+    sim = SimProcess(scenario, workdir, port=SIM_PORT, overrides=SHORT,
                      ready_timeout_s=300).start()
     try:
         extra = {"CTL_FAULT": fault} if fault else {}
@@ -100,6 +100,14 @@ def _one_run(base_dsn: str, workdir, fault: str | None, learner: str = "none",
                                                 GROUP BY 1 ORDER BY 1"""),
                "gov_intents": query(dsn, schema, """SELECT kind, count(*) FROM intent
                                                     WHERE status = 'done' GROUP BY 1"""),
+               "ledger": query(dsn, schema, """SELECT purpose, pool, cost FROM credit_ledger
+                                               ORDER BY seq"""),
+               "envelope": query(dsn, schema, """SELECT pool, tenant, allotted, spent
+                                                 FROM credit_envelope ORDER BY 1, 2"""),
+               "incidents": query(dsn, schema, """SELECT incident_id, state FROM incident
+                                                  ORDER BY 1"""),
+               "runs": query(dsn, schema, """SELECT count(*), count(*) FILTER (WHERE designated)
+                                             FROM validation_run"""),
                "history": {w.workflow_id: len(SimClient(sim.url).config_history(w.workflow_id))
                            for w in SimClient(sim.url).workflows()}}
         return out
@@ -156,3 +164,80 @@ def test_crash_equivalence_governance(clean_gov, pg_dsn, tmp_path, kind, n, phas
     assert out["sim"] == clean_gov["sim"], "the same approvals and config versions"
     assert diff_dumps(clean_gov["dump"], out["dump"]) == []
     assert ("started", 1) not in out["intents"]
+
+
+# ---------------------------------------------------------------------------- money cells (I5)
+# The credit-spending kinds (DESIGN.md 8.3, AUDIT-1 finding 4): a world whose business defaults
+# are unsafe, so the run makes D0 screens, opens incidents, calls suggest-fixes once per incident,
+# validates fix candidates and proposes P0 prompt fixes.
+
+MONEY_SCENARIO = "scenarios/private/unsafe_default_prompt_p01.yaml"
+MONEY_CELLS = ([(k, 1, ph) for k in ("validation", "suggest_fixes")
+                for ph in ("before_t1", "after_t1", "after_http", "in_t2")]
+               + [("validation", 3, "after_http"), ("validation", 5, "in_t2")])
+MONEY_COMPARED = COMPARED + ("proposal", "patch", "did_state", "loop_stage")
+
+
+def _ledger_total(rows) -> float:
+    return sum(float(r[2]) for r in rows)
+
+
+def _check_money_invariants(out, c0: float) -> None:
+    """The ledger is the credit balance: what the simulator charged is exactly what we recorded,
+    and each pool's envelope spend is its ledger sum."""
+    assert abs(c0 - out["state"].credits_remaining - _ledger_total(out["ledger"])) < 1e-6, \
+        (c0, out["state"].credits_remaining, out["ledger"])
+    by_pool: dict[str, float] = {}
+    for _, pool, cost in out["ledger"]:
+        by_pool[pool] = by_pool.get(pool, 0.0) + float(cost)
+    env: dict[str, float] = {}
+    for pool, _, _, spent in out["envelope"]:
+        env[pool] = env.get(pool, 0.0) + float(spent)
+    for pool in set(by_pool) | {p for p, v in env.items() if v}:
+        assert abs(by_pool.get(pool, 0.0) - env.get(pool, 0.0)) < 1e-6, (pool, by_pool, env)
+
+
+@pytest.fixture(scope="module")
+def clean_money(pg_dsn, tmp_path_factory):
+    out = _one_run(pg_dsn, tmp_path_factory.mktemp("clean_money"), None, "probe", MONEY_COMPARED,
+                   MONEY_SCENARIO)
+    assert out["codes"] == [0]
+    done = dict(out["gov_intents"])
+    assert done.get("validation", 0) >= 5 and done.get("suggest_fixes", 0) >= 1, done
+    out["c0"] = out["state"].credits_remaining + _ledger_total(out["ledger"])
+    _check_money_invariants(out, out["c0"])
+    return out
+
+
+@pytest.mark.parametrize("kind,n,phase", MONEY_CELLS,
+                         ids=[f"{k}:{n}:{p}" for k, n, p in MONEY_CELLS])
+def test_crash_equivalence_money(clean_money, pg_dsn, tmp_path, kind, n, phase):
+    """A crash around a validation or suggest-fixes call never double-spends and never loses the
+    spend. Before the call (before_t1, after_t1) the world and store equal the clean run's. After
+    the call (after_http, in_t2) the call's result is lost: its credits are in the ledger, a
+    validation is paid once more (at most one extra run), a suggest-fixes call is not repeated,
+    and the run still resolves every incident."""
+    spec = f"{kind}:{n}:{phase}"
+    out = _one_run(pg_dsn, tmp_path, spec, "probe", MONEY_COMPARED, MONEY_SCENARIO)
+    assert out["codes"][0] == 137 and out["codes"][-1] == 0, out["log"][-3000:]
+    assert len(out["codes"]) == 2, "the fault fires once per run"
+    assert out["faults"] == [(spec,)]
+    assert out["state"].finished and out["events"] == out["state"].last_event_id
+    assert ("started", 1) not in out["intents"]
+    _check_money_invariants(out, clean_money["c0"])
+    if phase in ("before_t1", "after_t1"):
+        assert out["advances"] == clean_money["advances"]
+        assert out["sim"] == clean_money["sim"], "the same approvals and config versions"
+        assert out["ledger"] == clean_money["ledger"]
+        assert diff_dumps(clean_money["dump"], out["dump"]) == []
+        return
+    extra = _ledger_total(out["ledger"]) - _ledger_total(clean_money["ledger"])
+    assert 0 <= extra <= 10, f"a lost call costs at most one extra run (10 credits): {extra}"
+    lost = [r for r in out["ledger"] if r not in clean_money["ledger"]]
+    n_runs_clean, n_runs = clean_money["runs"][0][0], out["runs"][0][0]
+    if kind == "validation":
+        assert n_runs <= n_runs_clean + 1
+    else:
+        assert extra == 0 and n_runs == n_runs_clean, (extra, lost)
+    assert all(state == "resolved" for _, state in out["incidents"]), out["incidents"]
+    assert [i for i, _ in out["incidents"]] == [i for i, _ in clean_money["incidents"]]

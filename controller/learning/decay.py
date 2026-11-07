@@ -296,7 +296,7 @@ class PageDecayMonitor:
 
         def fails(cfg: Config) -> tuple[str, ...]:
             return ctx.evaluate(live, cfg, ws.policy, t.alpha_h_rollback, t.alpha_d, None,
-                                None).report.failed
+                                None, planning=True).report.failed
 
         lams = {}
         for k in props:

@@ -56,6 +56,11 @@ class GateResult:
     e_new: np.ndarray
 
 
+def tail_margin(alpha: float, n_draws: int) -> float:
+    """Two standard errors of a Monte Carlo tail probability `alpha` from `n_draws` draws."""
+    return 2.0 * float(np.sqrt(max(alpha * (1.0 - alpha), 0.0) / max(n_draws, 1)))
+
+
 class GateContext:
     """Draws, population and current config, prepared once for many gate evaluations."""
 
@@ -158,9 +163,14 @@ class GateContext:
     def evaluate(self, cur: Config, new: Config, pol: EffectivePolicy | None = None,
                  alpha_h: float | None = None, alpha_d: float | None = None,
                  did_post: DidPosterior | None = None, guard: GuardrailForecast | None = None,
-                 cohort_line: float | None = None) -> GateResult:
+                 cohort_line: float | None = None, planning: bool = False) -> GateResult:
+        """The harm lines on one change. `planning=True` is for a planner that searches for the
+        largest step the gate allows: it judges the tails against `alpha - 2 Monte Carlo SE`, so a
+        plan that sits on the boundary of its own search does not fail the release gate (same
+        change, 4,000 draws, a tail a few draws above alpha) and get its whole lever held."""
         t = self.t
         alpha_h = t.alpha_h if alpha_h is None else alpha_h
+        alpha_tail = alpha_h - (tail_margin(alpha_h, self.cache.n_draws) if planning else 0.0)
         alpha_d = t.alpha_d if alpha_d is None else alpha_d
         x_k = cohort_line if cohort_line is not None else (
             pol.cohort_harm_line if pol is not None else t.cohort_harm_line_default)
@@ -172,7 +182,7 @@ class GateContext:
         de = e_new.sum(axis=1) / e_cur.sum(axis=1) - 1.0
         failed: list[str] = []
         p_pop = float(np.mean(de < -t.grader_engagement_line))
-        if p_pop > alpha_h + tol:
+        if p_pop > alpha_tail + tol:
             failed.append("population")
         coh_new = self.cohorts(new)
         de_k: dict[str, np.ndarray] = {}
@@ -186,7 +196,7 @@ class GateContext:
             de_k[k] = dk
             pk = float(np.mean(dk < -x_k))
             report_k[k] = (float(dk.mean()), pk)
-            if pk > alpha_h + tol:
+            if pk > alpha_tail + tol:
                 failed.append(f"cohort:{k}")
         dd_mean, p_dd = self._did(cur, new, did_post, failed, alpha_d)
         g_kpi, g_mean, g_p = "", 0.0, 0.0

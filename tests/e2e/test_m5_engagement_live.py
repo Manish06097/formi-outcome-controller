@@ -153,6 +153,20 @@ def test_no_ramp_or_promotion_of_a_decaying_variant_is_graded_harmful(world):
     assert bad == []
 
 
+def test_a_rollback_the_planner_passed_is_not_held_by_the_release_gate(world):
+    """ENG-GAP: the decay planner and the allocator search for the largest step their own gate
+    allows, so the plan sits on the boundary and the release gate (same change, a few draws of
+    Monte Carlo noise) failed it on one or two cohorts, which held the whole lever. On public_02
+    55 of 66 class-1 composed changes failed; a rollback that waits is a decaying variant that
+    keeps its traffic (nw_renewal W3 stayed at 30% for five days)."""
+    rows = _q(world, """SELECT (outcome->>'passes')::boolean FROM decision
+                        WHERE rule_id = '0.1/harm_gate' AND (inputs->>'class')::int = 1""")
+    if len(rows) < 5:
+        pytest.skip("scenario without rollback traffic")
+    failed = sum(1 for (ok,) in rows if not ok)
+    assert failed <= 0.25 * len(rows), (failed, len(rows))
+
+
 def test_no_applied_change_breaks_the_cohort_line_it_was_judged_on(world):
     """5.4: for every gate that let a change through, each cohort's predicted de_k stays above
     its line in the mean, and the tail is at or below the tail the class allows."""

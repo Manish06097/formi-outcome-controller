@@ -368,8 +368,10 @@ def _plan(ws: WorkflowSnapshot, draws_ew: Draws | EffectCache, *,
 
     def gate(cfg: Config, scopes: Sequence[str] | None) -> GateResult:
         guard = guard_fn(live, cfg) if guard_fn is not None else None
-        r = ctx.evaluate(live, cfg, ws.policy, t.alpha_h, t.alpha_d, did_post, guard)
-        r2 = trend_ctx.evaluate(live, cfg, ws.policy, t.alpha_h, t.alpha_d, did_post, guard) \
+        r = ctx.evaluate(live, cfg, ws.policy, t.alpha_h, t.alpha_d, did_post, guard,
+                         planning=True)
+        r2 = trend_ctx.evaluate(live, cfg, ws.policy, t.alpha_h, t.alpha_d, did_post, guard,
+                                planning=True) \
             if trend_ctx is not None else None
         return merge_results(r, r2)
 

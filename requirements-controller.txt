@@ -1,5 +1,8 @@
-# Controller dependencies on top of requirements.txt (numpy, pyyaml, fastapi, uvicorn, httpx, pytest).
-# Every line is justified by docs/decisions/0001-stack.md: psycopg 3 is the Postgres driver (COPY for
-# bulk ingest); the [pool] extra is psycopg's own connection pool (psycopg_pool, same project), used by
-# controller/store/db.py for the three connections of DESIGN.md section 2.
-psycopg[binary,pool]>=3.2,<4
+# Development dependencies of the controller: the runtime list plus the test runner. Install with
+#   uv pip install -r requirements.txt -r requirements-controller.txt -c requirements-runtime.lock
+# The image does not use this file: it installs requirements-runtime.lock (ADR 0019).
+# Every line of the runtime list is justified by docs/decisions/0001-stack.md: psycopg 3 is the
+# Postgres driver (COPY for bulk ingest); the [pool] extra is psycopg's own connection pool
+# (psycopg_pool, same project), used by controller/store/db.py for the connections of DESIGN.md 2.
+-r requirements-runtime.txt
+pytest>=8.0

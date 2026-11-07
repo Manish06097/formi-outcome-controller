@@ -15,6 +15,10 @@ Points (kind: phases):
 - audit_write: in_t2 (an audit row is inside an uncommitted transaction)
 - bootstrap: mid (between bootstrap stages)
 
+Hook faults (`CTL_HOOK_FAULT=<point>:<from_minute>:<raise|kill|hang>[,...]`) are a second, simpler
+kind, for safe mode (loop/safemode.py): the named hook point (or `core`, a failure outside every
+hook) fails every time it is reached from that simulated minute on, the way a deterministic bug does.
+
 A fault fires once per run: before exiting, the injector calls `on_fire` (the orchestrator
 writes an audit row in its own committed transaction), and a restarted process asks
 `already_fired` and stays disarmed for that spec. Without both callbacks the fault fires once per
@@ -26,6 +30,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -63,6 +68,38 @@ def parse_faults(raw: str | None) -> tuple[FaultSpec, ...]:
         if bits[0] not in KNOWN_KINDS:
             raise ValueError(f"CTL_FAULT kind {bits[0]!r} is not one of {sorted(KNOWN_KINDS)}")
         out.append(FaultSpec(bits[0], int(bits[1]), bits[2]))
+    return tuple(out)
+
+
+@dataclass(frozen=True)
+class HookFault:
+    point: str
+    from_minute: int
+    how: str
+    """raise | kill | hang"""
+
+    def fire(self) -> None:
+        log.critical("CTL_HOOK_FAULT %s:%d:%s", self.point, self.from_minute, self.how)
+        if self.how == "raise":
+            raise RuntimeError(f"CTL_HOOK_FAULT: deterministic failure in {self.point}")
+        if self.how == "kill":
+            os._exit(EXIT_CODE)
+        while True:          # hang
+            time.sleep(3600)
+
+
+def parse_hook_faults(raw: str | None) -> tuple[HookFault, ...]:
+    """Parse `CTL_HOOK_FAULT`. Raises ValueError on a malformed entry (a configuration error)."""
+    out = []
+    for part in (raw or "").split(","):
+        bits = part.strip().split(":")
+        if bits == [""]:
+            continue
+        if len(bits) != 3 or not bits[1].lstrip("-").isdigit() or bits[2] not in (
+                "raise", "kill", "hang"):
+            raise ValueError(f"CTL_HOOK_FAULT entry {part!r} must be "
+                             "<point>:<from_minute>:<raise|kill|hang>")
+        out.append(HookFault(bits[0], int(bits[1]), bits[2]))
     return tuple(out)
 
 

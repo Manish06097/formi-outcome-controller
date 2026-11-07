@@ -1,8 +1,10 @@
 # Postgres and the controller (DESIGN.md 2, 3.3, 11.3). Started by run.sh together with
 # compose.linux.yml (host network) or compose.desktop.yml (Docker Desktop); see ADR 0019.
+# run.sh's plain-docker path mirrors these settings (tests/e2e/platform/test_packaging.py keeps
+# the two equal). run.sh builds the image and passes every CTL_* it was given to the container.
 services:
   db:
-    image: postgres:16
+    image: ${CTL_PG_IMAGE:-postgres:16@sha256:933463a6c8eba2b9f5cd414138738cd8d5519cd2c471214c222652f547a66a32}
     environment:
       POSTGRES_PASSWORD: ${CTL_PG_PASSWORD:-ctl}
     # Settings of DESIGN.md 3.3. synchronous_commit stays on: audit durability is a constraint.
@@ -32,8 +34,11 @@ services:
       - pgdata:/var/lib/postgresql/data
     shm_size: 1g
     mem_limit: 3g
+    stop_grace_period: 60s
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      # Over TCP: during first-time init the entrypoint's temporary server listens only on the
+      # unix socket, so a socket check reports ready before the real server has started.
+      test: ["CMD-SHELL", "pg_isready -U postgres -h 127.0.0.1"]
       interval: 2s
       timeout: 5s
       retries: 90
@@ -53,19 +58,7 @@ services:
       - CTL_PG_PORT=5432
       - CTL_PG_PASSWORD=${CTL_PG_PASSWORD:-ctl}
       - CTL_CODE_VERSION=${CTL_CODE_VERSION:-dev}
-      # Optional knobs (controller/settings.py EnvSettings and Thresholds), passed
-      # through only when set on the host, so the code's defaults stay the only defaults:
-      - CTL_INGEST
-      - CTL_LOG_LEVEL
-      - CTL_SIM_WAIT
-      - CTL_FAULT
-      - CTL_STOP_AFTER_STEPS
-      - CTL_SYNTHETIC_MARKERS
-      - CTL_PREFETCH_CHUNKS
-      - CTL_LLM_SUGGEST
-      - CTL_ENGAGEMENT_MODEL
-      - CTL_LEARNER
-    mem_limit: 1g
+    mem_limit: 2g
     restart: "no"
 
   api:
@@ -74,12 +67,12 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    entrypoint: ["python", "-m", "uvicorn", "controller.api.app:app", "--host", "0.0.0.0",
-                 "--port", "8780"]
+    entrypoint: ["python", "-m", "uvicorn", "--factory", "controller.api.app:create_app",
+                 "--host", "0.0.0.0", "--port", "8780"]
     environment:
       CTL_PG_HOST: db
       CTL_PG_PORT: "5432"
-      CTL_PG_PASSWORD: ${CTL_PG_PASSWORD:-ctl}
+      CTL_API_PG_PASSWORD: ${CTL_API_PG_PASSWORD:-ctl_api}
     ports:
       - "127.0.0.1:${CTL_API_PORT:-8780}:8780"
     mem_limit: 256m

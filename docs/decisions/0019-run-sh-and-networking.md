@@ -1,6 +1,6 @@
 # 0019. run.sh and networking
 
-Status: accepted (2026-11-06), milestone M1
+Status: accepted (2026-11-06), milestone M1; amended by track R (2026-11-07), see Amendment
 
 ## Context
 - `./run.sh <SIM_URL>` must start everything and run to scenario end with no manual steps on a
@@ -60,3 +60,48 @@ Status: accepted (2026-11-06), milestone M1
   find it by the compose labels (`com.docker.compose.service=controller`).
 - `TMPDIR` must stay short when the docker CLI runs (its plugin socket lives there); the scripts
   keep their work directories elsewhere.
+
+## Amendment (track R, grader-box hardening, AUDIT-1 findings 5, 6, 7, 10, 11, 12, 15)
+
+This replaces points 3 and 5 above and adds the rest. The original text is kept for the reasoning.
+
+- **Reproducible build (finding 5).** `requirements-runtime.txt` lists only what the controller
+  imports (no pytest); `requirements-runtime.lock` pins every package by exact version and hash,
+  and the Dockerfile installs it with `--require-hashes --no-deps --only-binary=:all:`. numpy is
+  pinned exactly, so `Generator` streams cannot change between builds
+  (`tests/unit/test_numpy_stream.py` pins a known stream). Both base images are pinned by digest
+  (`Dockerfile` ARG, `compose.yml`); if a registry no longer serves the digest, `run.sh` warns and
+  uses the tag. `requirements.txt` is the simulator's and is untouched. `run.sh` states in its header
+  what the box needs: the registry, and PyPI (or a mirror, or `vendor/wheels/`) on the first run.
+- **Backends (finding 6).** `docker compose` v2, `docker-compose` v1, then plain `docker run`
+  (Postgres container with a published loopback port, polled with
+  `pg_isready` through `docker exec`; the controller on `--network host` or `host.docker.internal`).
+  Nothing uses `--wait`. The image is built with `docker build`, not `compose build`, so a missing
+  buildx does not matter. A compose backend that fails to start Postgres falls back to plain.
+- **Failure ladder (finding 10).** (1) A crash restarts the controller; the budget counts restarts
+  with no progress in `ctl.run_registry` and resets on progress. (2) A hook that raises
+  `safe_mode_crashes` times at one step is guarded: skipped with an audit row and a SAFE_MODE page
+  while the advance and the governance lifecycle continue (`controller/loop/safemode.py`, table
+  `hook_guard`, migration 0030). A process death or hang in a hook disables it. (3) If the budget runs
+  out anyway, the configuration is fatal, or Docker cannot run the controller, limp mode
+  (`controller/loop/limp.py`, standard library only) advances the simulator to its end. The last line
+  says DEGRADED. An unfinished scenario is the worst outcome, so the order is: finish with
+  decisions, finish without some hooks, finish with none.
+- **Exit and signals (finding 11).** A trap stops the controller container on SIGTERM/SIGINT.
+  `resolve_run` returns an already-done schema at once when the simulator is finished and the
+  store is consistent with it, so a second `run.sh` is a fast no-op. One controller container name
+  per simulator URL; an orphan is replaced.
+- **Fingerprint (finding 12).** The governance block is out of the run fingerprint (a policy change
+  between restarts resumes the same schema).
+- **Bounded waits and cleanup (finding 15).** GET retries stop after 30 minutes (exit 1; the next
+  start waits `CTL_SIM_WAIT` for `/health` and exits 3 if the simulator is gone). Postgres and the
+  API are stopped on exit unless `CTL_KEEP_UP=1`; the data stays in the volume. Holds written through
+  `POST /supervisor/holds` write an audit row (migration 0031).
+- **Directives (finding 7).** A directive that matches no workflow raises a DIRECTIVE_UNMATCHED alert
+  and an audit row at start. The memos name the Northwind and Kestrel tenants, so a renamed tenant
+  would otherwise silently lose the memo promise.
+
+### What was verified, and where
+See `docs/design/build-reports/R.md` for the commands. The Linux host-network path was exercised
+only through a Linux container with the docker CLI and the Docker Desktop socket; that is not a
+bare Linux box and the report says what it does and does not show.

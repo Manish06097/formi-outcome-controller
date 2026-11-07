@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 import yaml
 
@@ -166,6 +166,12 @@ class DirectiveLayer:
             pre_open_submits=values["pre_open_submits"],
             scopes=tuple(r.scope_label for r in [self.defaults, *matched]),
             sources=FrozenDict(sources))
+
+    def unmatched(self, workflows: Iterable[tuple[str, str, str]]) -> list[DirectiveRule]:
+        """The rules that match none of the (tenant_id, workflow_id, use_case) workflows: a rule
+        like this silently falls back to the defaults, so its memo promise is not in force."""
+        wfs = list(workflows)
+        return [r for r in self.rules if not any(r.matches(*w) for w in wfs)]
 
     def rows(self) -> list[tuple[str, str, Any, str]]:
         """(tenant_scope, key, value, source) rows for the `directive` table (as written)."""

@@ -21,6 +21,7 @@ PORT="${CTL_KILL_SIM_PORT:-8711}"
 export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-formi_t1}"
 export CTL_PG_PORT="${CTL_PG_PORT:-55441}"
 export CTL_MAX_RESTARTS="${CTL_MAX_RESTARTS:-40}"
+export CTL_KEEP_UP=1   # compare_runs.py reads the store after run.sh exits
 KILLS="${CTL_KILLS:-4}"
 KMIN="${CTL_KILL_MIN_S:-3}"
 KMAX="${CTL_KILL_MAX_S:-10}"

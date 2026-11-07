@@ -16,7 +16,8 @@ Per step:
   5-9          LIFECYCLE, DETECT, DECIDE, GOVERN, VERIFY: hooks (`LoopHooks`); production runs
                `loop/governance.py: GovernanceHooks` (ADR 0029). Each completed stage is marked
                in `loop_stage`; a restart finishes an interrupted step from the first unmarked
-               stage
+               stage. Every hook call goes through `loop/safemode.py`: one that keeps crashing is
+               skipped and recorded, and the loop keeps advancing (ADR 0019)
  10  OPS       loop_step row, run registry
  11  finished: final ingest and reconcile, run_registry.status = done, exit 0
 
@@ -26,13 +27,17 @@ sequence makes that safe); 3 a fatal configuration error (run.sh does not restar
 from __future__ import annotations
 
 import logging
+import platform
 import time
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, TypeVar
+
+import numpy as np
 
 from controller.audit.writer import config_version_subject, record, write_decision
 from controller.ingest.loader import reset_stage
 from controller.ingest.pipeline import IngestError, IngestPipeline
+from controller.loop.safemode import HookGuard
 from controller.loop.stepper import StopPlan, basic_policy, plan_state, plan_stop
 from controller.obs.alerts import raise_alert
 from controller.obs.metrics import Heartbeat, PhaseTimer, rss_mb
@@ -48,18 +53,25 @@ from controller.store.repos import WorkflowCatalog
 from controller.types import (AdvanceResult, ConfigChange, ConfigEvent, Decision,
                               EffectivePolicy, FrozenDict, IngestReport, PlannerContext,
                               ReconcileReport, ResumeReport, SimEpoch, SimState, StepReport, Tx,
-                              advance_key)
+                              WorkflowSpec, advance_key)
 from controller.world.clock import floor_to
+from controller.stats.draws import STREAM_DIGEST, stream_digest
 from controller.world.configs import ConfigMirror, cell_count
+from controller.world.directives import load_directives
 from controller.world.fingerprint import WorldIdentity, resolve_run, world_identity
 
 log = logging.getLogger(__name__)
 
+T = TypeVar("T")
 EXIT_DONE, EXIT_RESTART, EXIT_FATAL = 0, 1, 3
 
 
 class FatalConfig(RuntimeError):
     """A configuration error a restart cannot fix (exit 3)."""
+
+
+class AlreadyDone(Exception):
+    """The simulator has finished and a done schema holds the whole run: nothing to do (exit 0)."""
 
 
 # =============================================================================== markers and hooks
@@ -180,11 +192,13 @@ class Orchestrator:
         self.settings = settings
         self.hooks = hooks or LoopHooks()
         self.markers = tuple(Marker(*m) for m in settings.env.synthetic_markers)
-        self.client = SimClient.from_settings(settings)
+        self.client = SimClient.from_settings(settings, on_retry=self._on_get_retry)
         self.db = Database.from_settings(settings)
         self.lock = AdvisoryLock(settings.env.dsn, settings.env.sim_url)
         self.rt: Runtime | None = None
         self.heartbeat: Heartbeat | None = None
+        self.guard: HookGuard | None = None
+        self._sim_unreachable_paged = False
         self._step_no = 0
         self._adv_wall_per_sim_h: float | None = None
 
@@ -202,6 +216,9 @@ class Orchestrator:
         ident = world_identity(self.client)
         res = resolve_run(self.db, self.client, ident, env.sim_url)
         self.db.open(res.schema)
+        if res.already_done:
+            self._note_already_done(res.schema, ident.state.sim_minute)
+            raise AlreadyDone(res.schema)
         self._install_faults()
         epoch = SimEpoch.from_state(ident.state)
         with self.db.tx() as tx:
@@ -213,6 +230,7 @@ class Orchestrator:
                 raise_alert(tx, "NEW_WORLD", None, res.schema,
                             f"started fresh schema {res.schema}; rejected: " + "; ".join(
                                 f"{r.schema}: {', '.join(r.failures)}" for r in res.rejected))
+            self._check_directives(tx, ident.specs)
             self._step_no = repos.get_clock(tx).last_step_no
         registry = default_registry()
         ingest = IngestPipeline(self.db, self.client, int(epoch.epoch0.timestamp()),
@@ -224,7 +242,13 @@ class Orchestrator:
                                epoch, mirror, ingest, executor, registry, ident.state,
                                run6=ident.fingerprint[:6])
         self._attach_advance(registry)
-        self.hooks.attach(rt)
+        clock = self._clock()
+        try:
+            self.guard = HookGuard(self.db, res.schema, env, rt.decision)
+        except ValueError as e:
+            raise FatalConfig(str(e)) from e
+        self.guard.open(clock.sim_minute)
+        self._attach_hooks(clock.last_step_no, clock.sim_minute)
         self.heartbeat = Heartbeat(self.db, self.lock, env.heartbeat_s,
                                    lambda: self._step_no).start()
         reset_stage(self.db)                                           # restart step 2
@@ -234,7 +258,9 @@ class Orchestrator:
         caught = rt.ingest.catch_up()                                  # restart step 4
         self._after_ingest(cells_before)
         self._refresh()
-        self.hooks.full_sweep(rt)                                      # restart step 5
+        clock = self._clock()
+        self._call("full_sweep", clock.last_step_no, clock.sim_minute,  # restart step 5
+                   lambda: self.hooks.full_sweep(rt), None)
         rerun = self._bootstrap()                                      # restart step 6
         self._finish_interrupted_step()
         clock = self._clock()
@@ -245,6 +271,87 @@ class Orchestrator:
                             sim_minute=clock.sim_minute, reconcile=reconcile,
                             chunks_ingested=len(caught.chunks), bootstrap_rerun=rerun,
                             alerts=reconcile.alerts)
+
+    # ------------------------------------------------------------------ safe mode (loop/safemode.py)
+    def _guard(self) -> HookGuard:
+        if self.guard is None:
+            raise RuntimeError("resume() has not run")
+        return self.guard
+
+    def _attach_hooks(self, step_no: int, minute: int) -> None:
+        def attach() -> bool:
+            self.hooks.attach(self._rt())
+            return True
+
+        # Without their attach, the hooks have no working set: run the bare loop instead.
+        if not self._guard().run("attach", step_no, minute, attach, False):
+            log.critical("hooks could not attach: the loop continues without governance")
+            self.hooks = LoopHooks()
+            self._guard().needs_recovery = False
+
+    def _call(self, point: str, step_no: int, minute: int, fn: Callable[[], T], default: T) -> T:
+        result = self._guard().run(point, step_no, minute, fn, default)
+        self._recover_if_needed(step_no, minute)
+        return result
+
+    def _recover_if_needed(self, step_no: int, minute: int) -> None:
+        """A hook failed and we carried on in this process. It may have left its in-memory working
+        set ahead of a rolled-back transaction, or an intent unresolved: rebuild both the way a
+        restart would (restart steps 1 to 3 of DESIGN.md 2)."""
+        guard = self._guard()
+        if not guard.needs_recovery:
+            return
+        guard.needs_recovery = False
+        self._attach_hooks(step_no, minute)
+        Reconciler(self.db, self.client, self._rt().registry).run()
+
+    def _check_directives(self, tx: Tx, specs: tuple[WorkflowSpec, ...]) -> None:
+        """A directive naming a tenant no workflow has silently falls back to the defaults. It can
+        only have tightened the API policy, so this is safe, but a memo promise is not in force and
+        someone must know (AUDIT-1 finding 7). One audit row and one page per rule, per run."""
+        workflows = [(s.tenant_id, s.workflow_id, s.use_case) for s in specs]
+        tenants = sorted({s.tenant_id for s in specs})
+        for rule in load_directives(thresholds=self.settings.t).unmatched(workflows):
+            seen = tx.execute("""SELECT 1 FROM audit_log WHERE action = 'directive_unmatched'
+                                 AND subject_id = %s""", (rule.scope_label,)).fetchone()
+            if seen:
+                continue
+            text = (f"directive {rule.scope_label} ({rule.source}) matches no workflow; live "
+                    f"tenants: {', '.join(tenants)}")
+            log.warning("%s", text)
+            record(tx, wf=None, actor="controller", action="directive_unmatched",
+                   subject=("directive", rule.scope_label), summary=text,
+                   details={"rule": rule.scope_label, "source": rule.source, "tenants": tenants})
+            raise_alert(tx, "DIRECTIVE_UNMATCHED", None, rule.scope_label, text)
+
+    def _note_already_done(self, schema: str, minute: int) -> None:
+        with self.db.tx() as tx:
+            record(tx, wf=None, actor="controller", action="run_already_done",
+                   subject=("run", schema), summary="started after the scenario finished: "
+                   "this schema already has the whole run", details={}, sim_minute=minute)
+
+    def _on_get_retry(self, attempt: int, elapsed_s: float, err: BaseException) -> None:
+        """Page once when GETs have been failing for a while (8.4). Never raises: the store is
+        best effort here, and the retry loop owns what happens next."""
+        if self._sim_unreachable_paged or self.rt is None:
+            return
+        if elapsed_s < self.settings.t.alert_get_retry_page_s:
+            return
+        try:
+            with self.db.tx() as tx:
+                raise_alert(tx, "SIM_UNREACHABLE", None, "simulator",
+                            f"GETs have been failing for {elapsed_s:.0f} s: {err}")
+            self._sim_unreachable_paged = True
+        except Exception as e:
+            log.warning("could not page SIM_UNREACHABLE: %s", e)
+
+    def _simulator_answered(self) -> None:
+        if not self._sim_unreachable_paged:
+            return
+        self._sim_unreachable_paged = False
+        with self.db.tx() as tx:
+            tx.execute("""UPDATE alert SET closed_wall = now()
+                          WHERE code = 'SIM_UNREACHABLE' AND closed_wall IS NULL""")
 
     def _install_faults(self) -> None:
         try:
@@ -298,12 +405,20 @@ class Orchestrator:
             did = write_decision(tx, d)
             repos.start_bootstrap(tx, repos.get_clock(tx).sim_minute, hist, did)
         faults.maybe_crash("bootstrap", "mid")
-        self.hooks.bootstrap(rt)
+        clock = self._clock()
+        self._call("bootstrap", clock.last_step_no, clock.sim_minute,
+                   lambda: self.hooks.bootstrap(rt), None)
         with self.db.tx() as tx:
             repos.complete_bootstrap(tx, repos.get_clock(tx).sim_minute)
+            # What the run's draws depend on, so a replay elsewhere can tell (ADR 0019).
+            digest = stream_digest()
+            if digest != STREAM_DIGEST:
+                log.warning("numpy %s draws differ from the locked version's", np.__version__)
             record(tx, wf=None, actor="controller", action="bootstrap_completed",
                    subject=("bootstrap", "1"), summary="bootstrap completed",
-                   details={"rerun": row is not None})
+                   details={"rerun": row is not None, "numpy": np.__version__,
+                            "numpy_stream_as_locked": digest == STREAM_DIGEST,
+                            "machine": platform.machine()})
         return row is not None
 
     # ------------------------------------------------------------------ the loop
@@ -324,6 +439,9 @@ class Orchestrator:
                 if stop_after and steps >= stop_after:
                     log.warning("CTL_STOP_AFTER_STEPS=%d reached: exiting 1", stop_after)
                     return EXIT_RESTART
+        except AlreadyDone as e:
+            log.info("nothing to do: the scenario has finished and %s has the whole run", e)
+            return EXIT_DONE
         except (FatalConfig, MigrationError, BadMinutes) as e:
             log.critical("fatal configuration error: %s", e)
             return EXIT_FATAL
@@ -333,6 +451,8 @@ class Orchestrator:
         finally:
             if self.heartbeat:
                 self.heartbeat.stop()
+            if self.guard:
+                self.guard.close()
 
     def run_step(self) -> StepReport:
         rt = self._rt()
@@ -340,6 +460,7 @@ class Orchestrator:
         clock = self._clock()
         now = clock.sim_minute
         counts = StageCounts(decisions=1)
+        self._guard().inject_core(now)
         with timer("plan"):
             ctx = self.planner_context(now)
             plan = self._plan(now, ctx)
@@ -352,6 +473,7 @@ class Orchestrator:
             self._after_ingest(cells_before)
         with timer("refresh"):
             rt.state = state = self.client.state()
+            self._simulator_answered()
             self._check_lag(state)
             self._refresh()
         self._stages(self._step_no, state.sim_minute, timer, counts)
@@ -382,7 +504,9 @@ class Orchestrator:
             if stage in done:
                 continue
             with timer(stage):
-                counts.add(getattr(self.hooks, stage)(self._rt(), minute))
+                counts.add(self._call(stage, step_no, minute,
+                                      lambda: getattr(self.hooks, stage)(self._rt(), minute),
+                                      None))
             with self.db.tx() as tx:
                 tx.execute("INSERT INTO loop_stage (step_no, stage) VALUES (%s, %s) "
                            "ON CONFLICT DO NOTHING", (step_no, stage))
@@ -427,11 +551,17 @@ class Orchestrator:
         with self.db.tx() as tx:
             facts = repos.plan_facts(tx)
             end = repos.get_clock(tx).end_minute
+        hook_view = self._call(
+            "plan", self._step_no, now,
+            lambda: {s.workflow_id: (self.hooks.policy(rt, s.workflow_id),
+                                     dict(self.hooks.plan_facts(rt, now, s.workflow_id) or {}))
+                     for s in rt.catalog.specs}, {})
         states = []
         for spec in rt.catalog.specs:
             wid = spec.workflow_id
             wf = rt.catalog.code(wid)
-            pol = self.hooks.policy(rt, wid) or basic_policy(spec, tick, t)
+            hook_policy, extra = hook_view.get(wid, (None, {}))
+            pol = hook_policy or basic_policy(spec, tick, t)
             pending = facts.pending.get(wf)
             approved = list(facts.approved_apply_by.get(wf, ()))
             has_pending = pending is not None
@@ -442,7 +572,6 @@ class Orchestrator:
                     has_pending = True
                 if m.kind == "approved" and m.from_minute <= now < m.to_minute:
                     approved.append(m.to_minute)
-            extra = dict(self.hooks.plan_facts(rt, now, wid) or {})
             states.append(plan_state(
                 spec, pol, has_pending=extra.pop("has_pending", has_pending),
                 pending_class=extra.pop("pending_class", pending[0] if pending else None),
@@ -560,8 +689,17 @@ class Orchestrator:
                                f"({ch.body_source} body): {', '.join(ch.changed_dims)}",
                        details={"changed_paths": [list(p) for p in ch.changed_paths],
                                 "body_source": ch.body_source})
-            self.hooks.on_config_changes(rt, tx, changes)
+            clock = repos.get_clock(tx)
+            self._guard().run("on_config_changes", clock.last_step_no, clock.sim_minute,
+                              lambda: self._in_savepoint(tx, changes), None)
+        self._recover_if_needed(clock.last_step_no, clock.sim_minute)
         return changes
+
+    def _in_savepoint(self, tx: Tx, changes: list[ConfigChange]) -> None:
+        """The hook runs in REFRESH's transaction; if the guard swallows its failure, the rest of
+        that transaction (the mirror, the audit rows) must still commit."""
+        with tx.transaction():
+            self.hooks.on_config_changes(self._rt(), tx, changes)
 
     # ------------------------------------------------------------------ OPS and finish
     def _write_step(self, report: StepReport) -> None:
@@ -581,7 +719,9 @@ class Orchestrator:
         self._check_lag(state)
         self._refresh()
         Reconciler(self.db, self.client, rt.registry).run()
-        self.hooks.on_finished(rt)
+        clock = self._clock()
+        self._call("on_finished", clock.last_step_no, clock.sim_minute,
+                   lambda: self.hooks.on_finished(rt), None)
         with self.db.tx() as tx:
             record(tx, wf=None, actor="controller", action="run_finished",
                    subject=("world", rt.ident.fingerprint[:12]), summary="scenario finished",
@@ -623,5 +763,5 @@ def mark_refreshed(tx: Tx, events: list[ConfigEvent]) -> None:
 
 
 __all__ = ["Orchestrator", "LoopHooks", "Runtime", "StageCounts", "Marker",
-           "FatalConfig", "EXIT_DONE", "EXIT_RESTART", "EXIT_FATAL", "ReconcileReport",
+           "FatalConfig", "AlreadyDone", "EXIT_DONE", "EXIT_RESTART", "EXIT_FATAL", "ReconcileReport",
            "IngestReport"]

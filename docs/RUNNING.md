@@ -17,7 +17,16 @@ Status of the pieces this guide mentions (so nothing here surprises you):
 ## 1. Prerequisites
 
 - Python 3.11 and [uv](https://docs.astral.sh/uv/).
-- Docker with Compose v2 (the default path), or `CTL_NO_DOCKER=1` with a local Postgres 16.
+- Docker (a daemon the user can reach). Compose is optional: `run.sh` tries `docker compose` v2,
+  then `docker-compose` v1 (no `--wait`), then plain `docker run`, which needs only the docker CLI
+  (`CTL_DOCKER_BACKEND=auto|compose2|compose1|plain` forces one). Or `CTL_NO_DOCKER=1` with a local
+  Postgres 16.
+- Network on the first run only: `registry-1.docker.io` (the two base images, pinned by digest) and
+  `pypi.org` plus `files.pythonhosted.org` (the exact, hash-checked wheels of
+  `requirements-runtime.lock`). Without PyPI, run `scripts/vendor_wheels.sh` elsewhere and copy
+  `vendor/wheels/`, or set `PIP_INDEX_URL` to a mirror. Cached images and wheels are not fetched
+  again. If even that fails, `run.sh` advances the simulator to its end with no decisions (limp
+  mode, last line says DEGRADED) rather than leave the scenario unfinished.
 - About 8 GB of RAM for public_03; public_01 and public_02 fit in 1 GB.
 
 ```bash
@@ -37,7 +46,12 @@ mkdir -p reports && .venv/bin/python -m sim grade --run runs/mine_public_01 --ba
 `run.sh` starts Postgres and the controller in containers, waits for the simulator's `/health`
 (it builds history first; up to `CTL_SIM_WAIT`, default 900 s), runs until the scenario finishes
 and restarts the controller after a crash (state lives only in Postgres). Exit code 3 means a
-fatal configuration error and is not retried. Without Docker:
+fatal configuration error and is not retried. A crash restarts the controller; the restart budget
+(`CTL_MAX_RESTARTS`, 30) counts restarts with no progress and resets when the run moves on. A hook
+that keeps crashing at one step is put in safe mode by the controller (the loop keeps advancing
+without it; `SAFE_MODE` alert and audit rows, see `docs/RUNBOOK.md`). When the run ends `run.sh`
+stops Postgres (data stays in its volume); `CTL_KEEP_UP=1` leaves Postgres and the read-only API up.
+`SIGTERM` or `SIGINT` to `run.sh` stops the controller container too. Without Docker:
 
 ```bash
 CTL_NO_DOCKER=1 PG_DSN="host=127.0.0.1 port=5432 user=postgres password=... dbname=postgres" ./run.sh http://127.0.0.1:8700

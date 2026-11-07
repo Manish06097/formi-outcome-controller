@@ -106,14 +106,12 @@ class EngagementLoop:
 
     def __init__(self, hooks: Any):
         self.g = hooks
-        self._gate_seen: dict[tuple[str, str, str], bool] = {}
         self._last_gate: dict[str, tuple[str, str, ep.GateVerdict, Any]] = {}
 
     def attach(self) -> None:
         rt = self.g.rt
         self.t = rt.settings.t
         self.model = rt.settings.env.engagement_model
-        self._gate_seen.clear()
 
     # ------------------------------------------------------------------ helpers
     @property
@@ -712,11 +710,17 @@ class EngagementLoop:
         v, ws, fits, ta = self._judge(comp.wf, comp.live, comp.proposed, alpha, comp.cls)
         self._last_gate[comp.wf] = (comp.proposed.hash(), comp.live.hash(), v, fits)
         hold = self._to_hold(comp.patches, comp.cls, v, ws, comp.live, comp.proposed)
-        key = (comp.wf, comp.proposed.hash(), comp.live.hash())
-        if self._gate_seen.get(key) != v.passes:
-            self._gate_seen[key] = v.passes
-            did_seed = ep.seed_for(ws, "gate", "did")
-            with self.g.scope.tx() as tx:
+        gate_key = f"{comp.proposed.hash()}:{comp.live.hash()}"
+        did_seed = ep.seed_for(ws, "gate", "did")
+        with self.g.scope.tx() as tx:
+            # AUDIT-2 F9: the same change is recorded again only when its verdict flips, read
+            # from the store, so a restart neither repeats nor loses the row
+            last = tx.execute("""SELECT (outcome->>'passes')::boolean FROM decision
+                                 WHERE wf = %s AND rule_id = '0.1/harm_gate'
+                                   AND inputs->>'gate_key' = %s
+                                 ORDER BY decision_id DESC LIMIT 1""",
+                              (self._code(comp.wf), gate_key)).fetchone()
+            if last is None or bool(last[0]) != v.passes:
                 sids = self._store_fits(
                     tx, ws, fits, {"purpose": "gate", "cur": comp.live.stored(),
                                    "new": comp.proposed.as_stored().stored(), "alpha": alpha,
@@ -725,7 +729,8 @@ class EngagementLoop:
                 did = write_decision(tx, self._decision(
                     comp.wf, "learning.harm", "harm_gate", "0.1/harm_gate",
                     {"class": comp.cls, "patch_ids": [p.patch_id for p in comp.patches],
-                     "changed_dims": list(comp.changed_dims), "alpha": alpha, "t_apply": ta},
+                     "changed_dims": list(comp.changed_dims), "alpha": alpha, "t_apply": ta,
+                     "gate_key": gate_key},
                     {**v.outcome(), "held": hold}, harm=v.report, snapshot_ids=sids,
                     seed=fits.seeds["ew"] if fits else did_seed))
                 if hold:

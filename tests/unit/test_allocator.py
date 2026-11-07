@@ -136,7 +136,12 @@ def test_minimum_gain_skips_a_tiny_exploitation_move():
                     rows[key].append(val)
     ws = build_snapshot(spec=SPEC, policy=make_policy(), live=cfg, live_version=2,
                         now=6 * 720, engage=engage_from_columns(rows),
-                        cells={0: w.cells[0]}, experiments=exps)
+                        cells={0: w.cells[0]}, experiments=exps, decay=[
+                            DecayMonitorState(wf="wf_test", scope="population", dim=d, arm=o,
+                                              cusum=0.0, seg_last=5, theta_ref=0.0, alarm=False,
+                                              seg_first=2)
+                            for d, o in (("welcome_message", "W2"), ("welcome_message", "W3"),
+                                         ("voice", "V2"), ("voice", "V3"), ("voice", "V4"))])
     plan = plan_allocation_detail(ws, _draws(ws))
     assert plan.kind == "skipped_min_gain" and plan.patches == ()
     assert abs(plan.expected_gain) < 0.0025

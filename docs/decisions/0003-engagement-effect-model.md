@@ -81,3 +81,26 @@ made it.
   for allocation effects as long as allocations were uniform within today's cohorts.
 - Not done: empirical-Bayes widening for the ridge-logit prior (tau_E is fixed), and the
   interaction LR test (cut, 5.3).
+
+## Decision update: the default after the 17.2 comparison (lead, 2026-11-07)
+Status: accepted. The default stays the stratified Beta-binomial. Ridge-logit stays available
+behind `CTL_ENGAGEMENT_MODEL=ridge_logit` and is not removed.
+
+Evidence (`docs/measurements/engagement-model-selection.md`, 13 scenarios, each graded against the
+no-op baseline of the same scenario): neither model made a harmful engagement change in any
+scenario (0 and 0). Mean gap captured is +6.0% for the Beta-binomial and +2.8% for the ridge-logit.
+The rule fixed in advance (17.2) said the ridge-logit becomes the default only if it captures more
+gap and is no more harmful; it did not capture more, so the rule keeps the simpler model.
+
+What this does not show, stated so it is not oversold:
+- The ridge-logit is the safer model on the public_02 family: nw_renewal gap is -14.2% (public_02),
+  -16.4% and -6.3% (seeds) for the Beta-binomial against -1.2%, -5.4% and -1.6% for the ridge-logit.
+  Both are negative there, so the cause is not the model. The step I4 hypothesis is the
+  supervisor's mid-run edit of the default voice; it is not verified (open item, see the I4 report).
+- The Beta-binomial cannot see heterogeneity inside a cohort of the live grid. The ridge-logit can,
+  and no scenario in the private set exercises that strongly. That is a real gap in the evidence.
+- Wall time: the ridge-logit cell takes 1.3x to 1.7x longer end to end on this machine.
+
+Consequences: the simpler model is the one to explain in the live review. If a hidden scenario
+shows off-grid heterogeneity, switching is one environment variable and a re-run of the
+comparison; the model interface is the same.

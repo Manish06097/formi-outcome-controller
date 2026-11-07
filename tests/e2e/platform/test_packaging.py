@@ -68,7 +68,8 @@ def test_the_image_installs_only_the_lock_and_never_the_simulator():
     assert "--require-hashes" in docker and "--no-deps" in docker and "--only-binary=:all:" in docker
     assert "requirements-runtime.lock" in docker
     assert "requirements.txt" not in docker and "requirements-controller.txt" not in docker
-    ignore = (REPO / ".dockerignore").read_text().split()
+    ignore = [ln.strip() for ln in (REPO / ".dockerignore").read_text().splitlines()
+              if ln.strip() and not ln.startswith("#")]
     assert ignore[0] == "*" and "!requirements-runtime.lock" in ignore
     assert not any(line.startswith("!sim") or line == "!requirements.txt" for line in ignore)
 

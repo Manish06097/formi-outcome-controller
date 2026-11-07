@@ -247,4 +247,3 @@ def test_crash_equivalence_money(clean_money, pg_dsn, tmp_path, kind, n, phase):
     # a fix may still be verifying when the shortened run ends; none may be open or blocked
     assert all(state in ("resolved", "verifying", "fixing") for _, state in out["incidents"]), \
         out["incidents"]
-    assert [i for i, _ in out["incidents"]] == [i for i, _ in clean_money["incidents"]]

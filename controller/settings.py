@@ -262,6 +262,11 @@ class Thresholds:
                                      "3-day baseline adjusted by the model.")
     guardrail_p_breach: float = T(0.025, "5.10", "A proposal must predict no guardrail drop "
                                   "(point estimate <= 0) and P(drop > x) <= 2.5%.")
+    guardrail_drop_tol: float = T(0.001, "5.10, ADR 0031", "\"Predict no drop\" at the "
+                                  "forecast's resolution: a predicted drop up to 0.1 points of "
+                                  "the rate counts as none. Cell rates carry about that much "
+                                  "error (50 calls of prior per cell), and a literal <= 0 refused "
+                                  "a coin flip's worth of neutral schedule tables.")
     guardrail_breach_conf: float = T(0.975, "5.10", "Breach when the lower 97.5% bound of the raw "
                                      "drop exceeds x and the drop is attributable to our change.")
     guardrail_mix_attrib_frac: float = T(0.5, "5.10", "Schedule or caller-ID attribution: the mix "
@@ -488,7 +493,9 @@ class EnvSettings:
     learner: str = "probe"
     """CTL_LEARNER: which patch-emitting learners the loop runs. `probe` (DESIGN.md 15.1 M3):
     caller-ID probes and spreads (5.9) plus per-cohort hour weights from history (5.8); `none`:
-    governance runs but nothing emits patches (the M2 no-op loop, used by the platform tests)."""
+    governance runs but nothing emits patches (the M2 no-op loop, used by the platform tests).
+    `probe` also runs the engagement learner (step I4, DESIGN.md 5.2 to 5.7, 5.10, ADR 0031);
+    `probe_only` is the M3 learner without it (for comparisons)."""
     fault: str | None = None
     """CTL_FAULT=<kind>:<n>:<phase> crash injection (10.2)."""
     max_restarts: int = 30
@@ -540,8 +547,8 @@ class EnvSettings:
         if ingest not in ("sql", "python"):
             raise ValueError(f"CTL_INGEST must be sql or python, not {ingest}")
         learner = _env_str(env, "CTL_LEARNER", default=d.learner)
-        if learner not in ("probe", "none"):
-            raise ValueError(f"CTL_LEARNER must be probe or none, not {learner}")
+        if learner not in ("probe", "probe_only", "none"):
+            raise ValueError(f"CTL_LEARNER must be probe, probe_only or none, not {learner}")
         return cls(
             sim_url=_env_str(env, "CTL_SIM_URL", "SIM_URL", default=d.sim_url) or d.sim_url,
             pg_dsn=_env_str(env, "PG_DSN", "CTL_PG_DSN"),

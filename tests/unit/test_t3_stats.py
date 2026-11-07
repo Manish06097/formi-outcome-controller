@@ -57,7 +57,9 @@ def test_mh_single_stratum_is_the_beta_binomial_log_ratio_with_unequal_size_vari
     r = mantel_haenszel(np.array([a]), np.array([n1]), np.array([c]), np.array([n0]))
     p1, p0 = a / n1, c / n0
     assert r.log_rr == pytest.approx(math.log(p1 / p0))
-    assert r.var == pytest.approx((1 - p1) / (n1 * p1) + (1 - p0) / (n0 * p0))
+    # the variance is floored at the half-event smoothed two-sample variance (ratios.py), which
+    # differs from the plain one by about 0.1% at these counts
+    assert r.var == pytest.approx((1 - p1) / (n1 * p1) + (1 - p0) / (n0 * p0), rel=5e-3)
 
 
 def test_mh_is_robust_to_simpsons_paradox_across_strata():

@@ -9,7 +9,7 @@ world.py:634-655). From our posterior draws:
     population:  P( de   < -1%  ) <= alpha_H      de   = E_new / E_cur - 1 over the active leads
     per cohort:  P( de_k < -x_k ) <= alpha_H      for every cohort k (of the NEW config)
     caller ID:   P( dd   < -2%  ) <= alpha_D      dd   = H_new / H_cur - 1
-    guardrail:   predicted drop <= 0 and P(drop > x) <= 2.5%   (5.10, from a GuardrailForecast)
+    guardrail:   predicted drop <= tol and P(drop > x) <= 2.5%   (5.10, from a GuardrailForecast)
 
 `E_X = sum_c leads_c * base_c * prod_dim sum_o p_X(cohort_X(c), dim)[o] * exp(L_{dim,o}(c))`,
 the simulator's own expected-engagement formula (world.py:288-305) with our effect draws in
@@ -192,7 +192,7 @@ class GateContext:
         g_kpi, g_mean, g_p = "", 0.0, 0.0
         if guard is not None:
             g_kpi, g_mean, g_p = guard.kpi, float(guard.drop_mean), float(guard.p_breach)
-            if g_mean > tol or g_p > t.guardrail_p_breach + tol:
+            if g_mean > t.guardrail_drop_tol or g_p > t.guardrail_p_breach + tol:
                 failed.append("guardrail")
         report = HarmReport(de_mean=float(de.mean()), p_de_below_1pct=p_pop,
                             de_k=FrozenDict(report_k), dd_mean=dd_mean, p_dd_below_2pct=p_dd,
@@ -215,7 +215,7 @@ class GateContext:
         col = {d: i for i, d in enumerate(did_post.dids)}
         def health(cfg: Config, coh: Sequence[str]) -> np.ndarray:
             tot = np.zeros(r.shape[0])
-            for k in set(coh):
+            for k in sorted(set(coh)):
                 lead = float(self.lead[np.array([c == k for c in coh])].sum())
                 for d, p in cfg.dist(k, "caller_id").items():
                     rd = r[:, col[d]] if d in col else np.ones(r.shape[0])

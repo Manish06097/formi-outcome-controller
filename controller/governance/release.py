@@ -214,6 +214,9 @@ class ReleaseDeps:
     holds: Callable[[str], Sequence[Hold]] = lambda wf: ()
     suspect_since: Callable[[str], int | None] = lambda wf: None
     t: Thresholds = field(default_factory=Thresholds)
+    gate: Callable[[Composition, int], tuple[Sequence[int], str] | None] | None = None
+    """The harm gate on a composed change before it is routed (DESIGN.md 0.1): None when it
+    passes, else (patch ids to hold, reason). None here: no gate (governance unit tests)."""
 
 
 class ReleaseTrain:
@@ -287,12 +290,35 @@ class ReleaseTrain:
             skipped = self.d.overlay.last_compose[wf].skipped
             return ReleaseDecision(wf, "skipped", "; ".join(f"patch {i}: {why}"
                                                             for i, why in skipped))
+        comp, blocked = self._gated(comp, now, composition_classes(need_cls))
+        if comp is None:
+            return ReleaseDecision(wf, "harm_gate", blocked)
         if not comp.changed_dims:
             p = lc.submit(comp, now, check=False)
             return ReleaseDecision(wf, "discard", "no net change", p.proposal_id)
         if prec.action in ("supersede", "bundle_supersede"):
             return self._supersede(holder, comp, now, pol, prec)
         return self._route(comp, now, pol)
+
+    def _gated(self, comp: Composition, now: int, classes: set[int]
+               ) -> tuple[Composition | None, str]:
+        """The harm gate on the composed change before routing (0.1). The patches of a failing
+        lever are held (re-checked by the auto-release, 6.1) and the rest is recomposed, so a
+        failing allocation never delays a caller-ID or schedule change riding with it."""
+        reasons: list[str] = []
+        for _ in range(3):
+            if self.d.gate is None or not comp.changed_dims:
+                return comp, ""
+            verdict = self.d.gate(comp, now)
+            if verdict is None:
+                return comp, ""
+            held, why = verdict
+            reasons.append(why)
+            self.d.overlay.hold(held, now + self.d.t.held_patch_release_min)
+            comp = self._compose(comp.wf, classes)
+            if not comp.patches:
+                return None, "; ".join(reasons)
+        return None, "; ".join(reasons)
 
     def _compose(self, wf: str, classes: set[int], paths=None) -> Composition:
         version, live = self.d.live(wf)

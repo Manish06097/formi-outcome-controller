@@ -5,7 +5,9 @@ Owner: integration step I2 (milestone M3). Implements DESIGN.md 4.1 steps 4, 5, 
 supervisor-edit handler, LIFECYCLE, GOVERN, VERIFY), 2 restart step 5 (the proposal sweep), 6.1 to
 6.7 through `governance/*` and `planner/overlay.py`, and 8.2 and 8.3 through
 `governance/effects.py`. It also runs the pickup levers (`learning/probe.py`, `loop/pickup.py`) in
-DETECT, DECIDE and VERIFY when `CTL_LEARNER=probe`. ADR 0029, ADR 0030.
+DETECT, DECIDE and VERIFY when `CTL_LEARNER=probe`, and the engagement learner
+(`loop/engagement.py`, step I4, ADR 0031) in DETECT, DECIDE, the release train's composed-change
+gate, the lifecycle's re-gate and verifiers, and the held-patch re-check. ADR 0029, 0030, 0031.
 
 State: nothing lives only here. Proposals, transitions, the approval mirror, the overlay
 (patches, owners, cooldowns), DID states and every decision are in the run schema; `attach`
@@ -47,6 +49,7 @@ from controller.governance.store_pg import OverlayStore, PgProposalStore, TxScop
 from controller.governance.timing import choose_submit, routine_slots
 from controller.learning.probe import OWNER_COHORTS, ProbeLearner, did_rows
 from controller.learning.schedule import OWNER as OWNER_SCHEDULE
+from controller.loop.engagement import EngagementLoop
 from controller.loop.incidents_hooks import PromptSafety
 from controller.loop.orchestrator import LoopHooks, Runtime, StageCounts
 from controller.loop.pickup import PickupLevers, json_safe
@@ -72,7 +75,8 @@ class GovernanceHooks(LoopHooks):
 
     def __init__(self, learner: str = "probe"):
         self.learner_kind = learner
-        self.learner = ProbeLearner() if learner == "probe" else None
+        self.learner = ProbeLearner() if learner in ("probe", "probe_only") else None
+        self.engagement = EngagementLoop(self) if learner == "probe" else None
         self.now = 0
 
     # ------------------------------------------------------------------ wiring (on every start)
@@ -83,6 +87,8 @@ class GovernanceHooks(LoopHooks):
         self.t = rt.settings.t
         if self.learner is not None:
             self.learner = ProbeLearner(self.t)
+        if self.engagement is not None:
+            self.engagement.attach()
         self.scope = TxScope(rt.db)
         self.store = PgProposalStore(self.scope, rt.catalog)
         self.registry = WorkflowRegistry(load_directives(), self.t)
@@ -104,12 +110,14 @@ class GovernanceHooks(LoopHooks):
             clock=self._clock, epoch=rt.epoch, run6=rt.run6,
             settings_hash=rt.settings.settings_hash(), code_version=rt.settings.env.code_version,
             t=self.t, holds=self._holds, on_alert=self._alert, on_applied=self._on_applied,
-            verifiers=self._pickup_verifiers(), on_rollback=self._on_rollback))
+            regate=self.engagement.regate if self.engagement else None,
+            verifiers=self._all_verifiers(), on_rollback=self._on_rollback_all))
         self.release = ReleaseTrain(ReleaseDeps(
             overlay=self.overlay, lifecycle=self.lc, policy_of=self.registry.policy,
             workflows=self.registry.workflow_ids, live=self._live,
             build_context=self._build_context, holds=self._holds,
-            suspect_since=self._suspect_since, t=self.t))
+            suspect_since=self._suspect_since, t=self.t,
+            gate=self.engagement.gate if self.engagement else None))
         attach_effect_hooks(rt.registry, lambda: self.lc, self.scope)
         with self.scope.tx() as tx:
             self.pickup.restore(tx)
@@ -211,10 +219,11 @@ class GovernanceHooks(LoopHooks):
             hist = {int(c): float(a or 0) for c, _, a in first}
         total = sum(hist.values())
         share = {c: v / total for c, v in hist.items()} if total > 0 else {}
-        return BuildContext(primary_kpi=spec.objective.primary, batch_size=spec.daily_batch.size,
-                            mid_flight=spec.mid_flight, cells=cells,
-                            active_by_cell=FrozenDict(active),
-                            hist_share_by_cell=FrozenDict(share))
+        ctx = BuildContext(primary_kpi=spec.objective.primary, batch_size=spec.daily_batch.size,
+                           mid_flight=spec.mid_flight, cells=cells,
+                           active_by_cell=FrozenDict(active),
+                           hist_share_by_cell=FrozenDict(share))
+        return self.engagement.enrich(wf, ctx) if self.engagement else ctx
 
     def _decision(self, wf: str | None, module: str, kind: str, rule: str,
                   inputs: Mapping[str, Any], outcome: Mapping[str, Any] | None = None) -> Decision:
@@ -309,7 +318,8 @@ class GovernanceHooks(LoopHooks):
         before = self._applied_count()
         self.lc.recover(now)
         self.lc.tick(now)
-        released = self.overlay.release_held(now, lambda p: True)
+        released = self.overlay.release_held(
+            now, self.engagement.release_ok if self.engagement else (lambda p: True))
         self.scope.flush()
         if released["released"] or released["dropped"]:
             with self.scope.tx() as tx:
@@ -439,6 +449,8 @@ class GovernanceHooks(LoopHooks):
                     self._write_did_states(tx, wf, changed)
         if self.prompts is not None:
             self.prompts.detect()
+        if self.engagement is not None:
+            self.engagement.detect(now)
         return None
 
     def _write_did_states(self, tx: Tx, wf: str, states: Mapping[str, DidState]) -> None:
@@ -484,6 +496,8 @@ class GovernanceHooks(LoopHooks):
                     reqs += [r for r in model.plan_caller_ids(ws) if r.cls != P0_INCIDENT]
                 if planning or turned_bad:
                     self._record_blocked(tx, wf, model, now)
+                if self.engagement is not None:
+                    reqs = self.engagement.guardrail_filter(tx, ws, reqs)
                 for req in reqs:
                     if self._already_wanted(req):
                         continue
@@ -495,6 +509,8 @@ class GovernanceHooks(LoopHooks):
                     n += 1
         if self.prompts is not None:
             n += self.prompts.decide()
+        if self.engagement is not None:
+            n += self.engagement.decide(now)
         return StageCounts(decisions=n)
 
     def _did_turned_bad(self, wf: str, now: int) -> bool:
@@ -560,6 +576,17 @@ class GovernanceHooks(LoopHooks):
             if d.action == "no_safe_window":
                 raise_alert(tx, "NO_SAFE_WINDOW", self.rt.catalog.code(d.wf), d.wf, d.reason,
                             sim_minute=now)
+
+    def _all_verifiers(self) -> dict[str, Any]:
+        """Engagement's allocation and `none` verifiers, with the pickup levers' caller-ID and
+        schedule verifiers winning where both define a kind (I3 owns those two)."""
+        eng = self.engagement.verifiers() if self.engagement else {}
+        return {**eng, **self._pickup_verifiers()}
+
+    def _on_rollback_all(self, p: Proposal, r: VerifyResult) -> None:
+        self._on_rollback(p, r)
+        if self.engagement is not None:
+            self.engagement.on_verify_failed(p, r)
 
     def _pickup_verifiers(self) -> dict[str, Any]:
         """The kind verifiers of 6.1 for the levers of this module."""

@@ -152,9 +152,11 @@ class Thresholds:
                              "out-of-control ARL 8.4 segments at 1 SE.")
     decay_arm_share: float = T(0.10, "5.7", "Monitor every non-control arm with >= 10% share in "
                                "some scope (lowered from 15% per F1).")
-    decay_clean_segments: int = T(2, "5.7", "ADR 0034: an arm may rise above the monitoring floor "
-                                  "(decay_arm_share) only after its decay monitor has folded this "
-                                  "many segments without an alarm.")
+    decay_clean_segments: int = T(0, "5.7", "ADR 0034 (NOT enabled): when > 0 an arm may rise above "
+                                  "the monitoring floor (decay_arm_share) only after its decay "
+                                  "monitor has folded this many segments without an alarm. Measured "
+                                  "with 2: about 7 points of engagement gap lost on stable worlds, "
+                                  "so the default is off.")
     rollback_tolerance: float = T(0.10, "5.7", "Rollback when E[de_rollback(t_a)] > 0 and "
                                   "P(de_rollback(t_a) < -1%) <= 10%.")
     rollback_trend_segments: int = T(4, "5.7", "Local linear trend over the last 4 segments to "

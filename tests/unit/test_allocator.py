@@ -1,6 +1,8 @@
 """Harm-gated probability matching (DESIGN.md 5.4)."""
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import pytest
 
@@ -97,14 +99,15 @@ def test_an_arm_the_decay_monitor_has_not_seen_cannot_rise_above_the_monitoring_
     """ADR 0034 (ENG-GAP): the better arm W2 is held at the monitoring floor until its monitor
     has folded two segments; with them it ramps. One folded segment is not enough."""
     w, cfg, exps = _ramped_world()
-    floor = Thresholds().decay_arm_share
+    t2 = dataclasses.replace(Thresholds(), decay_clean_segments=2)
+    floor = t2.decay_arm_share
     unseen = w.snapshot(cfg, 6, experiments=exps)
     one = w.snapshot(cfg, 6, experiments=exps, decay=[_clean_monitor("W2", first=5, last=5)])
     seen = w.snapshot(cfg, 6, experiments=exps, decay=[_clean_monitor("W2")])
     for ws in (unseen, one):
-        d = plan_allocation_detail(ws, _draws(ws)).proposed.dist("default", "welcome_message")
+        d = plan_allocation_detail(ws, _draws(ws), settings=t2).proposed.dist("default", "welcome_message")
         assert d["W2"] <= max(floor, 0.15) + 1e-9
-    d = plan_allocation_detail(seen, _draws(seen)).proposed.dist("default", "welcome_message")
+    d = plan_allocation_detail(seen, _draws(seen), settings=t2).proposed.dist("default", "welcome_message")
     assert d["W2"] > 0.15
 
 

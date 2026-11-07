@@ -74,7 +74,7 @@ This replaces points 3 and 5 above and adds the rest. The original text is kept 
   uses the tag. `requirements.txt` is the simulator's and is untouched. `run.sh` states in its header
   what the box needs: the registry, and PyPI (or a mirror, or `vendor/wheels/`) on the first run.
 - **Backends (finding 6).** `docker compose` v2, `docker-compose` v1, then plain `docker run`
-  (own network-free layout: Postgres container with a published loopback port, polled with
+  (Postgres container with a published loopback port, polled with
   `pg_isready` through `docker exec`; the controller on `--network host` or `host.docker.internal`).
   Nothing uses `--wait`. The image is built with `docker build`, not `compose build`, so a missing
   buildx does not matter. A compose backend that fails to start Postgres falls back to plain.

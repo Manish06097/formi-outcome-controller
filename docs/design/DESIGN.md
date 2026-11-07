@@ -1009,6 +1009,12 @@ because W3 and the EW harm gate see the decline first (EW effective window about
 Not done: staggering exploration so that decay clocks start only when we can exploit them. That
 would be tuning to a simulator mechanism; real novelty decay would not care.
 
+Built and measured, off by default (ADR 0034, `decay_clean_segments`): holding an arm at the 10%
+monitoring floor until its monitor has folded two clean segments. It cost about 7 points of gap on
+stable worlds and gained under 1 on the p02 family, so the residual stated above stays. ENG-GAP also
+fixed the gate defects that delayed the rollback after the alarm (plans are made against the tail
+minus two Monte Carlo errors, and a rollback is judged on its planner's draws).
+
 ### 5.8 Call time (per cohort)
 
 **From history:** pickup by (cell, hour, attempt bucket {1, 2-3, 4+}) from `r_pickup`. History ran

@@ -126,3 +126,26 @@ def test_harm_gate_function_matches_the_context():
                   cells=ws.cells)
     b = ctx.evaluate(cfg, new, make_policy()).report
     assert a == b
+
+
+def test_a_planning_gate_leaves_two_monte_carlo_errors_below_the_tail():
+    """ENG-GAP: a planner that bisects to the largest step the gate allows lands on the
+    boundary, and the release gate then fails it by a few draws. With `planning=True` whatever
+    passes has a tail at most alpha - 2 SE, so it also passes the plain gate."""
+    from controller.learning.harm import tail_margin
+    ctx, cfg, _ = _ctx_and_cfg()
+    pol = make_policy()
+    margin = tail_margin(0.025, ctx.cache.n_draws)
+    assert 0.0 < margin < 0.01
+    arms = {"voice": ("V1", ["V2", "V3", "V4"])}
+
+    def passes(s: float, planning: bool) -> bool:
+        new = uniform_exploration(cfg, arms, s)
+        return ctx.evaluate(cfg, new, pol, planning=planning).report.passes
+
+    plain = largest_passing(lambda s: passes(s, False), 12, hi=0.3)
+    planned = largest_passing(lambda s: passes(s, True), 12, hi=0.3)
+    assert 0 < planned < plain
+    assert passes(planned, False)
+    new = uniform_exploration(cfg, arms, planned)
+    assert ctx.evaluate(cfg, new, pol).report.p_de_below_1pct <= 0.025 - margin + 1e-9

@@ -118,6 +118,19 @@ def test_a_table_that_shifts_connects_to_a_low_engagement_cell_is_refused_on_any
     assert f.dropped[0][1] == pytest.approx(0.043, abs=2e-3)
 
 
+def test_an_incident_class_change_is_never_refused_by_the_forecast():
+    """AUDIT-2 F2: the same breaching change as above, but incident class (a drain off a flagged
+    DID): kept, the breach only recorded, and it still counts in the running config."""
+    from dataclasses import replace
+    spec = _spec("pickup_rate")
+    ws = _ws(spec, _live(spec), rates=(0.3, 0.7))
+    drain = replace(_table({9: 3.0, 10: 1.0}), cls=0, owner="learning.did")
+    f = ep.filter_by_guardrail(ws, [drain], T)
+    assert [r.path for r in f.keep] == [("hour_weights", COHORT.id)]
+    assert f.dropped == () and f.exempt[0][0] == ("hour_weights", COHORT.id)
+    assert f.exempt[0][1] == pytest.approx(0.043, abs=2e-3)
+
+
 def test_the_same_table_passes_when_it_shifts_connects_to_a_high_engagement_cell():
     spec = _spec("pickup_rate")
     ws = _ws(spec, _live(spec), rates=(0.7, 0.3))

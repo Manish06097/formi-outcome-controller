@@ -106,14 +106,12 @@ class EngagementLoop:
 
     def __init__(self, hooks: Any):
         self.g = hooks
-        self._gate_seen: dict[tuple[str, str, str], bool] = {}
         self._last_gate: dict[str, tuple[str, str, ep.GateVerdict, Any]] = {}
 
     def attach(self) -> None:
         rt = self.g.rt
         self.t = rt.settings.t
         self.model = rt.settings.env.engagement_model
-        self._gate_seen.clear()
 
     # ------------------------------------------------------------------ helpers
     @property
@@ -347,13 +345,14 @@ class EngagementLoop:
         code = self._code(ws.spec.workflow_id)
         for s in states:
             tx.execute("""INSERT INTO decay_monitor (wf, scope, dim, arm, cusum, seg_last,
-                                                      theta_ref, alarm)
-                          VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                                      theta_ref, alarm, seg_first)
+                          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                           ON CONFLICT (wf, scope, dim, arm) DO UPDATE SET cusum = excluded.cusum,
                               seg_last = excluded.seg_last, theta_ref = excluded.theta_ref,
-                              alarm = excluded.alarm""",
+                              alarm = excluded.alarm, seg_first = excluded.seg_first""",
                        (code, s.scope, s.dim, self._opt(ws, s.dim, s.arm), float(s.cusum),
-                        int(s.seg_last), float(s.theta_ref), bool(s.alarm)))
+                        int(s.seg_last), float(s.theta_ref), bool(s.alarm),
+                        None if s.seg_first is None else int(s.seg_first)))
 
     # ================================================================== DECIDE
     def decide(self, now: int) -> int:
@@ -380,7 +379,7 @@ class EngagementLoop:
         """AUDIT-1 finding 3: the forecast before a pickup-lever patch enters the overlay, on
         every workflow. A refused request is a recorded decision not to act."""
         f = ep.filter_by_guardrail(ws, reqs, self.t)
-        if f.dropped:
+        if f.dropped or f.exempt:
             wf = ws.spec.workflow_id
             kpi = ws.spec.objective.guardrail_kpi
             did = write_decision(tx, self._decision(
@@ -389,10 +388,13 @@ class EngagementLoop:
                  "tolerance": self.t.guardrail_drop_tol},
                 {"dropped": [{"path": list(pa), "drop": d, "p_breach": b}
                              for pa, d, b in f.dropped],
+                 "exempt_p0": [{"path": list(pa), "drop": d, "p_breach": b}
+                               for pa, d, b in f.exempt],
                  "kept": [list(r.path) for r in f.keep]}))
-            raise_alert(tx, "HARM_GATE_BLOCK", self._code(wf), f"{wf}:guardrail",
-                        f"{wf}: guardrail forecast ({kpi}) refused {len(f.dropped)} pickup-lever "
-                        f"change(s) (decision #{did})", sim_minute=self.now)
+            if f.dropped:
+                raise_alert(tx, "HARM_GATE_BLOCK", self._code(wf), f"{wf}:guardrail",
+                            f"{wf}: guardrail forecast ({kpi}) refused {len(f.dropped)} "
+                            f"pickup-lever change(s) (decision #{did})", sim_minute=self.now)
         return list(f.keep)
 
     def _exposed(self, ws: WorkflowSnapshot) -> bool:
@@ -708,11 +710,17 @@ class EngagementLoop:
         v, ws, fits, ta = self._judge(comp.wf, comp.live, comp.proposed, alpha, comp.cls)
         self._last_gate[comp.wf] = (comp.proposed.hash(), comp.live.hash(), v, fits)
         hold = self._to_hold(comp.patches, comp.cls, v, ws, comp.live, comp.proposed)
-        key = (comp.wf, comp.proposed.hash(), comp.live.hash())
-        if self._gate_seen.get(key) != v.passes:
-            self._gate_seen[key] = v.passes
-            did_seed = ep.seed_for(ws, "gate", "did")
-            with self.g.scope.tx() as tx:
+        gate_key = f"{comp.proposed.hash()}:{comp.live.hash()}"
+        did_seed = ep.seed_for(ws, "gate", "did")
+        with self.g.scope.tx() as tx:
+            # AUDIT-2 F9: the same change is recorded again only when its verdict flips, read
+            # from the store, so a restart neither repeats nor loses the row
+            last = tx.execute("""SELECT (outcome->>'passes')::boolean FROM decision
+                                 WHERE wf = %s AND rule_id = '0.1/harm_gate'
+                                   AND inputs->>'gate_key' = %s
+                                 ORDER BY decision_id DESC LIMIT 1""",
+                              (self._code(comp.wf), gate_key)).fetchone()
+            if last is None or bool(last[0]) != v.passes:
                 sids = self._store_fits(
                     tx, ws, fits, {"purpose": "gate", "cur": comp.live.stored(),
                                    "new": comp.proposed.as_stored().stored(), "alpha": alpha,
@@ -721,7 +729,8 @@ class EngagementLoop:
                 did = write_decision(tx, self._decision(
                     comp.wf, "learning.harm", "harm_gate", "0.1/harm_gate",
                     {"class": comp.cls, "patch_ids": [p.patch_id for p in comp.patches],
-                     "changed_dims": list(comp.changed_dims), "alpha": alpha, "t_apply": ta},
+                     "changed_dims": list(comp.changed_dims), "alpha": alpha, "t_apply": ta,
+                     "gate_key": gate_key},
                     {**v.outcome(), "held": hold}, harm=v.report, snapshot_ids=sids,
                     seed=fits.seeds["ew"] if fits else did_seed))
                 if hold:
@@ -780,7 +789,11 @@ class EngagementLoop:
             ws = self.g._snapshot(tx, wf)
         fits = None
         if wf in self.workflows() and set(live.changed_dims(new)) & set(ENGAGEMENT_DIMS):
-            fits = ep.fit(ws, self.model, self.t, "plan", kinds=("ew",))
+            # the draws the planner of this class used: rollbacks and harm stops are planned in
+            # the urgent stage, everything else at the planning point. Other draws would make
+            # a plan that sits at the edge of its own gate fail it by Monte Carlo noise.
+            purpose = "urgent" if cls <= P1_ROLLBACK else "plan"
+            fits = ep.fit(ws, self.model, self.t, purpose, kinds=("ew",))
         ta = self._t_apply(ws, urgent=cls <= P1_ROLLBACK)
         v = ep.run_gate(ws, fits.ew if fits else None, live, new, self.t, alpha,
                         ep.seed_for(ws, "gate", "did"), ta)

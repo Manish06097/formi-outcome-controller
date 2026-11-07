@@ -1499,6 +1499,8 @@ class DecayMonitorState:
     seg_last: int
     theta_ref: float
     alarm: bool
+    seg_first: int | None = None
+    """first segment folded into the CUSUM (None for rows written before ADR 0034)"""
 
 
 @dataclass(frozen=True)

@@ -255,8 +255,9 @@ def load_snapshot(conn: Any, wf: int, *, spec: WorkflowSpec, policy: EffectivePo
                                arm=_opt_name(spec, r[1], r[2]), cusum=float(r[3]),
                                seg_last=int(r[4]) if r[4] is not None else -10 ** 6,
                                theta_ref=float(r[5]) if r[5] is not None else 0.0,
-                               alarm=bool(r[6]))
-             for r in q("""SELECT scope, dim, arm, cusum, seg_last, theta_ref, alarm
+                               alarm=bool(r[6]),
+                               seg_first=int(r[7]) if r[7] is not None else None)
+             for r in q("""SELECT scope, dim, arm, cusum, seg_last, theta_ref, alarm, seg_first
                            FROM decay_monitor WHERE wf = %s ORDER BY scope, dim, arm""",
                         (wf,)).fetchall()]
     holdouts = [HoldoutState(wf=spec.workflow_id, scope=r[0], dim=r[1],

@@ -217,6 +217,22 @@ class PgProposalStore:
                            (approval_id,)).fetchone()
         return tuple((r[0] if r else None) or ())
 
+    def auto_block_history(self) -> tuple[dict[str, tuple[int, str, str]], dict[str, int]]:
+        """(latest `forbidden` transition per workflow, last `policy_changed` minute per
+        workflow) for `ProposalLifecycle.restore_auto_blocks` (AUDIT-2 F5)."""
+        with self.scope.tx() as tx:
+            f = tx.execute("""SELECT DISTINCT ON (p.wf) p.wf, t.sim_minute, p.proposal_id,
+                                     coalesce(t.reason, '')
+                              FROM proposal_transition t JOIN proposal p USING (proposal_id)
+                              WHERE t.to_state = 'failed_policy'
+                              ORDER BY p.wf, t.sim_minute DESC, t.seq DESC""").fetchall()
+            c = tx.execute("""SELECT wf, max(sim_minute) FROM audit_log
+                              WHERE action = 'policy_changed' AND wf IS NOT NULL
+                              GROUP BY wf""").fetchall()
+        ids = {int(v): k for k, v in self.catalog.codes.items()}
+        return ({ids[int(r[0])]: (int(r[1]), str(r[2]), str(r[3])) for r in f},
+                {ids[int(r[0])]: int(r[1]) for r in c})
+
     def velocity_entries(self, wf: str, since_minute: int) -> list[VelocityEntry]:
         with self.scope.tx() as tx:
             rows = self._select(tx, """wf = %s AND route = 'auto' AND applied_minute IS NOT NULL

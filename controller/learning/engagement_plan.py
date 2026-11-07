@@ -30,7 +30,7 @@ from controller.settings import Thresholds
 from controller.snapshot import active_population
 from controller.stats.draws import derive_seed
 from controller.planner.overlay import apply_patch
-from controller.types import (P2_PROMOTION, Config, DidPosterior, Draws, FrozenDict,
+from controller.types import (P0_INCIDENT, P2_PROMOTION, Config, DidPosterior, Draws, FrozenDict,
                               GuardrailForecast, HarmReport, ParamIndex, PatchRequest, Posterior,
                               WorkflowSnapshot, thaw)
 
@@ -189,6 +189,8 @@ class ForecastFilter:
     """(path, predicted drop, P(breach)) of each request the forecast refused"""
     forecast: GuardrailForecast | None
     """the forecast of everything kept"""
+    exempt: tuple[tuple[tuple[str, ...], float, float], ...] = ()
+    """(path, drop, P(breach)) of incident-class (P0) requests kept although the forecast breaches"""
 
 
 def filter_by_guardrail(ws: WorkflowSnapshot, reqs: Sequence[PatchRequest], t: Thresholds
@@ -207,6 +209,7 @@ def filter_by_guardrail(ws: WorkflowSnapshot, reqs: Sequence[PatchRequest], t: T
     model = ConnectModel(ws, t)
     keep: list[PatchRequest] = []
     dropped: list[tuple[tuple[str, ...], float, float]] = []
+    exempt: list[tuple[tuple[str, ...], float, float]] = []
     last: GuardrailForecast | None = None
     for r in reqs:
         if r.path[0] == "cohorts":
@@ -214,13 +217,20 @@ def filter_by_guardrail(ws: WorkflowSnapshot, reqs: Sequence[PatchRequest], t: T
         trial = apply_patch(cfg, tuple(r.path), thaw(r.value))
         g = forecast(ws, None, ws.live, trial, t, model)
         if forecast_breaches(g, t):
+            if r.cls == P0_INCIDENT:
+                # AUDIT-2 F2: incident work (a drain off a flagged DID, a prompt fix) removes
+                # harm the forecast cannot see; it is kept and the breach only recorded
+                exempt.append((tuple(r.path), float(g.drop_mean), float(g.p_breach)))
+                cfg, last = trial, g
+                keep.append(r)
+                continue
             dropped.append((tuple(r.path), float(g.drop_mean), float(g.p_breach)))
             continue
         cfg, last = trial, g
         keep.append(r)
     if any(r.path[0] == "hour_weights" for r in keep):
         keep = cohorts + keep
-    return ForecastFilter(tuple(keep), tuple(dropped), last)
+    return ForecastFilter(tuple(keep), tuple(dropped), last, tuple(exempt))
 
 
 def forecast_breaches(g: GuardrailForecast, t: Thresholds) -> bool:

@@ -1,8 +1,12 @@
 """Harm-gated probability matching (DESIGN.md 5.4)."""
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import pytest
+
+from controller.settings import Thresholds
 
 from controller.learning.allocator import (harm_stops, open_experiments, plan_allocation_detail,
                                            plan_allocations, project_shares)
@@ -67,9 +71,14 @@ def _ramped_world(seed=1, days=3, mult=None):
     return w, cfg, exps
 
 
+def _clean_monitor(arm: str, first: int = 2, last: int = 5, alarm: bool = False):
+    return DecayMonitorState(wf="wf_test", scope="population", dim="welcome_message", arm=arm,
+                             cusum=0.5, seg_last=last, theta_ref=0.1, alarm=alarm, seg_first=first)
+
+
 def test_plan_moves_toward_the_better_arm_and_removes_the_bad_one():
     w, cfg, exps = _ramped_world()
-    ws = w.snapshot(cfg, 6, experiments=exps)
+    ws = w.snapshot(cfg, 6, experiments=exps, decay=[_clean_monitor("W2"), _clean_monitor("W3")])
     plan = plan_allocation_detail(ws, _draws(ws))
     d = plan.proposed.dist("default", "welcome_message")
     assert d["W2"] > 0.15 and d["W2"] <= 0.5 + 1e-9
@@ -84,6 +93,22 @@ def test_same_data_and_seed_give_the_same_plan():
     a = plan_allocation_detail(ws, _draws(ws, seed=99))
     b = plan_allocation_detail(ws, _draws(ws, seed=99))
     assert a.proposed == b.proposed and a.patches == b.patches and a.lambdas == b.lambdas
+
+
+def test_an_arm_the_decay_monitor_has_not_seen_cannot_rise_above_the_monitoring_floor():
+    """ADR 0034 (ENG-GAP): the better arm W2 is held at the monitoring floor until its monitor
+    has folded two segments; with them it ramps. One folded segment is not enough."""
+    w, cfg, exps = _ramped_world()
+    t2 = dataclasses.replace(Thresholds(), decay_clean_segments=2)
+    floor = t2.decay_arm_share
+    unseen = w.snapshot(cfg, 6, experiments=exps)
+    one = w.snapshot(cfg, 6, experiments=exps, decay=[_clean_monitor("W2", first=5, last=5)])
+    seen = w.snapshot(cfg, 6, experiments=exps, decay=[_clean_monitor("W2")])
+    for ws in (unseen, one):
+        d = plan_allocation_detail(ws, _draws(ws), settings=t2).proposed.dist("default", "welcome_message")
+        assert d["W2"] <= max(floor, 0.15) + 1e-9
+    d = plan_allocation_detail(seen, _draws(seen), settings=t2).proposed.dist("default", "welcome_message")
+    assert d["W2"] > 0.15
 
 
 def test_a_decay_alarm_freezes_increases():
@@ -114,7 +139,12 @@ def test_minimum_gain_skips_a_tiny_exploitation_move():
                     rows[key].append(val)
     ws = build_snapshot(spec=SPEC, policy=make_policy(), live=cfg, live_version=2,
                         now=6 * 720, engage=engage_from_columns(rows),
-                        cells={0: w.cells[0]}, experiments=exps)
+                        cells={0: w.cells[0]}, experiments=exps, decay=[
+                            DecayMonitorState(wf="wf_test", scope="population", dim=d, arm=o,
+                                              cusum=0.0, seg_last=5, theta_ref=0.0, alarm=False,
+                                              seg_first=2)
+                            for d, o in (("welcome_message", "W2"), ("welcome_message", "W3"),
+                                         ("voice", "V2"), ("voice", "V3"), ("voice", "V4"))])
     plan = plan_allocation_detail(ws, _draws(ws))
     assert plan.kind == "skipped_min_gain" and plan.patches == ()
     assert abs(plan.expected_gain) < 0.0025

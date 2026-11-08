@@ -47,9 +47,8 @@ So the arm cap does not make detection faster or slower on average; seed 101 sim
 - Why it varies: the fast detector (DESIGN 7.3) needs >= 100 dials on the DID in a 2, 4 or 8 h window, z <= -4
   and r <= 0.75. At a one-third share the z statistic crosses -4 after a random number of dials, so the alarm
   tick is random with a spread of about 75 to 150 minutes. The 2-hour assertion sits at the middle of that
-  spread, so the test passes or fails by the draw. The flag-day share bound in the same test uses the same
-  2 h and still passed (measured share 0.333 vs bound 0.113 + slack on the draw in I3; the assertion above it
-  did not fail here), so the harm bound is not at stake.
+  spread, so the test passes or fails by the draw. The flag-day share assertions of the same test (bound and
+  zero on later days) pass; only the alarm-time line fails, so the harm bound is not at stake.
 
 No code or threshold was changed.
 
@@ -80,3 +79,7 @@ docs/LIVE_REVIEW.md section 4 has the weakness note.
    one-third share" is a mean or a promise.
 2. Or make the detector faster (for example a 1 h window or lower min dials): a design and threshold change,
    not made here.
+
+## Final test run (HEAD plus these commits)
+- tests/e2e/test_m3_governance_live.py: 54 passed (11 min).
+- tests/e2e/test_m4_pickup_live.py: 29 passed, 15 skipped, 1 failed (d_max_shift_005 alarm-time assertion, the knife edge above).

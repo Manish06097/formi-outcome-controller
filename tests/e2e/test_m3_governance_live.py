@@ -154,9 +154,25 @@ def test_run_finishes_and_grader_counts_are_clean(world):
 
 
 def test_peak_requests_within_c_eff(world):
+    """DESIGN 6.4: routine requests (P2, P3) stay within the effective cap c_eff in any rolling 24 h;
+    urgent ones (P0 incident, P1 rollback) may use the reserve and exceed a directive (memo) cap,
+    but the total never exceeds the policy cap from the API (timing.fatigue_ok)."""
+    props = {p[0]: p for p in world["store"]["proposals"]}
+    by_wf = defaultdict(list)
+    for a in world["approvals"]:
+        by_wf[a.workflow_id].append((_minute(world, a.created_at), props[a.proposal_id][2]))
+    for wf, reqs in by_wf.items():
+        pol = world["registry"].policy(wf)
+        for t, _ in reqs:
+            window = [c for m, c in reqs if t - 1440 < m <= t]
+            routine = sum(1 for c in window if c >= 2)
+            mix = {f"P{c}": window.count(c) for c in sorted(set(window))}
+            assert routine <= pol.c_eff, (wf, "routine over c_eff", routine, pol.c_eff, mix, t)
+            assert len(window) <= pol.c_policy, (wf, "total over policy cap", len(window),
+                                                 pol.c_policy, mix, t)
     peak = world["grade"]["governance"]["peak_requests_per_24h"]
     for wf, n in peak.items():
-        assert n <= world["registry"].policy(wf).c_eff, (wf, n, peak)
+        assert n <= world["registry"].policy(wf).c_policy, (wf, n, peak)
 
 
 def test_every_approved_request_was_applied_in_time(world):

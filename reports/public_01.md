@@ -28,7 +28,7 @@ python -m sim grade --run runs/final_p01 --baseline runs/base_public_01_dev --ou
 
 - The controller mostly moved pickup (caller-ID probes and spreads, call-time schedule); welcome and voice experiments found a little more than in earlier runs but little in absolute terms within 8 days.
 - `nw_kyc` engagement is +0.5% this run (it was -2.4% in the previous report); its primary is pickup and engagement is the guardrail. No workflow is negative on engagement here.
-- `nw_renewal` carries a decaying welcome variant (W3): its share on the variant stays 0.25 to 0.30 through D7 in this run (see the decaying-variants block below). This is the known weakness in LIVE_REVIEW section 5.
+- `nw_renewal` carries a decaying welcome variant (W3): its share on the variant stays 0.25 to 0.30 through D7 in this run (see the decaying-variants block below). This is a known weakness (SUBMISSION.md section 13).
 - Variance: the previous report scored +7.4% on this scenario and an earlier build +11.1%. The controller's outcome depends on the random draws of its experiments and on code changes between runs; one run is one sample, not a point estimate (multi-seed spread: `docs/measurements/did-gate-multiseed.md`).
 
 ## Grade output (verbatim, from `sim grade`)

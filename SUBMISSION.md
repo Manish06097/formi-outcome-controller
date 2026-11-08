@@ -38,7 +38,7 @@ the 56 private variants in `scenarios/private/`, never on public-scenario truth.
 6. **AI usage (README section 10).** The design and build were led by an AI senior engineer (Claude)
    working through subagents: it wrote the design, ADRs, code and tests, and other subagents reviewed
    and audited. I direct the work and must be able to defend every decision in the live review without
-   AI help; the reasons are written down in the ADRs and [docs/LIVE_REVIEW.md](docs/LIVE_REVIEW.md).
+   AI help; the reasons are written down in the ADRs.
    The commit history shows how the thinking progressed, including the dead ends.
 
 **How to run.** `./run.sh http://127.0.0.1:8700` (Docker), no manual steps; exit code 0 when the scenario

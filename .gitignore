@@ -8,3 +8,4 @@ reports/baseline_*.md
 # Vendored wheels are a build input (scripts/vendor_wheels.sh, ADR 0019)
 vendor/wheels/*.whl
 .claude/worktrees/
+docs/LIVE_REVIEW.md

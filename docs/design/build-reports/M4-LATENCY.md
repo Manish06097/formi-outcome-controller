@@ -63,7 +63,7 @@ All request creation goes through `Lifecycle._blockers` -> `timing.fatigue_ok` (
 (P0, P1) need `n + 1 <= c_policy`; routine need `n + 1 <= routine_budget (c_eff - reserve)`. The only other
 caller of `request_approval` is the intent replay of the same stored body. So the controller cannot exceed the
 policy cap for any class, and P0/P1 exceed only a directive (memo) cap through that documented path. No bug.
-docs/LIVE_REVIEW.md section 4 has the weakness note.
+The weakness note is in SUBMISSION.md section 13.
 
 ## Commands
 - Single case: `CTL_T1_SIM_PORT=8795 CTL_TEST_PG_DSN=... .venv/bin/python -m pytest tests/e2e/test_m4_pickup_live.py -k "d_max_shift_005 and flag_day_share"`

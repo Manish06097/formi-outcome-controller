@@ -91,8 +91,7 @@ OWNER_GUARDRAIL = "learning.guardrail"
 OWNER_SCHEDULE = "learning.schedule"
 ENGAGEMENT_FAIL = ("population", "cohort")
 DID_FAIL = ("did", "did_unmodeled")
-UNPROVEN_DID = frozenset({"unknown", "probing", "degraded", "unhealthy", "suspect"})
-"""A DID status with no evidence that it is at least as good as its peers (5.9)."""
+"""The failed-line names of the caller-ID line (0.1): held on every non-P0 change (ADR 0035)."""
 VERIFY_MIN_CALLS = 100
 """Fewest calls in a (cohort, dim) before check (a) of 6.1 compares shares: 3 SE on a handful of
 calls across many cohorts and arms pages falsely by multiplicity alone."""
@@ -746,8 +745,8 @@ class EngagementLoop:
                  ws: WorkflowSnapshot, live: Config, new: Config) -> list[int]:
         """The patches on the failing lever. An engagement line holds welcome and voice; the
         guardrail line holds the pickup levers when the change has any (only they move who
-        connects), else welcome and voice; the caller-ID line holds caller ID when the change
-        adds share to a DID nothing has proved yet. Nothing for P0 incident work."""
+        connects), else welcome and voice; the caller-ID line holds caller ID, whichever DIDs
+        gain share (GATE-DID, ADR 0035). Nothing for P0 incident work."""
         if v.passes or cls == P0_INCIDENT:
             return []
         failed = [f.removeprefix("apply_time:") for f in v.report.failed]
@@ -762,26 +761,9 @@ class EngagementLoop:
             hold |= of(ENGAGEMENT_DIMS)
         if "guardrail" in failed:
             hold |= pickup or of(ENGAGEMENT_DIMS)
-        if any(f in DID_FAIL for f in failed) and self._adds_unproven_did(ws, live, new):
+        if any(f in DID_FAIL for f in failed):
             hold |= of(("caller_id",))
         return sorted(hold)
-
-    @staticmethod
-    def _adds_unproven_did(ws: WorkflowSnapshot, live: Config, new: Config) -> bool:
-        """The change raises some DID's share where its state gives no evidence for it. The
-        caller-ID line is recorded on every change, but it holds only these: the posterior of a
-        DID the SPRT cleared is wide (P(dd < -2%) about 0.48 for an ordinary spread), and
-        enforcing it there held almost every spread and cost about 2% pickup on public_01 (run
-        runs/i4/smoke1, ADR 0031). Step I3's own DID gate owns that calibration."""
-        for k in [*new.cohort_ids(), DEFAULT_COHORT]:
-            before = live.dist(k, "caller_id") if k in live.cohort_ids() or k == DEFAULT_COHORT \
-                else live.dist(DEFAULT_COHORT, "caller_id")
-            for d, x in new.dist(k, "caller_id").items():
-                st = ws.did_state.get(d)
-                status = st.status if st is not None else "unknown"
-                if x > before.get(d, 0.0) + 1e-9 and status in UNPROVEN_DID:
-                    return True
-        return False
 
     def _judge(self, wf: str, live: Config, new: Config, alpha: float, cls: int
                ) -> tuple[ep.GateVerdict, WorkflowSnapshot, ep.Fits | None, int]:
@@ -809,20 +791,13 @@ class EngagementLoop:
             return True
         alpha = ep.alpha_for(p.cls, self.t)
         v, ws, _, ta = self._judge(p.wf, live, p.proposed_config, alpha, p.cls)
-        ok = self._lever_lines_pass(v, ws, live, p.proposed_config)
+        ok = v.passes
         with self.g.scope.tx() as tx:
             write_decision(tx, self._decision(
                 p.wf, "learning.harm", "harm_gate", f"0.1/regate_{why}",
                 {"proposal_id": p.proposal_id, "class": p.cls, "alpha": alpha, "t_apply": ta},
                 {**v.outcome(), "ok": ok}, harm=v.report))
         return ok
-
-    def _lever_lines_pass(self, v: ep.GateVerdict, ws: WorkflowSnapshot, live: Config,
-                          new: Config) -> bool:
-        """The gate passes, a caller-ID line on proven DIDs aside (see `_adds_unproven_did`)."""
-        failed = [f.removeprefix("apply_time:") for f in v.report.failed]
-        return v.passes or (all(f in DID_FAIL for f in failed)
-                            and not self._adds_unproven_did(ws, live, new))
 
     def release_ok(self, p: Patch) -> bool:
         """AUDIT-1 finding 9: the re-check of a patch whose hold has run out (6.1): the same
@@ -839,7 +814,7 @@ class EngagementLoop:
             return True
         alpha = ep.alpha_for(p.cls, self.t)
         v, ws, _, ta = self._judge(p.wf, live, new, alpha, p.cls)
-        ok = self._lever_lines_pass(v, ws, live, new)
+        ok = v.passes
         with self.g.scope.tx() as tx:
             write_decision(tx, self._decision(
                 p.wf, "learning.harm", "harm_gate", "0.1/recheck_held",

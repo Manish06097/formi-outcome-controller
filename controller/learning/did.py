@@ -39,12 +39,13 @@ from typing import Iterable, Mapping, Sequence
 import numpy as np
 
 from controller.settings import Thresholds
+from controller.stats.draws import derive_seed
 from controller.stats.sequential import BernoulliRatioSprt
 from controller.world.clock import freeze_start
 from controller.types import (DEFAULT_COHORT, P0_INCIDENT, P0B_DID_DRAIN, P3_ROUTINE, Config,
                               DidArrays,
                               DidPosterior, DidState, Finding, FrozenDict, PatchRequest,
-                              WorkflowSnapshot, freeze, sha256_hex, thaw)
+                              WorkflowSnapshot, freeze, thaw)
 
 OWNER = "learning.did"
 LIVE_STATES = ("healthy", "suspect", "degraded", "unhealthy", "probing", "unknown")
@@ -567,7 +568,7 @@ class DidHealthModel:
         `did_posterior`, found by bisection. Probe sizes therefore come out of the gate itself:
         one untested DID can take the full probe share (s (1 - r_flag) is inside the line), two
         together less, and a re-admitted DID is judged by the estimate it was dropped with."""
-        post = did_posterior(ws, states, seed=gate_seed(ws), t=self.t)
+        post = did_posterior(ws, states, seed=gate_seed(ws), n=self.t.n_draws, t=self.t)
         names = tuple(sorted(set(cur) | set(target)))
 
         def at(lam: float) -> dict[str, float]:
@@ -776,8 +777,12 @@ def caller_change_check(ws: WorkflowSnapshot, applied_minute: int, proposed: Con
 
 def gate_seed(ws: WorkflowSnapshot) -> int:
     """Deterministic seed of one gate evaluation (8.6): the same workflow and minute draw the
-    same posterior, so a restarted run and a decision replay reach the same verdict."""
-    return int(sha256_hex([ws.spec.workflow_id, int(ws.now), "did_gate"])[:12], 16)
+    same posterior, so a restarted run and a decision replay reach the same verdict. It is the
+    seed of the release train's composed gate (`engagement_plan.seed_for(ws, "gate", "did")`),
+    on purpose: this gate cuts a change to the edge of the DID line, and the composed gate that
+    judges it at release must see the same draws (GATE-DID). Cut on other draws, an edge change
+    reads above the line at release by selection alone (0.082 cut to 0.050 here, 0.062 there)."""
+    return derive_seed(ws.run_id, ws.spec.workflow_id, int(ws.now), "gate", "did")
 
 
 def did_dd(cur: Mapping[str, float], new: Mapping[str, float], post: DidPosterior) -> np.ndarray:

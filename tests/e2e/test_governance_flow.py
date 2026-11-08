@@ -143,7 +143,9 @@ def test_j2_policy_cases_get_approvals_applied(tmp_path):
                 if v.actor == "controller_approved":
                     applied_days[wf].add(h.epoch.minute(v.applied_at) // 1440)
         slot = {wf: h.epoch.minute(client.approvals(wf)[0].created_at) % 1440 for wf in CASES}
-        assert slot == {"nw_renewal": 10 * 60, "nw_kyc": 12 * 60, "ks_cancel": 11 * 60}
+        assert slot == {"nw_renewal": 10 * 60, "nw_kyc": 11 * 60 + 45, "ks_cancel": 11 * 60}
+        # nw_kyc: approvers 14-16, TTL 4h, latency 30-240: 12:00 would expire at latency 240
+        # (p = 1/211), so the pre-open tier takes 11:45 (715734f, timing.routine_slots)
         # (a) and (b): an approval applied every day
         assert applied_days["nw_renewal"] == set(range(days)), applied_days
         assert applied_days["nw_kyc"] == set(range(days)), applied_days

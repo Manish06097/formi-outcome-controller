@@ -35,7 +35,7 @@ the 56 private variants in `scenarios/private/`, never on public-scenario truth.
    `kill -9` plus 4 deterministic faults (31 restarts) on public_02, final state equal to the clean run.
 5. Deliberately not built: per-person call time, prompt A/B outside incidents, SNIPS dry run, HTML
    supervisor page, interaction test, cross-tenant approver fairness (section 2, ADR 0023).
-6. **AI usage (README rule 10).** The design and build were led by an AI senior engineer (Claude)
+6. **AI usage (README section 10).** The design and build were led by an AI senior engineer (Claude)
    working through subagents: it wrote the design, ADRs, code and tests, and other subagents reviewed
    and audited. I direct the work and must be able to defend every decision in the live review without
    AI help; the reasons are written down in the ADRs and [docs/LIVE_REVIEW.md](docs/LIVE_REVIEW.md).
@@ -44,8 +44,8 @@ the 56 private variants in `scenarios/private/`, never on public-scenario truth.
 **How to run.** `./run.sh http://127.0.0.1:8700` (Docker), no manual steps; exit code 0 when the scenario
 finishes. Without Docker:
 `CTL_NO_DOCKER=1 PG_DSN="host=... dbname=postgres ..." ./run.sh <SIM_URL>` against any Postgres
-16 or newer. **Every final report was produced on the no-Docker path** because the Docker daemon
-on my Mac hangs. Details: [docs/RUNNING.md](docs/RUNNING.md), alerts: [docs/RUNBOOK.md](docs/RUNBOOK.md).
+16 or newer. The final reports for public_01, public_02 and public_03 were produced on the no-Docker path;
+public_01 was also run once through Docker and graded identically ([reports/docker_run.md](reports/docker_run.md)). Details: [docs/RUNNING.md](docs/RUNNING.md), alerts: [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
 **Key design decisions (ADRs):** one harm gate for every change ([0002](docs/decisions/0002-harm-gate.md),
 [0031](docs/decisions/0031-engagement-in-the-loop.md), [0035](docs/decisions/0035-did-line-enforced-on-every-change.md));

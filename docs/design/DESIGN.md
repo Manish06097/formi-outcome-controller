@@ -1916,7 +1916,7 @@ day_share = ( s x (t_pre + t_alarm) + tick_h x sum_{j=1..k-1} (s - j m) ) / H
 
 So "under 0.10 on the flag day" is not a property the controller can guarantee: it depends on `s`,
 which depends on how far the spread got before the flag. The tests therefore assert the formula
-(10.1): measured flag-day share `<= day_share(s_measured, m, t_alarm = 2 h) + 0.01` (sampling slack:
+(10.1): measured flag-day share `<= day_share(s_measured, m, t_alarm = 2 h) + 0.01` (2 h is a typical alarm time, not a promise: the alarm tick is random, 75 to 150 min measured over 7 seeds; the incident must open within 3 h) (sampling slack:
 binomial SE of the share at 4,800 dials is about 0.004), and 0 on every later day.
 
 **Verification.** Two dialling hours after the last step: the degraded DID has no new-version dials
